@@ -12,6 +12,7 @@ import { AppDispatch, RootState } from "@/store/store";
 import { setUserLocation } from "@/store/location.slice";
 import type { LatLng } from "@/app/assets/services";
 import {BottomSheetModal} from "@gorhom/bottom-sheet";
+import Animated, {useSharedValue} from "react-native-reanimated";
 
 /**
  * Fixed, self-contained main screen:
@@ -33,6 +34,9 @@ export default function Index() {
 
     // Local selected alternative coords — used when user picks an alt route in the sheet
     const [selectedCoords, setSelectedCoords] = useState<LatLng[]>([]);
+
+
+    const bottomSheetPosition = useSharedValue<number>(0);
 
     // initial user location -> store
     useEffect(() => {
@@ -83,7 +87,7 @@ export default function Index() {
             modalRef.current?.present(rawRoutes);
         }
     }, [routeRaw]);
-
+    modalRef.current?.present();
     const goToUser = async () => {
         try {
             const { status } = await Location.requestForegroundPermissionsAsync();
@@ -141,6 +145,7 @@ export default function Index() {
                 style={StyleSheet.absoluteFillObject}
                 provider={PROVIDER_GOOGLE}
                 showsUserLocation
+                showsMyLocationButton={false}
                 onMapReady={() => {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(
@@ -159,11 +164,12 @@ export default function Index() {
                 )}
             </MapView>
 
+            <Animated.View style={{top: bottomSheetPosition}}>
             <TouchableOpacity style={styles.myLocationBtn} onPress={goToUser}>
                 <Ionicons name="locate" size={24} />
             </TouchableOpacity>
-
-            <RouteBottomSheetModal ref={modalRef}/>
+            </Animated.View>
+            <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition}/>
         </View>
     );
 }
