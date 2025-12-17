@@ -1,16 +1,16 @@
 // app/index.tsx
-import React, { useEffect, useRef, useState } from "react";
-import MapView, { Polyline, PROVIDER_GOOGLE } from "react-native-maps";
-import { Keyboard, StyleSheet, TouchableOpacity, View } from "react-native";
+import React, {useEffect, useRef, useState} from "react";
+import MapView, {Polyline, PROVIDER_GOOGLE} from "react-native-maps";
+import {Keyboard, StyleSheet, TouchableOpacity, View} from "react-native";
 import * as Location from "expo-location";
-import { Ionicons } from "@expo/vector-icons";
+import {Ionicons} from "@expo/vector-icons";
 import Search from "@/components/Search";
 import RouteBottomSheetModal from "@/components/RouteBottomSheetModal";
-import { styles } from "@/constants/styles";
-import { useDispatch, useSelector } from "react-redux";
-import { AppDispatch, RootState } from "@/store/store";
-import { setUserLocation } from "@/store/location.slice";
-import type { LatLng } from "@/app/assets/services";
+import {styles} from "@/constants/styles";
+import {useDispatch, useSelector} from "react-redux";
+import {AppDispatch, RootState} from "@/store/store";
+import {setUserLocation} from "@/store/location.slice";
+import type {LatLng} from "@/app/assets/services";
 import {BottomSheetModal} from "@gorhom/bottom-sheet";
 import Animated, {useSharedValue} from "react-native-reanimated";
 
@@ -42,11 +42,11 @@ export default function Index() {
     useEffect(() => {
         let mounted = true;
         (async () => {
-            const { status } = await Location.requestForegroundPermissionsAsync();
+            const {status} = await Location.requestForegroundPermissionsAsync();
             if (status !== "granted") return;
-            const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
+            const {coords} = await Location.getCurrentPositionAsync({accuracy: Location.Accuracy.Highest});
             if (!mounted) return;
-            dispatch(setUserLocation({ latitude: coords.latitude, longitude: coords.longitude } as LatLng));
+            dispatch(setUserLocation({latitude: coords.latitude, longitude: coords.longitude} as LatLng));
             mapRef.current?.animateToRegion(
                 {
                     latitude: coords.latitude,
@@ -68,13 +68,13 @@ export default function Index() {
         if (!coords || coords.length === 0) return;
         if (coords.length > 1) {
             mapRef.current?.fitToCoordinates(coords, {
-                edgePadding: { top: 60, right: 60, bottom: 60, left: 60 },
+                edgePadding: {top: 60, right: 60, bottom: 60, left: 60},
                 animated: true
             });
         } else {
             const p = coords[0];
             mapRef.current?.animateToRegion(
-                { latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
+                {latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02},
                 700
             );
         }
@@ -90,12 +90,12 @@ export default function Index() {
     modalRef.current?.present();
     const goToUser = async () => {
         try {
-            const { status } = await Location.requestForegroundPermissionsAsync();
+            const {status} = await Location.requestForegroundPermissionsAsync();
             if (status !== "granted") return;
-            const { coords } = await Location.getCurrentPositionAsync();
-            dispatch(setUserLocation({ latitude: coords.latitude, longitude: coords.longitude } as LatLng));
+            const {coords} = await Location.getCurrentPositionAsync();
+            dispatch(setUserLocation({latitude: coords.latitude, longitude: coords.longitude} as LatLng));
             mapRef.current?.animateToRegion(
-                { latitude: coords.latitude, longitude: coords.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 },
+                {latitude: coords.latitude, longitude: coords.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01},
                 700
             );
         } catch (err) {
@@ -112,19 +112,19 @@ export default function Index() {
             // eslint-disable-next-line @typescript-eslint/no-var-requires
             const polyline = require("@mapbox/polyline");
             const pts: number[][] = polyline.decode(encoded);
-            const coords = pts.map(([lat, lng]) => ({ latitude: lat, longitude: lng }));
+            const coords = pts.map(([lat, lng]) => ({latitude: lat, longitude: lng}));
             setSelectedCoords(coords);
 
             // fit map to coordinates (safe)
             if (coords.length > 1) {
                 mapRef.current?.fitToCoordinates(coords, {
-                    edgePadding: { top: 60, right: 60, bottom: 60, left: 60 },
+                    edgePadding: {top: 60, right: 60, bottom: 60, left: 60},
                     animated: true
                 });
             } else {
                 const p = coords[0];
                 mapRef.current?.animateToRegion(
-                    { latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
+                    {latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02},
                     700
                 );
             }
@@ -137,8 +137,8 @@ export default function Index() {
     const coordsToRender = selectedCoords.length > 0 ? selectedCoords : routeCoordsFromStore;
 
     return (
-        <View style={{ flex: 1 }}>
-            <Search />
+        <View style={{flex: 1}}>
+            <Search/>
 
             <MapView
                 ref={mapRef}
@@ -149,7 +149,12 @@ export default function Index() {
                 onMapReady={() => {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(
-                            { latitude: userLocation.latitude, longitude: userLocation.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 },
+                            {
+                                latitude: userLocation.latitude,
+                                longitude: userLocation.longitude,
+                                latitudeDelta: 0.01,
+                                longitudeDelta: 0.01
+                            },
                             700
                         );
                     }
@@ -160,14 +165,14 @@ export default function Index() {
             >
                 {/* polylines */}
                 {coordsToRender && coordsToRender.length > 0 && (
-                    <Polyline coordinates={coordsToRender} strokeWidth={4} strokeColor="blue" />
+                    <Polyline coordinates={coordsToRender} strokeWidth={4} strokeColor="blue"/>
                 )}
             </MapView>
 
             <Animated.View style={{top: bottomSheetPosition}}>
-            <TouchableOpacity style={styles.myLocationBtn} onPress={goToUser}>
-                <Ionicons name="locate" size={24} />
-            </TouchableOpacity>
+                <TouchableOpacity style={styles.myLocationBtn} onPress={goToUser}>
+                    <Ionicons name="locate" size={24}/>
+                </TouchableOpacity>
             </Animated.View>
             <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition}/>
         </View>
