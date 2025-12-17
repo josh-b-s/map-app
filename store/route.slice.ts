@@ -1,7 +1,7 @@
 // src/store/route.slice.ts
-import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+import {createAsyncThunk, createSlice} from '@reduxjs/toolkit';
+import type {LatLng} from '@/app/assets/services';
 import {computeRoute as computeRouteService, TravelMode} from '@/app/assets/services';
-import type { LatLng } from '@/app/assets/services';
 
 export const computeRoute = createAsyncThunk<
     { coords: LatLng[]; raw: any },
@@ -9,11 +9,10 @@ export const computeRoute = createAsyncThunk<
     { rejectValue: string }
 >('route/compute', async (payload, { rejectWithValue }) => {
     try {
-        const res = await computeRouteService(payload.origin, payload.destination, {
+        return await computeRouteService(payload.origin, payload.destination, {
             apiKey: payload.apiKey,
             travelMode: payload.travelMode as TravelMode
         });
-        return res;
     } catch (err) {
         return rejectWithValue(String(err));
     }
