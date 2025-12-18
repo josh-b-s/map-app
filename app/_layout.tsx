@@ -7,7 +7,7 @@ import {BottomSheetModalProvider} from '@gorhom/bottom-sheet';
 import {Stack} from 'expo-router';
 import {Provider} from 'react-redux';
 import {store} from '@/store/store'; // adjust path
-import "./global.css"
+import "@/global.css"
 
 export default function Layout() {
     return (

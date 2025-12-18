@@ -14,7 +14,7 @@ export default function RouteBottomSheetModal({ref, animatedPosition}:
         <BottomSheetModal ref={ref}
                           animatedPosition={animatedPosition}>
             <BottomSheetView style={styles.contentContainer}>
-                <Text>Awesome 🎉</Text>
+                <Text className={"text-red-800"}>Awesome 🎉</Text>
             </BottomSheetView>
         </BottomSheetModal>
     )
