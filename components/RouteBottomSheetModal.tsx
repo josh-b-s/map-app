@@ -1,7 +1,7 @@
 import React, {RefObject} from 'react';
 import {StyleSheet, Text} from 'react-native';
 import {BottomSheetModal, BottomSheetView,} from '@gorhom/bottom-sheet';
-import {SharedValue, useSharedValue} from "react-native-reanimated";
+import {SharedValue} from "react-native-reanimated";
 
 export default function RouteBottomSheetModal({ref, animatedPosition}:
                                               {

@@ -1,9 +1,9 @@
 // src/store/location.slice.ts
-import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import type { LatLng } from '@/app/assets/services';
+import {createSlice, PayloadAction} from '@reduxjs/toolkit';
+import type {LatLng} from '@/app/assets/services';
 
 type State = { userLocation: LatLng | null };
-const initialState: State = { userLocation: null };
+const initialState: State = {userLocation: null};
 
 const slice = createSlice({
     name: 'location',
@@ -15,5 +15,5 @@ const slice = createSlice({
     }
 });
 
-export const { setUserLocation } = slice.actions;
+export const {setUserLocation} = slice.actions;
 export default slice.reducer;

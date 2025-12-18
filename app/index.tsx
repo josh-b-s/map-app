@@ -1,18 +1,17 @@
 // app/index.tsx
 import React, {useEffect, useRef, useState} from "react";
 import MapView, {Polyline, PROVIDER_GOOGLE} from "react-native-maps";
-import {Keyboard, StyleSheet, TouchableOpacity, View} from "react-native";
+import {Keyboard, StyleSheet, View} from "react-native";
 import * as Location from "expo-location";
-import {Ionicons} from "@expo/vector-icons";
 import Search from "@/components/Search";
 import RouteBottomSheetModal from "@/components/RouteBottomSheetModal";
-import {styles} from "@/constants/styles";
 import {useDispatch, useSelector} from "react-redux";
 import {AppDispatch, RootState} from "@/store/store";
 import {setUserLocation} from "@/store/location.slice";
 import type {LatLng} from "@/app/assets/services";
 import {BottomSheetModal} from "@gorhom/bottom-sheet";
-import Animated, {useSharedValue} from "react-native-reanimated";
+import {useSharedValue} from "react-native-reanimated";
+import LocationButton from "@/components/LocationButton";
 
 /**
  * Fixed, self-contained main screen:
@@ -88,20 +87,7 @@ export default function Index() {
         }
     }, [routeRaw]);
     modalRef.current?.present();
-    const goToUser = async () => {
-        try {
-            const {status} = await Location.requestForegroundPermissionsAsync();
-            if (status !== "granted") return;
-            const {coords} = await Location.getCurrentPositionAsync();
-            dispatch(setUserLocation({latitude: coords.latitude, longitude: coords.longitude} as LatLng));
-            mapRef.current?.animateToRegion(
-                {latitude: coords.latitude, longitude: coords.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01},
-                700
-            );
-        } catch (err) {
-            console.error(err);
-        }
-    };
+
 
     // apply route selected from modal: decode encoded polyline and show it immediately
     const applyRoute = (encoded: string, idx: number, raw: any) => {
@@ -169,11 +155,7 @@ export default function Index() {
                 )}
             </MapView>
 
-            <Animated.View style={{top: bottomSheetPosition}}>
-                <TouchableOpacity style={styles.myLocationBtn} onPress={goToUser}>
-                    <Ionicons name="locate" size={24}/>
-                </TouchableOpacity>
-            </Animated.View>
+            <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition}/>
             <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition}/>
         </View>
     );

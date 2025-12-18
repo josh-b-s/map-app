@@ -1,7 +1,7 @@
 // src/store/search.slice.ts
-import { createAsyncThunk, createSlice, PayloadAction } from '@reduxjs/toolkit';
-import { searchPlaces as searchPlacesService } from '@/app/assets/services';
-import type { LatLng } from '@/app/assets/services';
+import {createAsyncThunk, createSlice, PayloadAction} from '@reduxjs/toolkit';
+import type {LatLng} from '@/app/assets/services';
+import {searchPlaces as searchPlacesService} from '@/app/assets/services';
 
 export type SearchPlace = {
     place_id: string;
@@ -15,7 +15,7 @@ export const searchPlaces = createAsyncThunk<
     SearchPlace[],
     { query: string; location?: LatLng; apiKey: string },
     { rejectValue: string }
->('search/searchPlaces', async (payload, { rejectWithValue }) => {
+>('search/searchPlaces', async (payload, {rejectWithValue}) => {
     try {
         const res = await searchPlacesService(payload.query, {
             apiKey: payload.apiKey,
@@ -84,5 +84,5 @@ const slice = createSlice({
     }
 });
 
-export const { setQuery, setShowResults, selectPlace, clearResults } = slice.actions;
+export const {setQuery, setShowResults, selectPlace, clearResults} = slice.actions;
 export default slice.reducer;

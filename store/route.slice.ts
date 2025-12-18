@@ -7,7 +7,7 @@ export const computeRoute = createAsyncThunk<
     { coords: LatLng[]; raw: any },
     { origin: LatLng; destination: LatLng; apiKey: string; travelMode?: string },
     { rejectValue: string }
->('route/compute', async (payload, { rejectWithValue }) => {
+>('route/compute', async (payload, {rejectWithValue}) => {
     try {
         return await computeRouteService(payload.origin, payload.destination, {
             apiKey: payload.apiKey,
@@ -25,7 +25,7 @@ type State = {
     error?: string | null;
 };
 
-const initialState: State = { coords: [], raw: undefined, loading: false, error: null };
+const initialState: State = {coords: [], raw: undefined, loading: false, error: null};
 
 const slice = createSlice({
     name: 'route',
@@ -54,5 +54,5 @@ const slice = createSlice({
     }
 });
 
-export const { clearRoute } = slice.actions;
+export const {clearRoute} = slice.actions;
 export default slice.reducer;

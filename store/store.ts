@@ -1,5 +1,5 @@
 // src/store/index.ts
-import { configureStore } from '@reduxjs/toolkit';
+import {configureStore} from '@reduxjs/toolkit';
 import searchReducer from './search.slice';
 import locationReducer from './location.slice';
 import routeReducer from './route.slice';
