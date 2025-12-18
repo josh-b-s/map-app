@@ -1,7 +1,6 @@
 import React, {RefObject} from "react";
 import {TouchableOpacity} from "react-native";
 import {Ionicons} from "@expo/vector-icons";
-import {styles} from "@/constants/styles";
 import Animated, {SharedValue} from "react-native-reanimated";
 import {useDispatch} from "react-redux";
 import {AppDispatch} from "@/store/store";
@@ -32,7 +31,9 @@ export default function LocationButton({mapRef, animatedPosition}: {
 
     return (
         <Animated.View style={{top: animatedPosition}}>
-            <TouchableOpacity style={styles.myLocationBtn} onPress={goToUser}>
+            <TouchableOpacity
+                className="absolute bottom-5 right-5 w-12 h-12 rounded-full bg-white items-center justify-center elevation-4"
+                onPress={goToUser}>
                 <Ionicons name="locate" size={24}/>
             </TouchableOpacity>
         </Animated.View>
