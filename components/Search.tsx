@@ -8,6 +8,7 @@ import {clearResults, searchPlaces, selectPlace, setQuery} from '@/store/search.
 import {computeRoute} from '@/store/route.slice';
 import type {LatLng} from '@/app/assets/services';
 import {useSafeAreaInsets} from "react-native-safe-area-context";
+import {FLOATING_SHADOW, useThemeStyle} from "@/constants/themes";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_API_KEY || '<YOUR_KEY>';
 
@@ -57,15 +58,20 @@ export default function Search() {
         Platform.OS === "ios"
             ? insets.top + 12   // status bar + camera
             : insets.top + 16; // Android camera UI
+
+    const theme = useThemeStyle();
+
     return (
         <View
             className="absolute left-4 right-4 z-[9999]"
             style={{top: searchTop}}
         >
-            <View className="flex-row items-center bg-white rounded-full px-3 py-2.5 elevation-5">
-                <Ionicons name="search" size={20} color="#666" className="mr-2"/>
+            <View className={`flex-row items-center rounded-full px-3 py-2.5`}
+                  style={[{backgroundColor: theme.backgroundColor}, FLOATING_SHADOW]}>
+                <Ionicons name="search" size={20} color="#666" className="mr-4"/>
                 <TextInput value={query} onChangeText={onChange} placeholder="Search places..."
-                           className="flex-1 text-base text-[#333]"
+                           className={`flex-1 text-base placeholder:text-gray-500`}
+                           style={{backgroundColor: theme.backgroundColor, color: theme.color}}
                            returnKeyType="search"
                 />
                 {(query.length > 0 || loading) && (
@@ -80,17 +86,35 @@ export default function Search() {
             </View>
 
             {showResults && results.length > 0 && (
-                <View className="bg-white rounded-xl mt-2 max-h-[300px] elevation-5">
-                    <FlatList data={results} keyExtractor={(i) => i.place_id} renderItem={({item}) => (
-                        <TouchableOpacity className="flex-row items-center px-3 py-3 border-b border-[#f0f0f0]"
-                                          onPress={() => onSelect(item)}>
-                            <View className="flex-1">
-                                <Text className="text-base font-semibold text-[#333] mb-0.5">{item.name}</Text>
-                                <Text className="text-sm text-[#666]">{item.address}</Text>
-                            </View>
-                            <Ionicons name="chevron-forward" size={20} color="#666"/>
-                        </TouchableOpacity>
-                    )} keyboardShouldPersistTaps="handled"/>
+                <View className={`rounded-3xl overflow-hidden mt-2 elevation-5`}
+                      style={{backgroundColor: theme.backgroundColor}}>
+                    <FlatList
+                        data={results}
+                        keyExtractor={(i) => i.place_id}
+                        renderItem={({item, index}) => {
+                            const isLast = index === results.length - 1;
+
+                            return (
+                                <TouchableOpacity
+                                    onPress={() => onSelect(item)}
+                                    className={`flex-row items-center px-3 py-3 ${isLast ? "" : "border-b border-gray-500"}`}
+                                >
+                                    <View className="flex-1">
+                                        <Text className={`text-base font-semibold mb-0.5`} style={{color: theme.color}}>
+                                            {item.name}
+                                        </Text>
+                                        <Text className={`text-sm`} style={{color: theme.color}}>
+                                            {item.address}
+                                        </Text>
+                                    </View>
+
+                                    <Ionicons name="chevron-forward" size={20} color="#666"/>
+                                </TouchableOpacity>
+                            );
+                        }}
+                        keyboardShouldPersistTaps="handled"
+                    />
+
                 </View>
             )}
         </View>

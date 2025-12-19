@@ -7,6 +7,8 @@ import {AppDispatch} from "@/store/store";
 import {setUserLocation} from "@/store/location.slice";
 import MapView, {LatLng} from "react-native-maps";
 import * as Location from "expo-location";
+import {useColor, useThemeStyle} from "@/constants/themes";
+
 
 export default function LocationButton({mapRef, animatedPosition}: {
     mapRef: RefObject<MapView | null>,
@@ -32,9 +34,10 @@ export default function LocationButton({mapRef, animatedPosition}: {
     return (
         <Animated.View style={{top: animatedPosition}}>
             <TouchableOpacity
-                className="absolute bottom-5 right-5 w-12 h-12 rounded-full bg-white items-center justify-center elevation-4"
+                className={`absolute bottom-5 right-5 w-16 h-16 rounded-full items-center justify-center elevation-4`}
+                style={{backgroundColor: useThemeStyle().backgroundColor}}
                 onPress={goToUser}>
-                <Ionicons name="locate" size={24}/>
+                <Ionicons name="locate" size={28} color={useColor()}/>
             </TouchableOpacity>
         </Animated.View>
     )
