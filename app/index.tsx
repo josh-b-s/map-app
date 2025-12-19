@@ -12,6 +12,7 @@ import type {LatLng} from "@/app/assets/services";
 import {BottomSheetModal} from "@gorhom/bottom-sheet";
 import {useSharedValue} from "react-native-reanimated";
 import LocationButton from "@/components/LocationButton";
+import {useColorScheme} from "nativewind";
 
 /**
  * Fixed, self-contained main screen:
@@ -121,6 +122,8 @@ export default function Index() {
 
     // Which coordinates to render on the map: prefer selectedCoords (immediate alt), else store coords
     const coordsToRender = selectedCoords.length > 0 ? selectedCoords : routeCoordsFromStore;
+    const { colorScheme } = useColorScheme();
+    const scheme = colorScheme ?? "light";
 
     return (
         <View style={{flex: 1}}>
@@ -128,10 +131,13 @@ export default function Index() {
 
             <MapView
                 ref={mapRef}
+                key={scheme}
                 style={StyleSheet.absoluteFillObject}
                 provider={PROVIDER_GOOGLE}
                 showsUserLocation
                 showsMyLocationButton={false}
+                showsCompass={false}
+                userInterfaceStyle = {scheme}
                 onMapReady={() => {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(

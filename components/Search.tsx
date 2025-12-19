@@ -61,9 +61,9 @@ export default function Search() {
         >
             <View className={`flex-row items-center rounded-full px-3 py-2.5`}
                   style={[{backgroundColor: theme.backgroundColor}, SHADOW]}>
-                <Ionicons name="search" size={20} color="#666" className="mr-4"/>
+                <Ionicons name="search" size={20} color="#666" className="mx-2"/>
                 <TextInput value={query} onChangeText={onChange} placeholder="Search places..."
-                           className={`flex-1 text-base placeholder:text-gray-500`}
+                           className={`text-xl flex-1 placeholder:text-gray-500`}
                            style={{backgroundColor: theme.backgroundColor, color: theme.color}}
                            returnKeyType="search"
                 />
@@ -93,10 +93,10 @@ export default function Search() {
                                     className={`flex-row items-center px-3 py-3 ${isLast ? "" : "border-b border-gray-500"}`}
                                 >
                                     <View className="flex-1">
-                                        <Text className={`text-base font-semibold mb-0.5`} style={{color: theme.color}}>
+                                        <Text className={`text-lg font-semibold mb-0.5`} style={{color: theme.color}}>
                                             {item.name}
                                         </Text>
-                                        <Text className={`text-sm opacity-50`} style={{color: theme.color}}>
+                                        <Text className={`opacity-50`} style={{color: theme.color}}>
                                             {item.address}
                                         </Text>
                                     </View>
