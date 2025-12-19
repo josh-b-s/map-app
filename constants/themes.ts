@@ -1,4 +1,5 @@
 import {useColorScheme} from "nativewind";
+import {EdgeInsets} from "react-native-safe-area-context";
 
 export function useThemeStyle() {
     const {colorScheme} = useColorScheme();
@@ -9,23 +10,10 @@ export function useThemeStyle() {
     };
 }
 
-export const FLOATING_SHADOW = {
-    elevation: 9,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.22,
-    shadowRadius: 12,
+export const SHADOW = {
+    boxShadow: "0px 4px 20px rgba(0,0,0,0.75)",
 };
 
-
-
-export const ICON_COLORS = {
-    light: "#000000",
-    dark: "#ffffff",
-};
-
-
-export const useColor = () => {
-    const {colorScheme} = useColorScheme();
-    return ICON_COLORS[colorScheme ?? "light"];
+export const TOP_SAFE = (insets: EdgeInsets) => {
+    return insets.top + 12   // status bar + camera
 }

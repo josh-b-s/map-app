@@ -1,6 +1,6 @@
 // components/Search.tsx
 import React, {useCallback, useEffect, useRef} from 'react';
-import {Alert, FlatList, Keyboard, Platform, Text, TextInput, TouchableOpacity, View} from 'react-native';
+import {Alert, FlatList, Keyboard, Text, TextInput, TouchableOpacity, View} from 'react-native';
 import {Ionicons} from '@expo/vector-icons';
 import {useDispatch, useSelector} from 'react-redux';
 import {AppDispatch, RootState} from '@/store/store';
@@ -8,7 +8,7 @@ import {clearResults, searchPlaces, selectPlace, setQuery} from '@/store/search.
 import {computeRoute} from '@/store/route.slice';
 import type {LatLng} from '@/app/assets/services';
 import {useSafeAreaInsets} from "react-native-safe-area-context";
-import {FLOATING_SHADOW, useThemeStyle} from "@/constants/themes";
+import {SHADOW, TOP_SAFE, useThemeStyle} from "@/constants/themes";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_API_KEY || '<YOUR_KEY>';
 
@@ -52,22 +52,15 @@ export default function Search() {
         }));
     }, [dispatch, userLocation]);
 
-    const insets = useSafeAreaInsets();
-
-    const searchTop =
-        Platform.OS === "ios"
-            ? insets.top + 12   // status bar + camera
-            : insets.top + 16; // Android camera UI
-
     const theme = useThemeStyle();
 
     return (
         <View
             className="absolute left-4 right-4 z-[9999]"
-            style={{top: searchTop}}
+            style={{top: TOP_SAFE(useSafeAreaInsets())}}
         >
             <View className={`flex-row items-center rounded-full px-3 py-2.5`}
-                  style={[{backgroundColor: theme.backgroundColor}, FLOATING_SHADOW]}>
+                  style={[{backgroundColor: theme.backgroundColor}, SHADOW]}>
                 <Ionicons name="search" size={20} color="#666" className="mr-4"/>
                 <TextInput value={query} onChangeText={onChange} placeholder="Search places..."
                            className={`flex-1 text-base placeholder:text-gray-500`}
@@ -87,7 +80,7 @@ export default function Search() {
 
             {showResults && results.length > 0 && (
                 <View className={`rounded-3xl overflow-hidden mt-2 elevation-5`}
-                      style={{backgroundColor: theme.backgroundColor}}>
+                      style={[{backgroundColor: theme.backgroundColor}, SHADOW]}>
                     <FlatList
                         data={results}
                         keyExtractor={(i) => i.place_id}
@@ -103,7 +96,7 @@ export default function Search() {
                                         <Text className={`text-base font-semibold mb-0.5`} style={{color: theme.color}}>
                                             {item.name}
                                         </Text>
-                                        <Text className={`text-sm`} style={{color: theme.color}}>
+                                        <Text className={`text-sm opacity-50`} style={{color: theme.color}}>
                                             {item.address}
                                         </Text>
                                     </View>
