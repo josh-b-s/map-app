@@ -6,7 +6,7 @@ import {useDispatch, useSelector} from 'react-redux';
 import {AppDispatch, RootState} from '@/store/store';
 import {clearResults, searchPlaces, selectPlace, setQuery} from '@/store/search.slice';
 import {computeRoute} from '@/store/route.slice';
-import type {LatLng} from '@/app/assets/services';
+import type {LatLng} from '@/services/googleMaps';
 import {useSafeAreaInsets} from "react-native-safe-area-context";
 import {SHADOW, TOP_SAFE, useThemeStyle} from "@/constants/themes";
 

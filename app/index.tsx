@@ -8,7 +8,7 @@ import RouteBottomSheetModal from "@/components/RouteBottomSheetModal";
 import {useDispatch, useSelector} from "react-redux";
 import {AppDispatch, RootState} from "@/store/store";
 import {setUserLocation} from "@/store/location.slice";
-import type {LatLng} from "@/app/assets/services";
+import type {LatLng} from "@/services/googleMaps";
 import {BottomSheetModal} from "@gorhom/bottom-sheet";
 import {useSharedValue} from "react-native-reanimated";
 import LocationButton from "@/components/LocationButton";

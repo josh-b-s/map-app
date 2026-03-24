@@ -1,6 +1,6 @@
 // src/store/location.slice.ts
 import {createSlice, PayloadAction} from '@reduxjs/toolkit';
-import type {LatLng} from '@/app/assets/services';
+import type {LatLng} from '@/services/googleMaps';
 
 type State = { userLocation: LatLng | null };
 const initialState: State = {userLocation: null};

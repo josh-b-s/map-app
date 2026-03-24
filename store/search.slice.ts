@@ -1,7 +1,7 @@
 // src/store/search.slice.ts
 import {createAsyncThunk, createSlice, PayloadAction} from '@reduxjs/toolkit';
-import type {LatLng} from '@/app/assets/services';
-import {searchPlaces as searchPlacesService} from '@/app/assets/services';
+import type {LatLng} from '@/services/googleMaps';
+import {searchPlaces as searchPlacesService} from '@/services/googleMaps';
 
 export type SearchPlace = {
     place_id: string;

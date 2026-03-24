@@ -1,8 +1,3 @@
-// FILE: src/services/google.ts
-// Service functions for Places Text Search (v1) and Routes Preferred API (v2)
-// - export async function searchPlaces(query, opts)
-// - export async function computeRoute(origin, destination, opts)
-
 import polyline from "@mapbox/polyline";
 
 export type LatLng = { latitude: number; longitude: number };

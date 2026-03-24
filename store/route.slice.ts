@@ -1,7 +1,7 @@
 // src/store/route.slice.ts
 import {createAsyncThunk, createSlice} from '@reduxjs/toolkit';
-import type {LatLng} from '@/app/assets/services';
-import {computeRoute as computeRouteService, TravelMode} from '@/app/assets/services';
+import type {LatLng} from '@/services/googleMaps';
+import {computeRoute as computeRouteService, TravelMode} from '@/services/googleMaps';
 
 export const computeRoute = createAsyncThunk<
     { coords: LatLng[]; raw: any },
