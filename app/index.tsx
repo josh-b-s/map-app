@@ -1,168 +1,90 @@
-// app/index.tsx
-import React, {useEffect, useRef, useState} from "react";
-import MapView, {Polyline, PROVIDER_GOOGLE} from "react-native-maps";
-import {Keyboard, StyleSheet, View} from "react-native";
-import * as Location from "expo-location";
-import Search from "@/components/Search";
-import RouteBottomSheetModal from "@/components/RouteBottomSheetModal";
-import {useDispatch, useSelector} from "react-redux";
-import {AppDispatch, RootState} from "@/store/store";
-import {setUserLocation} from "@/store/location.slice";
-import type {LatLng} from "@/services/googleMaps";
-import {BottomSheetModal} from "@gorhom/bottom-sheet";
-import {useSharedValue} from "react-native-reanimated";
-import LocationButton from "@/components/LocationButton";
-import {useColorScheme} from "nativewind";
-
-/**
- * Fixed, self-contained main screen:
- * - uses Redux for persisted route coords (route.coords) but also supports a local
- *   selectedCoords state so selecting an alternative immediately shows on the map
- *   without requiring additional store reducers.
- * - fits to coordinates safely (fallback for single-point routes).
- * - decodes polylines using @mapbox/polyline (dynamic require to avoid runtime errors).
- */
+import React, { useEffect, useRef } from 'react';
+import MapView, { Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import { Keyboard, StyleSheet, View } from 'react-native';
+import * as Location from 'expo-location';
+import { useDispatch, useSelector } from 'react-redux';
+import { AppDispatch, RootState } from '@/store/store';
+import { setUserLocation } from '@/store/location.slice';
+import type { LatLng } from '@/services/places';
+import { BottomSheetModal } from '@gorhom/bottom-sheet';
+import { useSharedValue } from 'react-native-reanimated';
+import { useColorScheme } from 'nativewind';
+import Search from '@/components/Search';
+import LocationButton from '@/components/LocationButton';
+import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
     const modalRef = useRef<BottomSheetModal>(null);
     const dispatch = useDispatch<AppDispatch>();
+    const bottomSheetPosition = useSharedValue(0);
+    const { colorScheme } = useColorScheme();
 
     const userLocation = useSelector((s: RootState) => s.location.userLocation);
-    const routeCoordsFromStore = useSelector((s: RootState) => s.route.coords);
-    const routeRaw = useSelector((s: RootState) => s.route.raw);
+    const routeCoords = useSelector((s: RootState) => s.route.coords);
 
-    // Local selected alternative coords — used when user picks an alt route in the sheet
-    const [selectedCoords, setSelectedCoords] = useState<LatLng[]>([]);
-
-
-    const bottomSheetPosition = useSharedValue<number>(0);
-
-    // initial user location -> store
+    // Request location on mount
     useEffect(() => {
         let mounted = true;
         (async () => {
-            const {status} = await Location.requestForegroundPermissionsAsync();
-            if (status !== "granted") return;
-            const {coords} = await Location.getCurrentPositionAsync({accuracy: Location.Accuracy.Highest});
+            const { status } = await Location.requestForegroundPermissionsAsync();
+            if (status !== 'granted') return;
+            const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
             if (!mounted) return;
-            dispatch(setUserLocation({latitude: coords.latitude, longitude: coords.longitude} as LatLng));
+            dispatch(setUserLocation({ latitude: coords.latitude, longitude: coords.longitude } as LatLng));
             mapRef.current?.animateToRegion(
-                {
-                    latitude: coords.latitude,
-                    longitude: coords.longitude,
-                    latitudeDelta: 0.01,
-                    longitudeDelta: 0.01
-                },
+                { latitude: coords.latitude, longitude: coords.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 },
                 700
             );
         })();
-        return () => {
-            mounted = false;
-        };
+        return () => { mounted = false; };
     }, [dispatch]);
 
-    // animate map when route coords (from store) change
+    // Fit map to route whenever coords update
     useEffect(() => {
-        const coords = selectedCoords.length > 0 ? selectedCoords : routeCoordsFromStore;
-        if (!coords || coords.length === 0) return;
-        if (coords.length > 1) {
-            mapRef.current?.fitToCoordinates(coords, {
-                edgePadding: {top: 60, right: 60, bottom: 60, left: 60},
-                animated: true
+        if (!routeCoords?.length) return;
+        if (routeCoords.length > 1) {
+            mapRef.current?.fitToCoordinates(routeCoords, {
+                edgePadding: { top: 60, right: 60, bottom: 60, left: 60 },
+                animated: true,
             });
         } else {
-            const p = coords[0];
+            const p = routeCoords[0];
             mapRef.current?.animateToRegion(
-                {latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02},
+                { latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
                 700
             );
         }
-    }, [routeCoordsFromStore, selectedCoords]);
-
-    // open bottom-sheet modal when routeRaw contains alternatives
-    useEffect(() => {
-        const rawRoutes = routeRaw?.routes || [];
-        if (rawRoutes.length > 0) {
-            modalRef.current?.present(rawRoutes);
-        }
-    }, [routeRaw]);
-    modalRef.current?.present();
-
-
-    // apply route selected from modal: decode encoded polyline and show it immediately
-    const applyRoute = (encoded: string, idx: number, raw: any) => {
-        if (!encoded) return;
-        try {
-            // dynamic require so app doesn't crash in environments without the package installed
-            // Ensure you have @mapbox/polyline installed: `npm i @mapbox/polyline`
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const polyline = require("@mapbox/polyline");
-            const pts: number[][] = polyline.decode(encoded);
-            const coords = pts.map(([lat, lng]) => ({latitude: lat, longitude: lng}));
-            setSelectedCoords(coords);
-
-            // fit map to coordinates (safe)
-            if (coords.length > 1) {
-                mapRef.current?.fitToCoordinates(coords, {
-                    edgePadding: {top: 60, right: 60, bottom: 60, left: 60},
-                    animated: true
-                });
-            } else {
-                const p = coords[0];
-                mapRef.current?.animateToRegion(
-                    {latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02},
-                    700
-                );
-            }
-        } catch (err) {
-            console.error("decode error", err);
-        }
-    };
-
-    // Which coordinates to render on the map: prefer selectedCoords (immediate alt), else store coords
-    const coordsToRender = selectedCoords.length > 0 ? selectedCoords : routeCoordsFromStore;
-    const { colorScheme } = useColorScheme();
-    const scheme = colorScheme ?? "light";
+    }, [routeCoords]);
 
     return (
-        <View style={{flex: 1}}>
-            <Search/>
-
+        <View style={{ flex: 1 }}>
+            <Search />
             <MapView
                 ref={mapRef}
-                key={scheme}
+                key={colorScheme}
                 style={StyleSheet.absoluteFillObject}
                 provider={PROVIDER_GOOGLE}
                 showsUserLocation
                 showsMyLocationButton={false}
                 showsCompass={false}
-                userInterfaceStyle = {scheme}
+                userInterfaceStyle={colorScheme ?? 'light'}
                 onMapReady={() => {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(
-                            {
-                                latitude: userLocation.latitude,
-                                longitude: userLocation.longitude,
-                                latitudeDelta: 0.01,
-                                longitudeDelta: 0.01
-                            },
+                            { ...userLocation, latitudeDelta: 0.01, longitudeDelta: 0.01 },
                             700
                         );
                     }
                 }}
-                onPress={() => {
-                    Keyboard.dismiss();
-                }}
+                onPress={() => Keyboard.dismiss()}
             >
-                {/* polylines */}
-                {coordsToRender && coordsToRender.length > 0 && (
-                    <Polyline coordinates={coordsToRender} strokeWidth={4} strokeColor="blue"/>
+                {routeCoords.length > 0 && (
+                    <Polyline coordinates={routeCoords} strokeWidth={4} strokeColor="blue" />
                 )}
             </MapView>
-
-            <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition}/>
-            <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition}/>
+            <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition} />
+            <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition} />
         </View>
     );
 }
