@@ -12,6 +12,7 @@ import { useColorScheme } from 'nativewind';
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
+import {MAP_STYLE_DARK} from "@/constants/themes";
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
@@ -64,11 +65,11 @@ export default function Index() {
                 ref={mapRef}
                 key={colorScheme}
                 style={StyleSheet.absoluteFillObject}
-                provider={PROVIDER_GOOGLE}
                 showsUserLocation
                 showsMyLocationButton={false}
                 showsCompass={false}
                 userInterfaceStyle={colorScheme ?? 'light'}
+                customMapStyle={colorScheme === 'dark' ? MAP_STYLE_DARK : []}
                 onMapReady={() => {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(
