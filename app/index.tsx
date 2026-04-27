@@ -13,6 +13,7 @@ import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 import {MAP_STYLE_DARK} from "@/constants/themes";
+import {useGoToUserLocation} from "@/hooks/goToUserLocation";
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
@@ -25,21 +26,11 @@ export default function Index() {
     const routeCoords = useSelector((s: RootState) => s.route.coords);
 
     // Request location on mount
+    const goToUserLocation = useGoToUserLocation(mapRef);
+
     useEffect(() => {
-        let mounted = true;
-        (async () => {
-            const { status } = await Location.requestForegroundPermissionsAsync();
-            if (status !== 'granted') return;
-            const { coords } = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest });
-            if (!mounted) return;
-            dispatch(setUserLocation({ latitude: coords.latitude, longitude: coords.longitude } as LatLng));
-            mapRef.current?.animateToRegion(
-                { latitude: coords.latitude, longitude: coords.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 },
-                700
-            );
-        })();
-        return () => { mounted = false; };
-    }, [dispatch]);
+        goToUserLocation();
+    }, []);
 
     // Fit map to route whenever coords update
     useEffect(() => {
