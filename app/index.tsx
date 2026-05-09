@@ -19,7 +19,7 @@ export default function Index() {
     const mapRef = useRef<MapView>(null);
     const modalRef = useRef<BottomSheetModal>(null);
     const dispatch = useDispatch<AppDispatch>();
-    const bottomSheetPosition = useSharedValue(0);
+    const bottomSheetPosition = useSharedValue(1000);
     const { colorScheme } = useColorScheme();
 
     const userLocation = useSelector((s: RootState) => s.location.userLocation);

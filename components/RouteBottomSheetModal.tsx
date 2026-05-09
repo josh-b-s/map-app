@@ -3,6 +3,7 @@ import { BottomSheetModal, BottomSheetView } from '@gorhom/bottom-sheet';
 import { SharedValue } from 'react-native-reanimated';
 import { SHADOW, TOP_SAFE, useThemeStyle } from '@/constants/themes';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {Text} from 'react-native';
 
 export default function RouteBottomSheetModal({ ref, animatedPosition }: {
     ref: RefObject<BottomSheetModal | null>;
@@ -22,7 +23,7 @@ export default function RouteBottomSheetModal({ ref, animatedPosition }: {
             enableOverDrag={false}
         >
             <BottomSheetView className="flex-1 items-center justify-center">
-                TODO: render GTFS route options here
+                <Text className="text-red-800">Awesome 🎉</Text>
             </BottomSheetView>
         </BottomSheetModal>
     );
