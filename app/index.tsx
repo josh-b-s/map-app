@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import MapView, { Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
-import { Keyboard, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Keyboard, StyleSheet, View } from 'react-native';
 import * as Location from 'expo-location';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
@@ -12,39 +12,42 @@ import { useColorScheme } from 'nativewind';
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
-import {MAP_STYLE_DARK} from "@/constants/themes";
-import {useGoToUserLocation} from "@/hooks/goToUserLocation";
+import { MAP_STYLE_DARK } from '@/constants/themes';
+import { useGoToUserLocation} from '../hooks/goToUserLocation';
 
 export default function Index() {
-    const mapRef = useRef<MapView>(null);
+    const mapRef   = useRef<MapView>(null);
     const modalRef = useRef<BottomSheetModal>(null);
     const dispatch = useDispatch<AppDispatch>();
     const bottomSheetPosition = useSharedValue(1000);
     const { colorScheme } = useColorScheme();
 
-    const userLocation = useSelector((s: RootState) => s.location.userLocation);
-    const routeCoords = useSelector((s: RootState) => s.route.coords);
+    const userLocation   = useSelector((s: RootState) => s.location.userLocation);
+    const routeCoords    = useSelector((s: RootState) => s.route.coords);
+    const routeLoading   = useSelector((s: RootState) => s.route.loading);
+    const selectedPlace  = useSelector((s: RootState) => s.search.selected);
 
-    // Request location on mount
     const goToUserLocation = useGoToUserLocation(mapRef);
+    useEffect(() => { goToUserLocation(); }, []);
 
+    // Open bottom sheet when a place is selected
     useEffect(() => {
-        goToUserLocation();
-    }, []);
+        if (selectedPlace) modalRef.current?.present();
+    }, [selectedPlace]);
 
-    // Fit map to route whenever coords update
+    // Fit map to route when coords update
     useEffect(() => {
         if (!routeCoords?.length) return;
         if (routeCoords.length > 1) {
             mapRef.current?.fitToCoordinates(routeCoords, {
-                edgePadding: { top: 60, right: 60, bottom: 60, left: 60 },
+                edgePadding: { top: 80, right: 60, bottom: 300, left: 60 },
                 animated: true,
             });
         } else {
             const p = routeCoords[0];
             mapRef.current?.animateToRegion(
                 { latitude: p.latitude, longitude: p.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
-                700
+                700,
             );
         }
     }, [routeCoords]);
@@ -65,16 +68,35 @@ export default function Index() {
                     if (userLocation) {
                         mapRef.current?.animateToRegion(
                             { ...userLocation, latitudeDelta: 0.01, longitudeDelta: 0.01 },
-                            700
+                            700,
                         );
                     }
                 }}
                 onPress={() => Keyboard.dismiss()}
             >
                 {routeCoords.length > 0 && (
-                    <Polyline coordinates={routeCoords} strokeWidth={4} strokeColor="blue" />
+                    <Polyline
+                        coordinates={routeCoords}
+                        strokeWidth={4}
+                        strokeColor="#2563eb"
+                    />
                 )}
             </MapView>
+
+            {/* Routing spinner — sits above the map */}
+            {routeLoading && (
+                <View
+                    style={{
+                        position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                        alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: 'rgba(0,0,0,0.15)',
+                    }}
+                    pointerEvents="none"
+                >
+                    <ActivityIndicator size="large" color="#2563eb" />
+                </View>
+            )}
+
             <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition} />
             <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition} />
         </View>

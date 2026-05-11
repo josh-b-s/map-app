@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef } from 'react';
-import { FlatList, Keyboard, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import {Alert, FlatList, Keyboard, Text, TextInput, TouchableOpacity, View} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
 import { clearResults, searchPlaces, selectPlace, setQuery } from '@/store/search.slice';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { SHADOW, TOP_SAFE, useThemeStyle } from '@/constants/themes';
+import {computeRoute} from "@/store/route.slice";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_API_KEY ?? '';
 
@@ -30,8 +31,15 @@ export default function Search() {
     const onSelect = useCallback((place: any) => {
         dispatch(selectPlace(place));
         Keyboard.dismiss();
-        // TODO: dispatch GTFS route computation here
-    }, [dispatch]);
+        if (!userLocation) {
+            Alert.alert('Location unavailable', 'Waiting for your current location.');
+            return;
+        }
+        dispatch(computeRoute({
+            origin:      userLocation,
+            destination: { latitude: place.latitude, longitude: place.longitude },
+        }));
+    }, [dispatch, userLocation]);
 
     return (
         <View className="absolute left-4 right-4 z-[9999]" style={{ top: TOP_SAFE(useSafeAreaInsets()) }}>
