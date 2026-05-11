@@ -43,6 +43,8 @@ const slice = createSlice({
     reducers: {
         setRoute(state, action: PayloadAction<GtfsRouteResult>) {
             Object.assign(state, action.payload);
+            state.loading = false;
+            state.error = null;
         },
         clearRoute(state) {
             state.coords = [];
