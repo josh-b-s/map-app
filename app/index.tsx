@@ -26,6 +26,8 @@ export default function Index() {
     const routeCoords    = useSelector((s: RootState) => s.route.coords);
     const routeLoading   = useSelector((s: RootState) => s.route.loading);
     const selectedPlace  = useSelector((s: RootState) => s.search.selected);
+    const routeSegments = useSelector((s: RootState) => s.route.segments);
+    const routeColor = useSelector((s: RootState) => s.route.routeColor);
 
     const goToUserLocation = useGoToUserLocation(mapRef);
     useEffect(() => { goToUserLocation(); }, []);
@@ -74,13 +76,22 @@ export default function Index() {
                 }}
                 onPress={() => Keyboard.dismiss()}
             >
-                {routeCoords.length > 0 && (
+                {routeSegments.length > 0 ? (
+                    routeSegments.map((segment, index) => (
+                        <Polyline
+                            key={index}
+                            coordinates={segment.coords}
+                            strokeWidth={4}
+                            strokeColor={segment.routeColor ?? routeColor ?? "#2563eb"}
+                        />
+                    ))
+                ) : routeCoords.length > 0 ? (
                     <Polyline
                         coordinates={routeCoords}
                         strokeWidth={4}
-                        strokeColor="#2563eb"
+                        strokeColor={routeColor ?? "#2563eb"}
                     />
-                )}
+                ) : null}
             </MapView>
 
             {/* Routing spinner — sits above the map */}
