@@ -20,7 +20,7 @@ export default function RouteBottomSheetModal({ ref, animatedPosition }: {
     animatedPosition: SharedValue<number>;
 }) {
     const theme = useThemeStyle();
-    const { routeName, routeType, originStopName, destStopName, error } =
+    const { legs = [], routeName, routeType, originStopName, destStopName, error } =
         useSelector((s: RootState) => s.route);
 
     return (
@@ -41,22 +41,29 @@ export default function RouteBottomSheetModal({ ref, animatedPosition }: {
             <BottomSheetView style={{ flex: 1, padding: 24 }}>
                 {error ? (
                     <Text style={{ color: '#ef4444', fontSize: 16 }}>{error}</Text>
-                ) : routeName ? (
-                    <View style={{ gap: 8 }}>
-                        <Text style={{ color: theme.color, fontSize: 22, fontWeight: '700' }}>
-                            {ROUTE_TYPE_LABEL[routeType ?? 3] ?? 'Transit'} {routeName}
-                        </Text>
-                        <Text style={{ color: theme.color, opacity: 0.7, fontSize: 15 }}>
-                            Board at {originStopName}
-                        </Text>
-                        <Text style={{ color: theme.color, opacity: 0.7, fontSize: 15 }}>
-                            Alight at {destStopName}
-                        </Text>
+                ) : legs.length > 0 ? (
+                    <View style={{ gap: 16 }}>
+                        {legs.map((leg, i) => (
+                            <View key={i} style={{ gap: 4 }}>
+                                <Text style={{ color: theme.color, fontSize: 20, fontWeight: '700' }}>
+                                    {ROUTE_TYPE_LABEL[leg.routeType] ?? 'Transit'} {leg.routeName}
+                                </Text>
+                                <Text style={{ color: theme.color, opacity: 0.7 }}>
+                                    Board at {leg.originStopName}
+                                </Text>
+                                <Text style={{ color: theme.color, opacity: 0.7 }}>
+                                    Alight at {leg.destStopName}
+                                </Text>
+                                {i < legs.length - 1 && (
+                                    <Text style={{ color: '#f59e0b', marginTop: 4 }}>
+                                        ↓ Transfer here
+                                    </Text>
+                                )}
+                            </View>
+                        ))}
                     </View>
                 ) : (
-                    <Text style={{ color: theme.color, opacity: 0.5 }}>
-                        Calculating route…
-                    </Text>
+                    <Text style={{ color: theme.color, opacity: 0.5 }}>Calculating route…</Text>
                 )}
             </BottomSheetView>
         </BottomSheetModal>

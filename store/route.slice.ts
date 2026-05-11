@@ -1,12 +1,12 @@
-import { createAsyncThunk, createSlice, PayloadAction } from '@reduxjs/toolkit';
-import type { LatLng } from '@/services/places';
-import { computeGtfsRoute, GtfsRouteResult } from '@/services/gtfsRouter';
+import {createAsyncThunk, createSlice, PayloadAction} from '@reduxjs/toolkit';
+import type {LatLng} from '@/services/places';
+import {computeGtfsRoute, GtfsRouteResult} from '@/services/gtfsRouter';
 
 export const computeRoute = createAsyncThunk<
     GtfsRouteResult,
     { origin: LatLng; destination: LatLng },
     { rejectValue: string }
->('route/compute', async ({ origin, destination }, { rejectWithValue }) => {
+>('route/compute', async ({origin, destination}, {rejectWithValue}) => {
     try {
         return await computeGtfsRoute(origin, destination);
     } catch (err) {
@@ -16,19 +16,23 @@ export const computeRoute = createAsyncThunk<
 
 type State = {
     coords: LatLng[];
+    legs: GtfsRouteResult['legs'];
     routeName?: string;
     routeType?: number;
     originStopName?: string;
     destStopName?: string;
+    transferStopName?: string;
     loading: boolean;
     error?: string | null;
 };
 
 const initialState: State = {
     coords: [],
+    legs: [],
     loading: false,
     error: null,
 };
+
 
 const slice = createSlice({
     name: 'route',
@@ -54,11 +58,13 @@ const slice = createSlice({
             })
             .addCase(computeRoute.fulfilled, (s, a) => {
                 s.loading = false;
-                s.coords         = a.payload.coords;
-                s.routeName      = a.payload.routeName;
-                s.routeType      = a.payload.routeType;
+                s.coords = a.payload.coords;
+                s.legs = a.payload.legs;
+                s.routeName = a.payload.routeName;
+                s.routeType = a.payload.routeType;
                 s.originStopName = a.payload.originStopName;
-                s.destStopName   = a.payload.destStopName;
+                s.destStopName = a.payload.destStopName;
+                s.transferStopName = a.payload.transferStopName;
             })
             .addCase(computeRoute.rejected, (s, a) => {
                 s.loading = false;
@@ -67,5 +73,5 @@ const slice = createSlice({
     },
 });
 
-export const { setRoute, clearRoute } = slice.actions;
+export const {setRoute, clearRoute} = slice.actions;
 export default slice.reducer;

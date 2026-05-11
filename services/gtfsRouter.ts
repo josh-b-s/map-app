@@ -31,29 +31,42 @@ interface Stop {
     dist?: number;
 }
 
-interface PatternMatch {
+interface Leg {
     pattern_id: string;
     shape_id: string;
     agency: number;
-    route_short_name: string;
-    route_long_name: string;
+    route_name: string;
     route_type: number;
+    origin_stop: Stop;
+    dest_stop: Stop;
     origin_seq: number;
     dest_seq: number;
 }
 
 export interface GtfsRouteResult {
     coords: LatLng[];
+    legs: {
+        routeName: string;
+        routeType: number;
+        originStopName: string;
+        destStopName: string;
+    }[];
     routeName: string;
     routeType: number;
     originStopName: string;
     destStopName: string;
+    transferStopName?: string;
 }
 
-// ── Nearest stops with expanding search ───────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function placeholders(n: number): string {
+    return Array(n).fill('?').join(',');
+}
+
+// ── Nearest stops ─────────────────────────────────────────────────────────────
 async function nearestStops(center: LatLng, limit: number): Promise<Stop[]> {
     const db = await getDb();
-    let delta = 0.005; // ~550m
+    let delta = 0.005;
 
     for (let attempt = 0; attempt < 8; attempt++, delta *= 1.8) {
         const rows = await db.getAllAsync<Stop>(
@@ -61,7 +74,7 @@ async function nearestStops(center: LatLng, limit: number): Promise<Stop[]> {
              FROM stops
              WHERE stop_lat BETWEEN ? AND ?
                AND stop_lon BETWEEN ? AND ?
-                 LIMIT 200`,
+             LIMIT 200`,
             [
                 center.latitude  - delta, center.latitude  + delta,
                 center.longitude - delta, center.longitude + delta,
@@ -79,7 +92,6 @@ async function nearestStops(center: LatLng, limit: number): Promise<Stop[]> {
         }
     }
 
-    // Return whatever we found even if < limit
     const rows = await db.getAllAsync<Stop>(
         `SELECT stop_id, stop_name, stop_lat, stop_lon, agency
          FROM stops
@@ -100,7 +112,7 @@ async function nearestStops(center: LatLng, limit: number): Promise<Stop[]> {
         .slice(0, limit);
 }
 
-// ── Shape segment (SQL distance sort) ─────────────────────────────────────────
+// ── Shape segment ─────────────────────────────────────────────────────────────
 async function shapeSegment(
     shapeId: string,
     agency: number,
@@ -109,7 +121,7 @@ async function shapeSegment(
 ): Promise<LatLng[]> {
     const db = await getDb();
 
-    const closestSeq = async (lat: number, lon: number): Promise<number | null> => {
+    const closestSeq = async (lat: number, lon: number) => {
         const row = await db.getFirstAsync<{ shape_pt_sequence: number }>(
             `SELECT shape_pt_sequence
              FROM shapes
@@ -144,7 +156,6 @@ async function shapeSegment(
     return pts.map(p => ({ latitude: p.shape_pt_lat, longitude: p.shape_pt_lon }));
 }
 
-// ── Stop-sequence fallback (no shape data) ────────────────────────────────────
 async function stopSequenceCoords(
     patternId: string,
     originSeq: number,
@@ -153,7 +164,7 @@ async function stopSequenceCoords(
     const db = await getDb();
     const lo = Math.min(originSeq, destSeq);
     const hi = Math.max(originSeq, destSeq);
-    const stops = await db.getAllAsync<{ stop_lat: number; stop_lon: number }>(
+    const rows = await db.getAllAsync<{ stop_lat: number; stop_lon: number }>(
         `SELECT s.stop_lat, s.stop_lon
          FROM pattern_stops ps
          JOIN stops s ON s.stop_id = ps.stop_id AND s.agency = ps.agency
@@ -163,68 +174,216 @@ async function stopSequenceCoords(
          ORDER BY ps.stop_sequence`,
         [patternId, lo, hi],
     );
-    return stops.map(s => ({ latitude: s.stop_lat, longitude: s.stop_lon }));
+    return rows.map(r => ({ latitude: r.stop_lat, longitude: r.stop_lon }));
 }
 
-// ── Find a matching pattern for two stops ─────────────────────────────────────
-async function findPattern(
-    oStop: Stop,
-    dStop: Stop,
-): Promise<PatternMatch | null> {
+async function legCoords(leg: Leg): Promise<LatLng[]> {
+    if (leg.shape_id) {
+        const pts = await shapeSegment(leg.shape_id, leg.agency, leg.origin_stop, leg.dest_stop);
+        if (pts.length > 0) return pts;
+    }
+    return stopSequenceCoords(leg.pattern_id, leg.origin_seq, leg.dest_seq);
+}
+
+// ── Direct route ──────────────────────────────────────────────────────────────
+async function findDirectLeg(
+    originStops: Stop[],
+    destStops: Stop[],
+): Promise<Leg | null> {
     const db = await getDb();
 
-    // Try forward direction first, then reverse (handles bidirectional patterns)
-    for (const [s1, s2] of [[oStop, dStop], [dStop, oStop]]) {
-        const matches = await db.getAllAsync<PatternMatch>(
-            `SELECT
-                 p.pattern_id,
-                 p.shape_id,
-                 p.agency,
-                 r.route_short_name,
-                 r.route_long_name,
-                 r.route_type,
-                 ps1.stop_sequence AS origin_seq,
-                 ps2.stop_sequence AS dest_seq
-             FROM patterns p
-             JOIN pattern_stops ps1
-                 ON ps1.pattern_id = p.pattern_id
-                AND ps1.stop_id    = ?
-                AND ps1.agency     = ?
-             JOIN pattern_stops ps2
-                 ON ps2.pattern_id = p.pattern_id
-                AND ps2.stop_id    = ?
-                AND ps2.agency     = ?
-             JOIN routes r
-                 ON r.route_id = p.route_id
-                AND r.agency   = p.agency
-             WHERE ps1.stop_sequence < ps2.stop_sequence
-             ORDER BY (ps2.stop_sequence - ps1.stop_sequence) ASC
-             LIMIT 5`,
-            [s1.stop_id, s1.agency, s2.stop_id, s2.agency],
-        );
+    // Try both directions in case pattern is stored in reverse
+    for (const [stops1, stops2, swapped] of [
+        [originStops, destStops, false] as const,
+        [destStops, originStops, true]  as const,
+    ]) {
+        for (const oStop of stops1) {
+            for (const dStop of stops2) {
+                if (oStop.stop_id === dStop.stop_id && oStop.agency === dStop.agency) continue;
 
-        if (matches.length > 0) {
-            // If we matched in reverse, swap the sequences so the route draws correctly
-            const m = matches[0];
-            if (s1 === dStop) {
-                return { ...m, origin_seq: m.dest_seq, dest_seq: m.origin_seq };
+                const match = await db.getFirstAsync<{
+                    pattern_id: string; shape_id: string; agency: number;
+                    route_short_name: string; route_long_name: string;
+                    route_type: number; origin_seq: number; dest_seq: number;
+                }>(
+                    `SELECT p.pattern_id, p.shape_id, p.agency,
+                            r.route_short_name, r.route_long_name, r.route_type,
+                            ps1.stop_sequence AS origin_seq,
+                            ps2.stop_sequence AS dest_seq
+                     FROM patterns p
+                     JOIN pattern_stops ps1
+                         ON ps1.pattern_id = p.pattern_id
+                        AND ps1.stop_id = ? AND ps1.agency = ?
+                     JOIN pattern_stops ps2
+                         ON ps2.pattern_id = p.pattern_id
+                        AND ps2.stop_id = ? AND ps2.agency = ?
+                     JOIN routes r ON r.route_id = p.route_id AND r.agency = p.agency
+                     WHERE ps1.stop_sequence < ps2.stop_sequence
+                     ORDER BY (ps2.stop_sequence - ps1.stop_sequence)
+                     LIMIT 1`,
+                    [oStop.stop_id, oStop.agency, dStop.stop_id, dStop.agency],
+                );
+
+                if (!match) continue;
+
+                const origin = swapped ? dStop : oStop;
+                const dest   = swapped ? oStop : dStop;
+
+                return {
+                    pattern_id:  match.pattern_id,
+                    shape_id:    match.shape_id,
+                    agency:      match.agency,
+                    route_name:  match.route_short_name || match.route_long_name || '?',
+                    route_type:  match.route_type,
+                    origin_stop: origin,
+                    dest_stop:   dest,
+                    origin_seq:  swapped ? match.dest_seq   : match.origin_seq,
+                    dest_seq:    swapped ? match.origin_seq : match.dest_seq,
+                };
             }
-            return m;
         }
     }
 
     return null;
 }
 
-// ── Debug helper — call this temporarily if routing fails ─────────────────────
-export async function debugNearbyStops(location: LatLng): Promise<void> {
-    const stops = await nearestStops(location, 10);
-    console.log('=== Nearby stops ===');
-    stops.forEach((s, i) =>
-        console.log(
-            `${i + 1}. [Agency ${s.agency}] ${s.stop_name} (${s.stop_id}) — ${Math.round(s.dist ?? 0)}m`,
-        ),
+// ── 1-transfer route ──────────────────────────────────────────────────────────
+interface Leg1Row {
+    pattern_id: string; shape_id: string; agency: number;
+    route_name: string; route_type: number;
+    origin_stop_id: string; origin_agency: number; origin_seq: number;
+    transfer_stop_id: string; transfer_agency: number; transfer_seq: number;
+}
+
+interface Leg2Row {
+    pattern_id: string; shape_id: string; agency: number;
+    route_name: string; route_type: number;
+    transfer_stop_id: string; transfer_agency: number; transfer_seq: number;
+    dest_stop_id: string; dest_agency: number; dest_seq: number;
+}
+
+async function findOneTransferRoute(
+    originStops: Stop[],
+    destStops: Stop[],
+): Promise<[Leg, Leg] | null> {
+    const db = await getDb();
+
+    const oIds = originStops.map(s => s.stop_id);
+    const dIds = destStops.map(s => s.stop_id);
+
+    // All stops reachable from origin stops (forward direction only)
+    const leg1Rows = await db.getAllAsync<Leg1Row>(
+        `SELECT
+             p.pattern_id, p.shape_id, p.agency,
+             COALESCE(r.route_short_name, r.route_long_name, '?') AS route_name,
+             r.route_type,
+             ps_o.stop_id        AS origin_stop_id,
+             ps_o.agency         AS origin_agency,
+             ps_o.stop_sequence  AS origin_seq,
+             ps_t.stop_id        AS transfer_stop_id,
+             ps_t.agency         AS transfer_agency,
+             ps_t.stop_sequence  AS transfer_seq
+         FROM pattern_stops ps_o
+         JOIN patterns p ON p.pattern_id = ps_o.pattern_id
+         JOIN routes r   ON r.route_id = p.route_id AND r.agency = p.agency
+         JOIN pattern_stops ps_t
+             ON ps_t.pattern_id = p.pattern_id
+            AND ps_t.stop_sequence > ps_o.stop_sequence
+         WHERE ps_o.stop_id IN (${placeholders(oIds.length)})
+         LIMIT 20000`,
+        oIds,
     );
+
+    if (leg1Rows.length === 0) return null;
+
+    // All stops that can board a pattern leading to dest stops
+    const leg2Rows = await db.getAllAsync<Leg2Row>(
+        `SELECT
+             p.pattern_id, p.shape_id, p.agency,
+             COALESCE(r.route_short_name, r.route_long_name, '?') AS route_name,
+             r.route_type,
+             ps_t.stop_id        AS transfer_stop_id,
+             ps_t.agency         AS transfer_agency,
+             ps_t.stop_sequence  AS transfer_seq,
+             ps_d.stop_id        AS dest_stop_id,
+             ps_d.agency         AS dest_agency,
+             ps_d.stop_sequence  AS dest_seq
+         FROM pattern_stops ps_d
+         JOIN patterns p ON p.pattern_id = ps_d.pattern_id
+         JOIN routes r   ON r.route_id = p.route_id AND r.agency = p.agency
+         JOIN pattern_stops ps_t
+             ON ps_t.pattern_id = p.pattern_id
+            AND ps_t.stop_sequence < ps_d.stop_sequence
+         WHERE ps_d.stop_id IN (${placeholders(dIds.length)})
+         LIMIT 20000`,
+        dIds,
+    );
+
+    if (leg2Rows.length === 0) return null;
+
+    // Index leg2 by transfer stop for O(1) lookup
+    const leg2Map = new Map<string, Leg2Row[]>();
+    for (const row of leg2Rows) {
+        const key = `${row.transfer_stop_id}:${row.transfer_agency}`;
+        if (!leg2Map.has(key)) leg2Map.set(key, []);
+        leg2Map.get(key)!.push(row);
+    }
+
+    // Stop detail cache
+    const stopCache = new Map<string, Stop>(
+        [...originStops, ...destStops].map(s => [`${s.stop_id}:${s.agency}`, s]),
+    );
+
+    const getStop = async (stop_id: string, agency: number): Promise<Stop | null> => {
+        const key = `${stop_id}:${agency}`;
+        if (stopCache.has(key)) return stopCache.get(key)!;
+        const s = await db.getFirstAsync<Stop>(
+            `SELECT stop_id, stop_name, stop_lat, stop_lon, agency
+             FROM stops WHERE stop_id = ? AND agency = ? LIMIT 1`,
+            [stop_id, agency],
+        );
+        if (s) stopCache.set(key, s);
+        return s ?? null;
+    };
+
+    // Find first valid transfer combination
+    for (const l1 of leg1Rows) {
+        const key = `${l1.transfer_stop_id}:${l1.transfer_agency}`;
+        const l2Candidates = leg2Map.get(key);
+        if (!l2Candidates) continue;
+
+        for (const l2 of l2Candidates) {
+            if (l1.pattern_id === l2.pattern_id) continue; // same route = direct
+
+            const oStop = originStops.find(
+                s => s.stop_id === l1.origin_stop_id && s.agency === l1.origin_agency,
+            );
+            const dStop = destStops.find(
+                s => s.stop_id === l2.dest_stop_id && s.agency === l2.dest_agency,
+            );
+            if (!oStop || !dStop) continue;
+
+            const transferStop = await getStop(l1.transfer_stop_id, l1.transfer_agency);
+            if (!transferStop) continue;
+
+            return [
+                {
+                    pattern_id: l1.pattern_id, shape_id: l1.shape_id,
+                    agency: l1.agency, route_name: l1.route_name, route_type: l1.route_type,
+                    origin_stop: oStop, dest_stop: transferStop,
+                    origin_seq: l1.origin_seq, dest_seq: l1.transfer_seq,
+                },
+                {
+                    pattern_id: l2.pattern_id, shape_id: l2.shape_id,
+                    agency: l2.agency, route_name: l2.route_name, route_type: l2.route_type,
+                    origin_stop: transferStop, dest_stop: dStop,
+                    origin_seq: l2.transfer_seq, dest_seq: l2.dest_seq,
+                },
+            ];
+        }
+    }
+
+    return null;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -232,83 +391,86 @@ export async function computeGtfsRoute(
     origin: LatLng,
     destination: LatLng,
 ): Promise<GtfsRouteResult> {
-
     const [originStops, destStops] = await Promise.all([
-        nearestStops(origin, 15),
-        nearestStops(destination, 15),
+        nearestStops(origin, 50),
+        nearestStops(destination, 50)
     ]);
 
-    console.log(`Origin stops found: ${originStops.length}`);
-    console.log(`Dest stops found: ${destStops.length}`);
-
-    if (originStops.length === 0)
-        throw new Error('No stops found near your location. Are you in Melbourne?');
-    if (destStops.length === 0)
-        throw new Error('No stops found near destination.');
-
-    // Log the closest few for debugging
+    console.log(`Origin: ${originStops.length} stops, Dest: ${destStops.length} stops`);
     originStops.slice(0, 3).forEach(s =>
-        console.log(`  Origin stop: [${s.agency}] ${s.stop_name} — ${Math.round(s.dist ?? 0)}m`),
-    );
+        console.log(`  O [${s.agency}] ${s.stop_name} ${Math.round(s.dist ?? 0)}m`));
     destStops.slice(0, 3).forEach(s =>
-        console.log(`  Dest stop: [${s.agency}] ${s.stop_name} — ${Math.round(s.dist ?? 0)}m`),
-    );
+        console.log(`  D [${s.agency}] ${s.stop_name} ${Math.round(s.dist ?? 0)}m`));
 
-    // Try every (origin, destination) stop pair — closest first
-    for (const oStop of originStops) {
-        for (const dStop of destStops) {
-            if (
-                oStop.stop_id === dStop.stop_id &&
-                oStop.agency  === dStop.agency
-            ) continue;
+    if (originStops.length === 0) throw new Error('No stops near your location.');
+    if (destStops.length   === 0) throw new Error('No stops near destination.');
 
-            const match = await findPattern(oStop, dStop);
-            if (!match) continue;
-
-            console.log(
-                `Match: route ${match.route_short_name} (agency ${match.agency})`,
-                `| ${oStop.stop_name} → ${dStop.stop_name}`,
-            );
-
-            // Get transit polyline
-            let transitCoords: LatLng[] = [];
-
-            if (match.shape_id) {
-                transitCoords = await shapeSegment(
-                    match.shape_id, match.agency, oStop, dStop,
-                );
-            }
-
-            if (transitCoords.length === 0) {
-                transitCoords = await stopSequenceCoords(
-                    match.pattern_id, match.origin_seq, match.dest_seq,
-                );
-            }
-
-            const coords: LatLng[] = [
+    // Direct
+    const direct = await findDirectLeg(originStops, destStops);
+    if (direct) {
+        console.log(`Direct: ${direct.route_name}`);
+        const transit = await legCoords(direct);
+        return {
+            coords: [
                 origin,
-                { latitude: oStop.stop_lat, longitude: oStop.stop_lon },
-                ...transitCoords,
-                { latitude: dStop.stop_lat, longitude: dStop.stop_lon },
+                { latitude: direct.origin_stop.stop_lat, longitude: direct.origin_stop.stop_lon },
+                ...transit,
+                { latitude: direct.dest_stop.stop_lat, longitude: direct.dest_stop.stop_lon },
                 destination,
-            ];
-
-            const routeLabel = match.route_short_name || match.route_long_name || '?';
-
-            return {
-                coords,
-                routeName:      routeLabel,
-                routeType:      match.route_type,
-                originStopName: oStop.stop_name,
-                destStopName:   dStop.stop_name,
-            };
-        }
+            ],
+            legs: [{
+                routeName: direct.route_name, routeType: direct.route_type,
+                originStopName: direct.origin_stop.stop_name,
+                destStopName: direct.dest_stop.stop_name,
+            }],
+            routeName: direct.route_name,
+            routeType: direct.route_type,
+            originStopName: direct.origin_stop.stop_name,
+            destStopName: direct.dest_stop.stop_name,
+        };
     }
 
-    // ── Helpful error: show what stops were found ─────────────────────────────
+    // 1-transfer
+    console.log('No direct route — trying 1 transfer…');
+    const transfer = await findOneTransferRoute(originStops, destStops);
+    if (transfer) {
+        const [leg1, leg2] = transfer;
+        console.log(`Transfer: ${leg1.route_name} → ${leg2.route_name} @ ${leg1.dest_stop.stop_name}`);
+
+        const [coords1, coords2] = await Promise.all([legCoords(leg1), legCoords(leg2)]);
+        const transferStop = leg1.dest_stop;
+
+        return {
+            coords: [
+                origin,
+                { latitude: leg1.origin_stop.stop_lat, longitude: leg1.origin_stop.stop_lon },
+                ...coords1,
+                { latitude: transferStop.stop_lat, longitude: transferStop.stop_lon },
+                ...coords2,
+                { latitude: leg2.dest_stop.stop_lat, longitude: leg2.dest_stop.stop_lon },
+                destination,
+            ],
+            legs: [
+                {
+                    routeName: leg1.route_name, routeType: leg1.route_type,
+                    originStopName: leg1.origin_stop.stop_name,
+                    destStopName: transferStop.stop_name,
+                },
+                {
+                    routeName: leg2.route_name, routeType: leg2.route_type,
+                    originStopName: transferStop.stop_name,
+                    destStopName: leg2.dest_stop.stop_name,
+                },
+            ],
+            routeName: `${leg1.route_name} → ${leg2.route_name}`,
+            routeType: leg1.route_type,
+            originStopName: leg1.origin_stop.stop_name,
+            destStopName: leg2.dest_stop.stop_name,
+            transferStopName: transferStop.stop_name,
+        };
+    }
+
     const oNames = originStops.slice(0, 3).map(s => s.stop_name).join(', ');
     const dNames = destStops.slice(0,  3).map(s => s.stop_name).join(', ');
-    throw new Error(
-        `No direct route found.\n\nNear origin: ${oNames}\nNear destination: ${dNames}\n\nThis journey likely requires a transfer — coming soon.`,
-    );
+    throw new Error(`No route found (direct or 1 transfer).\n\nNear origin: ${oNames}\nNear destination: ${dNames}`);
 }
