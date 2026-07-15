@@ -93,12 +93,15 @@ export default function Index() {
                         <Polyline
                             key={index}
                             coordinates={segment.coords}
-                            strokeWidth={segment.type === 'walk' ? 3 : 4}
+                            strokeWidth={segment.type === 'walk' ? 3 : 5}
                             strokeColor={segment.routeColor ?? routeColor ?? '#2563eb'}
                             lineDashPattern={segment.type === 'walk' ? [8, 8] : undefined}
+                            lineCap="round"
+                            lineJoin="round"
+                            geodesic={false}
                         />
                     ))
-                ) : routeCoords.length > 0 ? (
+                )  : routeCoords.length > 0 ? (
                     <Polyline
                         coordinates={routeCoords}
                         strokeWidth={4}
