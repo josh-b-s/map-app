@@ -11,10 +11,20 @@
  *   - trips (373K rows): ~7.1s
  *   - stop_times: OutOfMemoryError before even finishing the query
  *
- * FIX: filter geographically FIRST using cheap indexed queries against
- * `stops`, THEN only load patterns/trips/stop_times for routes that actually
- * pass near the search corridor. The ellipse (same shape used by the router)
- * is now a DATA LOADING boundary, not just a search-space optimization.
+ * FIX (v1): filter geographically FIRST using a single ellipse between
+ * origin and destination, THEN only load patterns/trips/stop_times for
+ * routes that pass near it.
+ *
+ * FIX (v2, this version): the single ellipse was either generous everywhere
+ * (defeating the point of pruning) or clipped real branching routes when a
+ * valid path loops away from the straight line — geographically close isn't
+ * the same as topologically related ("small world" problem). Instead, we now
+ * run a coarse schedule-agnostic BFS (coarseGraph.ts / seedRouteBfs.ts) to
+ * find the actual shape of plausible routes, then build a tapered buffer
+ * around those seed paths (corridorTagging.ts) and use that as the loading
+ * boundary. Same principle as before — the corridor is a DATA LOADING
+ * boundary, not just a search-space optimization — just a better-fitting
+ * shape.
  *
  * There is no persistent whole-network cache anymore — each search loads its
  * own scoped index. That's intentional: once scoped, the data is small
@@ -26,6 +36,7 @@
 import type { LatLng } from './gtfsDb';
 import { getDb } from './gtfsDb';
 import { makeKey, parseKey } from './gtfsKeyUtil';
+import { computeCorridor } from './corridorTagging';
 
 export interface StopInfo {
     stop_id:   string;
@@ -62,6 +73,11 @@ export interface StopTimeEntry {
 export interface GtfsIndex {
     stopsByKey: Map<string, StopInfo>;
     allStops: StopInfo[];
+    /** Unqualified stop_ids that survived corridor scoping for this query.
+     *  Computed once here by gtfsLoader.ts and shared with gtfsRouter.ts so
+     *  the two stages agree on a single corridor shape instead of each
+     *  computing (and potentially disagreeing on) their own filter. */
+    corridorStopIds: Set<string>;
     patternsByKey: Map<string, PatternMeta>;
     patternStops: Map<string, PatternStopEntry[]>;
     stopTimesByStop: Map<string, StopTimeEntry[]>;
@@ -70,6 +86,12 @@ export interface GtfsIndex {
     stopTimesByStopAndTrip: Map<string, Map<string, StopTimeEntry>>;
     shapePoints: Map<string, { latitude: number; longitude: number }[]>;
     serviceDate: string;
+    /** True if no active trip departed within any search window, even after
+     *  widening (up to 20h ahead). Distinguishes "genuinely no service in
+     *  this window" (e.g. overnight gap) from a normal search — the UI
+     *  should show something like "no more services until tomorrow" rather
+     *  than a bare empty journey list. */
+    noServiceFound: boolean;
 }
 
 const DOW_COLUMNS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -90,19 +112,6 @@ function haversineMeters(a: LatLng, b: { lat: number; lon: number }): number {
     const x = s1 * s1 + Math.cos(toRad(a.latitude)) * Math.cos(toRad(b.lat)) * s2 * s2;
     return R * 2 * Math.asin(Math.sqrt(x));
 }
-
-/**
- * Ellipse detour buffer. A stop is in play if
- *   dist(origin, stop) + dist(stop, destination) <= straightLineDist + buffer
- * The buffer is capped in absolute terms, not purely proportional — a real
- * transit detour rarely grows past a few km regardless of total trip length.
- * A flat multiplier (e.g. x1.5) is fine for a 5km hop (2.5km slack) but
- * catastrophic for a 50km trip (25km slack, thousands of irrelevant stops).
- */
-const ELLIPSE_BUFFER_RATIO = 0.5;    // up to 50% of straight-line distance...
-const ELLIPSE_BUFFER_CAP_M = 8000;   // ...but never more than 8km absolute.
-const ELLIPSE_BUFFER_MIN_M = 1500;   // floor so very short trips still get some slack.
-const ELLIPSE_MIN_DISTANCE_M = 1500;
 
 /** SQLite's default bound-parameter limit is 999; stay comfortably under it. */
 const SQL_CHUNK_SIZE = 400;
@@ -129,16 +138,29 @@ async function chunkedQuery<T, R>(
     return out;
 }
 
+/** How many of the nearest stops (at each end) to seed the corridor BFS
+ *  from. Wider than "just the single nearest stop" so the corridor can find
+ *  a route that boards from, say, the 3rd-closest stop if that's the one
+ *  that's actually on a useful pattern. */
+const NEAREST_FOR_CORRIDOR_SEED = 6;
+
+/** Journey-planning transfer budget. Since coarseGraph.ts now models a BFS
+ *  hop as "ride one line," this is a real transfer count, not a stop-count
+ *  proxy — see seedRouteBfs.ts. 5 comfortably covers any plausible Melbourne
+ *  metro trip (worst case is usually 2-3 transfers) with margin to spare. */
+const MAX_TRANSFERS = 5;
+
 /**
  * Loads a GTFS index SCOPED to the given trip: only stops/patterns/trips/
  * stop_times for routes that plausibly serve an origin -> destination journey
  * are loaded. Call this fresh per search — it's cheap enough (bounded by the
- * ellipse) that there's no need to cache it globally like the old version did.
+ * corridor) that there's no need to cache it globally like the old version did.
  */
 export async function loadGtfsIndexForTrip(
     origin: LatLng,
     destination: LatLng,
     forDate: Date = new Date(),
+    opts?: { forceWindowSec?: number },
 ): Promise<GtfsIndex> {
     const t0 = Date.now();
     const lap = (label: string, since: number) => {
@@ -164,34 +186,50 @@ export async function loadGtfsIndexForTrip(
         allStops.push(s);
     }
 
-    // ── 2. Ellipse filter -> candidate stop_ids ───────────────────────────────
-    const straightM = haversineMeters(origin, { lat: destination.latitude, lon: destination.longitude });
+    // ── 2. Corridor filter -> candidate stop_ids ──────────────────────────────
+    // Replaces the old single-ellipse filter. Run a coarse BFS (schedule-
+    // agnostic, cached across queries — see coarseGraph.ts) from several
+    // nearby stops at each end to find the actual seed route shape(s), then
+    // buffer around those paths (corridorTagging.ts). Falls back to a wider
+    // buffer, then the full network, if the result looks too small.
+    const candidateAll = allStops.map(s => ({ stop_id: s.stop_id, lat: s.stop_lat, lon: s.stop_lon, agency: s.agency }));
+
+    const nearestForSeed = (center: LatLng, limit: number) =>
+        allStops
+            .map(s => ({ s, d: haversineMeters(center, { lat: s.stop_lat, lon: s.stop_lon }) }))
+            .sort((a, b) => a.d - b.d)
+            .slice(0, limit)
+            .map(x => makeKey(x.s.agency, x.s.stop_id));
+
+    const originSeedKeys = nearestForSeed(origin, NEAREST_FOR_CORRIDOR_SEED);
+    const destSeedKeys = nearestForSeed(destination, NEAREST_FOR_CORRIDOR_SEED);
+
+    const corridor = await computeCorridor(
+        { lat: origin.latitude, lon: origin.longitude },
+        { lat: destination.latitude, lon: destination.longitude },
+        originSeedKeys,
+        destSeedKeys,
+        candidateAll,
+        MAX_TRANSFERS,
+    );
+
     let allowedStopIds: Set<string>;
-    if (straightM < ELLIPSE_MIN_DISTANCE_M) {
-        allowedStopIds = new Set(allStops.map(s => s.stop_id));
+    if (corridor.stopIds.size > 0) {
+        allowedStopIds = corridor.stopIds;
     } else {
-        const buffer = Math.min(Math.max(straightM * ELLIPSE_BUFFER_RATIO, ELLIPSE_BUFFER_MIN_M), ELLIPSE_BUFFER_CAP_M);
-        const maxSum = straightM + buffer;
-        allowedStopIds = new Set();
-        for (const s of allStops) {
-            const dO = haversineMeters(origin, { lat: s.stop_lat, lon: s.stop_lon });
-            const dD = haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon });
-            if (dO + dD <= maxSum) allowedStopIds.add(s.stop_id);
-        }
+        // Coarse BFS found nothing at all (e.g. disconnected topology data,
+        // or origin/destination not near any known stop) — fall back to the
+        // full network rather than returning zero stops.
+        console.log('[gtfsLoader] corridor came back empty even after widening — falling back to full network');
+        allowedStopIds = new Set(allStops.map(s => s.stop_id));
     }
-    t = lap(`ellipse filter (${allowedStopIds.size}/${allStops.length} stops kept)`, t);
+    t = lap(
+        `corridor filter (${allowedStopIds.size}/${allStops.length} stops kept, ` +
+        `${corridor.seedPathCount} seed paths, widened=${corridor.widened})`,
+        t,
+    );
 
-    // TEMP DIAGNOSTIC: confirm whether known Springvale train platforms
-    // actually pass the ellipse check, and what their computed distances are.
-    for (const testId of ['13714', '13715']) {
-        const stop = allStops.find(s => s.stop_id === testId);
-        if (!stop) { console.log(`[gtfsLoader] DIAG stop ${testId}: not found in allStops at all`); continue; }
-        const dO = haversineMeters(origin, { lat: stop.stop_lat, lon: stop.stop_lon });
-        const dD = haversineMeters(destination, { lat: stop.stop_lat, lon: stop.stop_lon });
-        console.log(`[gtfsLoader] DIAG stop ${testId} (${stop.stop_name}, agency ${stop.agency}): distO=${Math.round(dO)}m distD=${Math.round(dD)}m sum=${Math.round(dO+dD)}m inEllipse=${allowedStopIds.has(testId)}`);
-    }
-
-    // ── 3. Which patterns pass through the ellipse? (chunked IN query) ───────
+    // ── 3. Which patterns pass through the corridor? (chunked IN query) ──────
     const stopIdList = [...allowedStopIds];
     const candidatePatternRows = await chunkedQuery(stopIdList, SQL_CHUNK_SIZE, chunk =>
         db.getAllAsync<{ pattern_id: string; agency: number }>(
@@ -204,8 +242,9 @@ export async function loadGtfsIndexForTrip(
 
     if (candidatePatternKeys.size === 0) {
         return {
-            stopsByKey, allStops, patternsByKey: new Map(), patternStops: new Map(),
+            stopsByKey, allStops, corridorStopIds: allowedStopIds, patternsByKey: new Map(), patternStops: new Map(),
             stopTimesByStop: new Map(), stopTimesByStopAndTrip: new Map(), shapePoints: new Map(), serviceDate: dateStr,
+            noServiceFound: true,
         };
     }
 
@@ -213,7 +252,7 @@ export async function loadGtfsIndexForTrip(
     const uniquePatternIds = [...new Set(patternIdList)];
 
     // ── 4. Full pattern_stops for candidate patterns (need whole sequence, not
-    //       just in-ellipse stops, so stop_sequence numbering stays intact) ────
+    //       just in-corridor stops, so stop_sequence numbering stays intact) ──
     const psRows = await chunkedQuery(uniquePatternIds, SQL_CHUNK_SIZE, chunk =>
         db.getAllAsync<{ pattern_id: string; stop_id: string; stop_sequence: number; agency: number }>(
             `SELECT pattern_id, stop_id, stop_sequence, agency FROM pattern_stops
@@ -308,33 +347,89 @@ export async function loadGtfsIndexForTrip(
     //   (b) full stop_times for exactly those trips (need the whole sequence,
     //       not just the in-window rows, so downstream matching still works)
     const departSec = forDate.getHours() * 3600 + forDate.getMinutes() * 60 + forDate.getSeconds();
-    const SEARCH_WINDOW_SEC = 4 * 3600; // 4 hours forward is generous for on-device local trips
-    const windowLo = Math.max(0, departSec - 15 * 60); // small buffer for already-walking-there boarding
-    const windowHi = departSec + SEARCH_WINDOW_SEC;
 
-    // Query by STOP_ID (not pattern_id) — this matches the existing
-    // idx_st_stop_dep(stop_id, departure_sec) index exactly, so SQLite can
-    // range-scan departure_sec directly instead of scanning every row for a
-    // pattern regardless of time. It's also semantically better: we want
-    // "does this trip depart from a stop we can actually board at, within the
-    // window" — which is exactly what RAPTOR's boarding step needs.
-    const windowedRows = await chunkedQuery(stopIdList, SQL_CHUNK_SIZE, chunk =>
-        db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string }>(
-            `SELECT DISTINCT trip_id, agency, pattern_id FROM stop_times
-             WHERE stop_id IN (${placeholders(chunk.length)})
-               AND departure_sec BETWEEN ? AND ?`,
-            [...chunk, windowLo, windowHi],
-        ),
+    // Distance-scaled starting window. IMPORTANT: this window has to cover
+    // not just the FIRST leg's departure, but every later leg's boarding
+    // time too — a transfer partway through a long trip can depart well
+    // after the first leg, and if its departure_sec falls outside the
+    // window, that trip's timetable never gets loaded at all, so RAPTOR
+    // silently can't connect through it (looks like "no route found" even
+    // though service exists). 150s/km (not straight-line speed) plus a flat
+    // 45min buffer is a deliberately generous estimate that bakes in
+    // transfer wait time, not just in-vehicle travel time. Even so, this is
+    // an estimate — computeGtfsRoute in gtfsRouter.ts retries with
+    // forceWindowSec if RAPTOR fails to reach the destination despite
+    // trips existing, which is the real safety net.
+    const straightLineM = haversineMeters(
+        origin,
+        { lat: destination.latitude, lon: destination.longitude },
     );
-    t = lap(`time-windowed trip discovery (${windowedRows.length} candidate trips)`, t);
+    const SEC_PER_KM = 150;
+    const BUFFER_SEC = 45 * 60;
+    const distanceScaledSec = (straightLineM / 1000) * SEC_PER_KM + BUFFER_SEC;
+    const initialWindowSec = opts?.forceWindowSec ?? Math.min(5 * 3600, Math.max(2.5 * 3600, distanceScaledSec));
+    console.log(`[gtfsLoader] window sizing: straightLine=${(straightLineM / 1000).toFixed(1)}km, ` +
+        `distanceScaled=${(distanceScaledSec / 3600).toFixed(2)}h, initial=${(initialWindowSec / 3600).toFixed(2)}h` +
+        `${opts?.forceWindowSec ? ' (forced)' : ''}, departSec=${departSec}`);
 
-    const windowedActiveTripIds = [...new Set(
-        windowedRows
-            .filter(r => candidatePatternKeys.has(makeKey(r.agency, r.pattern_id)))
-            .filter(r => activeTripKeys.has(makeKey(r.agency, r.trip_id)))
-            .map(r => r.trip_id),
-    )];
-    t = lap(`windowed trips filtered to active + candidate patterns (${windowedActiveTripIds.length})`, t);
+    // If the initial window finds no usable trips — most commonly because
+    // it's off-peak/overnight and the next real departure is hours away —
+    // widen and retry rather than silently returning an empty result.
+    // Stages are deliberately generous at the top end since overnight gaps
+    // on lower-frequency lines can be large (e.g. last train ~1am, first
+    // ~5am is a real 4h+ gap with zero service, not a bug to route around).
+    const WINDOW_STAGES_SEC = [initialWindowSec, 10 * 3600, 20 * 3600];
+    const WINDOW_BOARD_BUFFER_SEC = 15 * 60; // small buffer for already-walking-there boarding
+
+    let windowLo = 0, windowHi = 0;
+    let windowedRows: Array<{ trip_id: string; agency: number; pattern_id: string }> = [];
+    let windowedActiveTripIds: string[] = [];
+    let usedWindowStageIdx = -1;
+
+    for (let stageIdx = 0; stageIdx < WINDOW_STAGES_SEC.length; stageIdx++) {
+        const windowSec = WINDOW_STAGES_SEC[stageIdx];
+        windowLo = Math.max(0, departSec - WINDOW_BOARD_BUFFER_SEC);
+        windowHi = departSec + windowSec;
+
+        // Query by STOP_ID (not pattern_id) — this matches the existing
+        // idx_st_stop_dep(stop_id, departure_sec) index exactly, so SQLite can
+        // range-scan departure_sec directly instead of scanning every row for a
+        // pattern regardless of time. It's also semantically better: we want
+        // "does this trip depart from a stop we can actually board at, within the
+        // window" — which is exactly what RAPTOR's boarding step needs.
+        windowedRows = await chunkedQuery(stopIdList, SQL_CHUNK_SIZE, chunk =>
+            db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string }>(
+                `SELECT DISTINCT trip_id, agency, pattern_id FROM stop_times
+                 WHERE stop_id IN (${placeholders(chunk.length)})
+                   AND departure_sec BETWEEN ? AND ?`,
+                [...chunk, windowLo, windowHi],
+            ),
+        );
+        t = lap(`time-windowed trip discovery, stage ${stageIdx} (${(windowSec / 3600).toFixed(1)}h -> ${windowedRows.length} candidate trips)`, t);
+
+        windowedActiveTripIds = [...new Set(
+            windowedRows
+                .filter(r => candidatePatternKeys.has(makeKey(r.agency, r.pattern_id)))
+                .filter(r => activeTripKeys.has(makeKey(r.agency, r.trip_id)))
+                .map(r => r.trip_id),
+        )];
+        t = lap(`windowed trips filtered to active + candidate patterns (${windowedActiveTripIds.length})`, t);
+
+        usedWindowStageIdx = stageIdx;
+        if (windowedActiveTripIds.length > 0) break;
+        if (stageIdx < WINDOW_STAGES_SEC.length - 1) {
+            console.log(`[gtfsLoader] no active trips in ${(windowSec / 3600).toFixed(1)}h window — widening to ${(WINDOW_STAGES_SEC[stageIdx + 1] / 3600).toFixed(1)}h and retrying`);
+        }
+    }
+
+    // Surfaced to the caller so the UI can distinguish "genuinely no service
+    // today within a day+ of this time" from a normal result, and show
+    // something like "no more services until tomorrow" instead of a bare
+    // empty journey list.
+    const noServiceFound = windowedActiveTripIds.length === 0;
+    if (noServiceFound) {
+        console.log(`[gtfsLoader] no active trips found even after widening to ${(WINDOW_STAGES_SEC[WINDOW_STAGES_SEC.length - 1] / 3600).toFixed(1)}h — likely genuinely no service in this window`);
+    }
 
     const stopTimeRows = windowedActiveTripIds.length > 0
         ? await chunkedQuery(windowedActiveTripIds, SQL_CHUNK_SIZE, chunk =>
@@ -371,32 +466,52 @@ export async function loadGtfsIndexForTrip(
     for (const arr of stopTimesByStop.values()) arr.sort((a, b) => a.departure_sec - b.departure_sec);
     t = lap('stop_times filter + sort + trip-index build', t);
 
-    // ── 9. Shapes — only for candidate patterns' shape_ids ────────────────────
-    const shapeKeys = [...patternsByKey.values()]
-        .filter(p => p.shape_id)
-        .map(p => ({ shape_id: p.shape_id as string, agency: p.agency }));
-    const uniqueShapeIds = [...new Set(shapeKeys.map(s => s.shape_id))];
-
-    const shapeRows = uniqueShapeIds.length > 0
-        ? await chunkedQuery(uniqueShapeIds, SQL_CHUNK_SIZE, chunk =>
-            db.getAllAsync<{ shape_id: string; agency: number; shape_pt_lat: number; shape_pt_lon: number; shape_pt_sequence: number }>(
-                `SELECT shape_id, agency, shape_pt_lat, shape_pt_lon, shape_pt_sequence
-                 FROM shapes WHERE shape_id IN (${placeholders(chunk.length)})
-                 ORDER BY shape_id, agency, shape_pt_sequence`,
-                chunk,
-            ),
-        )
-        : [];
-    t = lap(`shapes for candidates (${shapeRows.length} rows)`, t);
-
+    // ── 9. Shapes — deferred, NOT loaded here ──────────────────────────────
+    // Shape polylines are a pure rendering concern: RAPTOR itself never reads
+    // shapePoints, only reconstructPath() does, and only for the handful of
+    // journeys that survive the Pareto filter at the very end. Loading shapes
+    // for every candidate pattern (up to ~1300+ patterns for a long corridor)
+    // was the single biggest remaining cost — see loadShapesForShapeIds below,
+    // which the caller invokes only for the patterns actually used in the
+    // journeys it decides to keep.
     const shapePoints = new Map<string, { latitude: number; longitude: number }[]>();
+
+    console.log(`[gtfsLoader] TOTAL scoped load time: ${Date.now() - t0}ms`);
+
+    return {
+        stopsByKey, allStops, corridorStopIds: allowedStopIds, patternsByKey, patternStops,
+        stopTimesByStop, stopTimesByStopAndTrip, shapePoints, serviceDate: dateStr, noServiceFound,
+    };
+}
+
+/**
+ * Loads shape polylines for a specific, small set of shape_ids — the
+ * counterpart to the deferred step 9 above. Callers (gtfsRouter.ts) should
+ * collect the shape_ids actually used by the journeys they're keeping
+ * (typically a handful, after Pareto filtering) and call this once, rather
+ * than gtfsLoader eagerly loading shapes for every candidate pattern.
+ */
+export async function loadShapesForShapeIds(
+    shapeIds: Array<{ shape_id: string; agency: number }>,
+): Promise<Map<string, { latitude: number; longitude: number }[]>> {
+    const shapePoints = new Map<string, { latitude: number; longitude: number }[]>();
+    const uniqueShapeIds = [...new Set(shapeIds.map(s => s.shape_id))];
+    if (uniqueShapeIds.length === 0) return shapePoints;
+
+    const db = await getDb();
+    const shapeRows = await chunkedQuery(uniqueShapeIds, SQL_CHUNK_SIZE, chunk =>
+        db.getAllAsync<{ shape_id: string; agency: number; shape_pt_lat: number; shape_pt_lon: number; shape_pt_sequence: number }>(
+            `SELECT shape_id, agency, shape_pt_lat, shape_pt_lon, shape_pt_sequence
+             FROM shapes WHERE shape_id IN (${placeholders(chunk.length)})
+             ORDER BY shape_id, agency, shape_pt_sequence`,
+            chunk,
+        ),
+    );
+
     for (const r of shapeRows) {
         const key = makeKey(r.agency, r.shape_id);
         if (!shapePoints.has(key)) shapePoints.set(key, []);
         shapePoints.get(key)!.push({ latitude: r.shape_pt_lat, longitude: r.shape_pt_lon });
     }
-
-    console.log(`[gtfsLoader] TOTAL scoped load time: ${Date.now() - t0}ms`);
-
-    return { stopsByKey, allStops, patternsByKey, patternStops, stopTimesByStop, stopTimesByStopAndTrip, shapePoints, serviceDate: dateStr };
+    return shapePoints;
 }

@@ -1,5 +1,5 @@
 /**
- * gtfsRoute.ts — In-memory McRAPTOR (multi-criteria RAPTOR) transit router.
+ * gtfsRouter.ts — In-memory McRAPTOR (multi-criteria RAPTOR) transit router.
  *
  * Two changes from the previous version:
  *
@@ -25,7 +25,7 @@
  */
 
 import type { LatLng } from './gtfsDb';
-import { loadGtfsIndexForTrip, type GtfsIndex, type StopTimeEntry } from './gtfsLoader';
+import { loadGtfsIndexForTrip, loadShapesForShapeIds, type GtfsIndex, type StopTimeEntry } from './gtfsLoader';
 import { fallbackRouteColor } from './routeTypeUtil';
 import { makeKey, parseKey } from './gtfsKeyUtil';
 
@@ -52,21 +52,6 @@ const MAX_TRANSFER_WALK_SEC = 20 * 60; // was 7min (only ~588m at normal speed) 
 // Maps for the Mornington Peninsula trip). 20min covers ~1.68km at normal walking speed.
 const NEARBY_STOPS = 50;
 const BEST_MARKED_CAP = 400; // was 200 — raised as extra headroom now that trimming is goal-directed (see ASSUMED_TRANSIT_SPEED_MPS below), not just earliest-arrival-first
-
-/**
- * Ellipse detour margin. A stop is considered "in play" if
- *   dist(origin, stop) + dist(stop, destination) <= straightLineDist * ELLIPSE_MARGIN
- * 1.0 = degenerate (only the direct line); higher = more permissive.
- * 1.4–1.6 comfortably absorbs real-world street/river/freeway detours.
- */
-const ELLIPSE_BUFFER_RATIO = 0.5;
-const ELLIPSE_BUFFER_CAP_M = 8000;
-const ELLIPSE_BUFFER_MIN_M = 1500;
-
-/** Below this straight-line distance, skip the ellipse filter entirely — for
- *  short hops the ellipse is nearly the whole search radius anyway, and the
- *  extra per-stop check isn't worth it. */
-const ELLIPSE_MIN_DISTANCE_M = 1500;
 
 const INF = Number.MAX_SAFE_INTEGER;
 
@@ -159,39 +144,6 @@ export interface GtfsRouteResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ellipse pre-filter
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Returns stops considered "in play" for this origin→destination pair: those
- * whose combined distance from both endpoints doesn't exceed the straight-line
- * distance by more than ELLIPSE_MARGIN. For short trips the filter is skipped
- * (not worth the pass over all stops when the whole network is already close).
- */
-function ellipseFilterStops(
-    index: GtfsIndex,
-    origin: LatLng,
-    destination: LatLng,
-): Set<string> /* stop_id (unqualified) */ {
-    const straightM = haversineMeters(origin, { lat: destination.latitude, lon: destination.longitude });
-
-    if (straightM < ELLIPSE_MIN_DISTANCE_M) {
-        return new Set(index.allStops.map(s => s.stop_id)); // no filtering — everything qualifies
-    }
-
-    const buffer = Math.min(Math.max(straightM * ELLIPSE_BUFFER_RATIO, ELLIPSE_BUFFER_MIN_M), ELLIPSE_BUFFER_CAP_M);
-    const maxSum = straightM + buffer;
-    const allowed = new Set<string>();
-
-    for (const s of index.allStops) {
-        const dO = haversineMeters(origin,      { lat: s.stop_lat, lon: s.stop_lon });
-        const dD = haversineMeters(destination,  { lat: s.stop_lat, lon: s.stop_lon });
-        if (dO + dD <= maxSum) allowed.add(s.stop_id);
-    }
-    return allowed;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Nearest-stops helper (in-memory linear scan — fine at ~20K stops)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -228,19 +180,49 @@ export async function computeGtfsRoute(
     departureTime: Date = new Date(),
     walkingSpeedMps: number = WALK_SPEED_MPS.NORMAL,
 ): Promise<GtfsRouteResult> {
+    let index = await loadGtfsIndexForTrip(origin, destination, departureTime);
+
+    try {
+        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps);
+    } catch (err) {
+        // Two different failure shapes, only one of which widening can fix:
+        //  - index.noServiceFound: gtfsLoader already widened its own window
+        //    up to 20h and found literally zero active trips. More widening
+        //    won't help — genuinely no service in this window, rethrow as-is.
+        //  - RAPTOR threw "no route found" despite trips existing: the
+        //    window was wide enough to find SOME trips but a later leg's
+        //    boarding trip (departing well after the first leg) fell outside
+        //    it, so RAPTOR never had that trip's full timetable to connect
+        //    through. This is exactly the Mornington->Werribee case — a 2h
+        //    window is plenty for a short hop but not for a long corridor
+        //    with multiple transfers spread over hours. Reload with a forced
+        //    10h window and retry once before giving up.
+        if (index.noServiceFound) throw err;
+
+        console.log('[gtfsRoute] search failed despite active trips in window — retrying once with a forced-wide (10h) window');
+        index = await loadGtfsIndexForTrip(origin, destination, departureTime, { forceWindowSec: 10 * 3600 });
+        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps);
+    }
+}
+
+async function runSearchOnIndex(
+    index: GtfsIndex,
+    origin: LatLng,
+    destination: LatLng,
+    departureTime: Date,
+    walkingSpeedMps: number,
+): Promise<GtfsRouteResult> {
     const tStart = Date.now();
     let t = tStart;
     const lap = (label: string) => { console.log(`[gtfsRoute] ${label}: ${Date.now() - t}ms`); t = Date.now(); };
-
-    const index = await loadGtfsIndexForTrip(origin, destination, departureTime);
     lap('loadGtfsIndexForTrip (scoped to this search)');
 
     const departSec  = toSecsMidnight(departureTime);
     const xferRadius = transferRadiusM(walkingSpeedMps);
 
-    // ── Ellipse pre-filter ────────────────────────────────────────────────────
-    const allowedStopIds = ellipseFilterStops(index, origin, destination);
-    lap(`ellipse filter (${allowedStopIds.size}/${index.allStops.length} stops kept)`);
+    // ── Corridor (computed once, upstream, in gtfsLoader.ts) ──────────────────
+    const allowedStopIds = index.corridorStopIds;
+    lap(`corridor from loader (${allowedStopIds.size}/${index.allStops.length} stops kept)`);
 
     // ── Nearest stops at both ends (within the ellipse) ──────────────────────
     // Pre-filter the stop list to the ellipse ONCE. Footpath relaxation used to
@@ -248,7 +230,7 @@ export async function computeGtfsRoute(
     // membership per-element inside the loop — with hundreds of newly-marked
     // stops per round, that was tens of millions of wasted iterations. Scanning
     // this much smaller pre-filtered array directly removes that cost.
-    const ellipseStops = index.allStops.filter(s => allowedStopIds.has(s.stop_id));
+    const corridorStops = index.allStops.filter(s => allowedStopIds.has(s.stop_id));
 
     const originNearby = nearestStops(index, origin, NEARBY_STOPS, allowedStopIds);
     const destNearby    = nearestStops(index, destination, NEARBY_STOPS, allowedStopIds);
@@ -439,7 +421,7 @@ export async function computeGtfsRoute(
                 const tauS = tau.get(key) ?? INF;
                 if (tauS === INF) continue;
 
-                for (const other of ellipseStops) {
+                for (const other of corridorStops) {
                     if (other.stop_id === stopId && other.agency === agency) continue;
 
                     const distM = haversineMeters(
@@ -522,6 +504,37 @@ export async function computeGtfsRoute(
         )
     );
     lap(`Pareto filter (${candidates.length} candidates -> ${nonDominated.length} kept)`);
+
+    // ── Load shapes only for patterns the surviving journeys actually use ──
+    // reconstructPath (below) reads index.shapePoints, but until now nothing
+    // has populated it — gtfsLoader defers shape loading entirely (see
+    // loadShapesForShapeIds there). We collect the pattern keys used by just
+    // the ≤ a few kept journeys (not all ~1000+ candidate patterns) and load
+    // those specific shape_ids, then mutate index.shapePoints in place before
+    // reconstructing paths.
+    const usedPatternKeys = new Set<string>();
+    for (const c of nonDominated) {
+        let cur = c.destKey;
+        while (true) {
+            const p = parent.get(cur);
+            if (!p) break;
+            if (p.type === 'transit') {
+                usedPatternKeys.add(makeKey(p.agency, p.patternId));
+                cur = p.boardKey;
+            } else if (p.type === 'footpath') {
+                cur = p.fromKey;
+            } else {
+                break; // origin-walk — chain terminates
+            }
+        }
+    }
+    const neededShapeIds = [...usedPatternKeys]
+        .map(k => index.patternsByKey.get(k))
+        .filter((p): p is NonNullable<typeof p> => !!p?.shape_id)
+        .map(p => ({ shape_id: p.shape_id as string, agency: p.agency }));
+    const loadedShapes = await loadShapesForShapeIds(neededShapeIds);
+    for (const [key, pts] of loadedShapes) index.shapePoints.set(key, pts);
+    lap(`shapes for kept journeys (${usedPatternKeys.size} patterns, ${loadedShapes.size} shapes)`);
 
     // Reconstruct full path for each surviving candidate.
     const journeys: GtfsJourney[] = [];
