@@ -24,7 +24,11 @@
  * immediately invalidate themselves on the very next read.
  */
 
-import type { SQLiteDatabase } from 'expo-sqlite';
+// Migrated from expo-sqlite to op-sqlite (see gtfsDb.ts). SQLiteDatabase is
+// now this app's own compatibility wrapper, not expo-sqlite's type — it
+// preserves the same getAllAsync/execAsync/runAsync/withTransactionAsync
+// method shapes, so nothing else in this file needed to change.
+import type { SQLiteDatabase } from './gtfsDb';
 import type { CoarseEdge } from './coarseGraph';
 
 const EDGE_SEP = '\x1f';       // unit separator — won't collide with real stop_ids

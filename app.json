@@ -32,7 +32,6 @@
     },
     "plugins": [
       "expo-router",
-      "expo-sqlite",
       "expo-asset"
     ],
     "experiments": {
