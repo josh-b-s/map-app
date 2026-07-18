@@ -11,6 +11,8 @@ import { useColorScheme } from 'nativewind';
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
+import DebugMapOverlay from '@/components/DebugMapOverlay';
+import DebugControls from '@/components/DebugControls';
 import { MAP_STYLE_DARK } from '@/constants/themes';
 import { useGoToUserLocation } from '../hooks/goToUserLocation';
 
@@ -108,6 +110,8 @@ export default function Index() {
                         strokeColor={routeColor ?? '#2563eb'}
                     />
                 ) : null}
+
+                <DebugMapOverlay />
             </MapView>
 
             {routeLoading && (
@@ -129,6 +133,7 @@ export default function Index() {
             )}
 
             <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition} />
+            <DebugControls />
             <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition} />
         </View>
     );

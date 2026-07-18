@@ -13,6 +13,11 @@ import type { CoarseGraph } from './coarseGraph';
 export interface SeedPathResult {
     paths: string[][];   // each is a list of stopKeys, origin -> destination
     levelsExpanded: number;
+    /** Snapshot of the frontier (stopKeys newly reached) at the END of each
+     *  level, in order — level 0 is the origin seed set itself. Purely for
+     *  debug visualization (replaying "BFS expanding outward level by
+     *  level"); routing never reads this. */
+    levelFrontiers: string[][];
 }
 
 const SAFETY_MARGIN_LEVELS = 1; // expand one extra full level past first hit
@@ -46,6 +51,8 @@ export function findSeedPaths(
     let frontier = new Set(originKeys);
     for (const k of originKeys) levelOf.set(k, 0);
 
+    const levelFrontiers: string[][] = [[...frontier]]; // level 0 = origin seed set
+
     let firstHitLevel = -1;
     let level = 0;
 
@@ -76,11 +83,12 @@ export function findSeedPaths(
             if (destSet.has(k) && firstHitLevel < 0) firstHitLevel = level;
         }
         frontier = nextFrontier;
+        levelFrontiers.push([...frontier]);
         if (frontier.size === 0) break;
     }
 
     if (firstHitLevel < 0) {
-        return { paths: [], levelsExpanded: level };
+        return { paths: [], levelsExpanded: level, levelFrontiers };
     }
 
     // Reconstruct every distinct origin -> destination path by walking
@@ -118,5 +126,5 @@ export function findSeedPaths(
         backtrack(dKey, [], new Set());
     }
 
-    return { paths, levelsExpanded: level };
+    return { paths, levelsExpanded: level, levelFrontiers };
 }

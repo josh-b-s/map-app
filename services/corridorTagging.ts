@@ -18,10 +18,36 @@ import { parseKey } from './gtfsKeyUtil';
 
 export interface LatLon { lat: number; lon: number; }
 
+/** Tapered-buffer outline for one seed path, as two parallel polylines (one
+ *  per side) sampled at even arc-length steps along the path. Concatenating
+ *  `left` followed by `right` reversed gives a single closed ring suitable
+ *  for a map Polygon — this is purely a debug-visualization convenience;
+ *  routing itself only ever needs the stopIds set, never this shape. */
+export interface CorridorBoundary {
+    left: LatLon[];
+    right: LatLon[];
+}
+
 export interface CorridorResult {
     stopIds: Set<string>;   // unqualified stop_id, matches ellipseFilterStops' old return shape
     widened: boolean;       // true if the fallback (widen or full-network) kicked in
     seedPathCount: number;
+    /** The raw seed paths BFS found (stop-key sequences, origin->destination),
+     *  one per distinct path. Not used by routing itself — exposed purely so
+     *  a debug overlay can draw exactly what the corridor was built from,
+     *  without recomputing anything. Cheap to include: these already exist
+     *  in memory by the time runOnce returns, this just stops discarding them. */
+    seedPaths: string[][];
+    /** BFS's per-level frontier snapshots (see seedRouteBfs.ts) — passed
+     *  straight through for the debug replay. */
+    levelFrontiers: string[][];
+    /** One tapered-buffer outline per seed path, in the same order as
+     *  seedPaths. Lets a debug overlay draw the actual corridor SHAPE (the
+     *  taper this module computes) as a single Polygon per path, instead of
+     *  approximating it by scattering a Circle over every tagged stop —
+     *  cheaper to render (one native map object per path vs. hundreds) and
+     *  a more honest picture of what the taper actually looks like. */
+    corridorBoundaries: CorridorBoundary[];
 }
 
 const MIN_WIDTH_M = 350;
@@ -154,6 +180,76 @@ function tagStopsForPath(
     return tagged;
 }
 
+// How many points to sample along each seed path when building its taper
+// outline. Purely a rendering-smoothness knob — has no effect on which
+// stops get tagged (tagStopsForPath's own per-segment loop is unaffected).
+// 20 is plenty for a Polygon at map zoom levels a phone screen can show.
+const BOUNDARY_SAMPLES_PER_PATH = 20;
+
+/**
+ * Computes the tapered-buffer outline for one seed path: at each of
+ * BOUNDARY_SAMPLES_PER_PATH evenly-arc-length-spaced points along the path,
+ * finds the local direction, offsets perpendicular to it by the taper width
+ * at that point (same minWidthM + taperKM*sin(pi*t) formula tagStopsForPath
+ * uses), and records a point on each side. This is purely a debug-viz
+ * convenience derived from the same taper the tagging pass already computes
+ * — it changes nothing about which stops get included in the corridor.
+ */
+function boundaryForPath(path: LatLon[], minWidthM: number, taperKM: number): CorridorBoundary {
+    const left: LatLon[] = [];
+    const right: LatLon[] = [];
+    if (path.length < 2) return { left, right };
+
+    const segLengths: number[] = [];
+    let totalLength = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+        const d = haversineMeters(path[i], path[i + 1]);
+        segLengths.push(d);
+        totalLength += d;
+    }
+    if (totalLength === 0) return { left, right };
+
+    for (let s = 0; s <= BOUNDARY_SAMPLES_PER_PATH; s++) {
+        const targetLen = (s / BOUNDARY_SAMPLES_PER_PATH) * totalLength;
+
+        // Walk forward to find which segment contains targetLen.
+        let acc = 0, segIdx = 0;
+        while (segIdx < segLengths.length - 1 && acc + segLengths[segIdx] < targetLen) {
+            acc += segLengths[segIdx];
+            segIdx++;
+        }
+        const segLen = segLengths[segIdx];
+        const segFrac = segLen > 0 ? (targetLen - acc) / segLen : 0;
+        const a = path[segIdx];
+        const b = path[segIdx + 1] ?? path[segIdx];
+
+        const lat = a.lat + (b.lat - a.lat) * segFrac;
+        const lon = a.lon + (b.lon - a.lon) * segFrac;
+
+        const globalT = totalLength > 0 ? targetLen / totalLength : 0;
+        const width = minWidthM + taperKM * Math.sin(Math.PI * globalT);
+
+        // Local bearing of this segment, in the same equirectangular
+        // approximation distanceToSegment already uses — fine at city scale.
+        const mPerDegLat = 111_320;
+        const mPerDegLon = 111_320 * Math.cos(toRadSafe(lat));
+        const dxM = (b.lon - a.lon) * mPerDegLon;
+        const dyM = (b.lat - a.lat) * mPerDegLat;
+        const segLenM = Math.sqrt(dxM * dxM + dyM * dyM) || 1;
+        // Unit perpendicular (rotate direction vector 90 degrees).
+        const perpXM = -dyM / segLenM;
+        const perpYM = dxM / segLenM;
+
+        const dLat = (perpYM * width) / mPerDegLat;
+        const dLon = (perpXM * width) / mPerDegLon;
+
+        left.push({ lat: lat + dLat, lon: lon + dLon });
+        right.push({ lat: lat - dLat, lon: lon - dLon });
+    }
+
+    return { left, right };
+}
+
 async function runOnce(
     origin: LatLon,
     destination: LatLon,
@@ -167,15 +263,16 @@ async function runOnce(
     const tGraph0 = Date.now();
     const graph = await getCoarseGraph();
     const tGraph1 = Date.now();
-    const { paths } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
+    const { paths, levelFrontiers } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
     const tBfs1 = Date.now();
     console.log(`[corridorTagging] getCoarseGraph: ${tGraph1 - tGraph0}ms, BFS: ${tBfs1 - tGraph1}ms (${paths.length} paths)`);
 
     if (paths.length === 0) {
-        return { stopIds: new Set(), widened: false, seedPathCount: 0 };
+        return { stopIds: new Set(), widened: false, seedPathCount: 0, seedPaths: [], levelFrontiers: [], corridorBoundaries: [] };
     }
 
     const union = new Set<string>();
+    const corridorBoundaries: CorridorBoundary[] = [];
     for (const stopKeyPath of paths) {
         const polyline: LatLon[] = stopKeyPath.map(key => {
             const node = graph.nodesByKey.get(key);
@@ -185,6 +282,7 @@ async function runOnce(
         const localCandidates = bboxFilterCandidates(polyline, candidates, maxWidthM);
         const tagged = tagStopsForPath(polyline, localCandidates, minWidthM, taperKM);
         for (const s of tagged) union.add(s);
+        corridorBoundaries.push(boundaryForPath(polyline, minWidthM, taperKM));
     }
 
     // Always keep the immediate origin/destination neighborhoods in-corridor,
@@ -198,7 +296,7 @@ async function runOnce(
     }
     console.log(`[corridorTagging] tagging (${paths.length} paths x ${candidates.length} candidates, bbox-filtered): ${Date.now() - tBfs1}ms -> ${union.size} stops`);
 
-    return { stopIds: union, widened: false, seedPathCount: paths.length };
+    return { stopIds: union, widened: false, seedPathCount: paths.length, seedPaths: paths, levelFrontiers, corridorBoundaries };
 }
 
 /**

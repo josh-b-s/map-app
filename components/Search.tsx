@@ -14,6 +14,7 @@ export default function Search() {
     const dispatch = useDispatch<AppDispatch>();
     const { query, results, showResults, loading } = useSelector((s: RootState) => s.search);
     const userLocation = useSelector((s: RootState) => s.location.userLocation);
+    const debugEnabled = useSelector((s: RootState) => s.debug.enabled);
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const theme = useThemeStyle();
 
@@ -38,8 +39,9 @@ export default function Search() {
         dispatch(computeRoute({
             origin:      userLocation,
             destination: { latitude: place.latitude, longitude: place.longitude },
+            debugMode:   debugEnabled,
         }));
-    }, [dispatch, userLocation]);
+    }, [dispatch, userLocation, debugEnabled]);
 
     return (
         <View className="absolute left-4 right-4 z-[9999]" style={{ top: TOP_SAFE(useSafeAreaInsets()) }}>

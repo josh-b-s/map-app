@@ -139,8 +139,32 @@ export interface GtfsJourney {
     arrivalTime: string;
 }
 
+export interface GtfsDebugInfo {
+    /** Every stop the corridor filter kept, for drawing "here's the search
+     *  space" on the map. */
+    corridorStops: LatLng[];
+    /** The raw BFS seed paths the corridor was tapered around — one
+     *  polyline per path, in origin->destination order. */
+    seedPaths: LatLng[][];
+    /** BFS's frontier at the end of each level, in order — level 0 is the
+     *  origin seed set. Lets a debug replay show the coarse-graph search
+     *  expanding outward before any of the corridor/RAPTOR stages. */
+    bfsLevels: LatLng[][];
+    /** RAPTOR's marked-stop set at the END of each round, one entry per
+     *  round actually run. Lets a debug overlay show the search frontier
+     *  expanding round by round. */
+    roundMarkedStops: LatLng[][];
+    /** One tapered-buffer outline per seed path (left/right boundary
+     *  polylines) — lets a debug overlay draw the corridor as a single
+     *  shape instead of scattering a marker over every tagged stop. */
+    corridorBoundary: { left: LatLng[]; right: LatLng[] }[];
+}
+
 export interface GtfsRouteResult {
     journeys: GtfsJourney[]; // sorted by arrival time ascending; caller can re-sort
+    /** Only populated when computeGtfsRoute is called with debugMode=true —
+     *  omitted entirely otherwise so normal searches pay zero cost for this. */
+    debug?: GtfsDebugInfo;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,11 +203,19 @@ export async function computeGtfsRoute(
     destination: LatLng,
     departureTime: Date = new Date(),
     walkingSpeedMps: number = WALK_SPEED_MPS.NORMAL,
+    debugMode: boolean = false,
 ): Promise<GtfsRouteResult> {
+    // Captured BEFORE the load, not inside runSearchOnIndex — otherwise the
+    // "TOTAL search time" logged at the end only measures post-load work,
+    // silently dropping the load's cost (which was ~14s in testing) from
+    // the reported total. This bit us directly: a 4.2s "TOTAL search time"
+    // log next to a 14.4s "TOTAL scoped load time" log made a ~18.6s search
+    // look like a 4.2s one.
+    const overallStart = Date.now();
     let index = await loadGtfsIndexForTrip(origin, destination, departureTime);
 
     try {
-        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps);
+        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps, debugMode, overallStart);
     } catch (err) {
         // Two different failure shapes, only one of which widening can fix:
         //  - index.noServiceFound: gtfsLoader already widened its own window
@@ -201,7 +233,7 @@ export async function computeGtfsRoute(
 
         console.log('[gtfsRoute] search failed despite active trips in window — retrying once with a forced-wide (10h) window');
         index = await loadGtfsIndexForTrip(origin, destination, departureTime, { forceWindowSec: 10 * 3600 });
-        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps);
+        return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps, debugMode, overallStart);
     }
 }
 
@@ -211,11 +243,13 @@ async function runSearchOnIndex(
     destination: LatLng,
     departureTime: Date,
     walkingSpeedMps: number,
+    debugMode: boolean,
+    overallStart: number,
 ): Promise<GtfsRouteResult> {
     const tStart = Date.now();
     let t = tStart;
     const lap = (label: string) => { console.log(`[gtfsRoute] ${label}: ${Date.now() - t}ms`); t = Date.now(); };
-    lap('loadGtfsIndexForTrip (scoped to this search)');
+    lap(`post-load setup (load itself took ${tStart - overallStart}ms — see gtfsLoader's own TOTAL log for its breakdown)`);
 
     const departSec  = toSecsMidnight(departureTime);
     const xferRadius = transferRadiusM(walkingSpeedMps);
@@ -289,7 +323,36 @@ async function runSearchOnIndex(
     for (const key of marked) tryRecordDestination(key);
     lap('seed + initial destination check');
 
+    // Debug-only: snapshot marked-stop coordinates at the end of each round,
+    // so a debug overlay can show the RAPTOR frontier expanding round by
+    // round. Skipped entirely when !debugMode — this is otherwise a
+    // per-round Set->Array->coord-lookup pass, cheap but not free, and
+    // there's no reason to pay it on every normal search.
+    const debugRoundMarkedStops: LatLng[][] = [];
+
     // ── RAPTOR rounds ─────────────────────────────────────────────────────────
+    // Reverse index: stopKey -> every pattern that serves it, built ONCE
+    // before the round loop (a pattern's stop membership never changes
+    // round to round, so re-deriving this from ALL of index.patternStops on
+    // every round — as a previous version of this loop did — was pure
+    // waste: it turned each round into an O(every candidate pattern's every
+    // stop) scan instead of the O(marked stops) lookup RAPTOR is supposed
+    // to cost. With a few hundred candidate patterns averaging dozens of
+    // stops each, that was tens of thousands of wasted entry-scans PER
+    // ROUND, repeated for every round — the actual reason a RAPTOR search
+    // was taking ~5s on-device instead of the low tens of milliseconds it
+    // should. Building this index costs the same O(total pattern_stops)
+    // work, but exactly once per search, not once per round.
+    const patternsByStop = new Map<StopKey, Array<{ patternKey: string; seq: number }>>();
+    for (const [patternKey, seqList] of index.patternStops) {
+        const { agency: patAgency } = parseKey(patternKey); // agency-first key, safe regardless of colons in pattern_id
+        for (const entry of seqList) {
+            const sk = keyOf(entry.stop_id, patAgency);
+            if (!patternsByStop.has(sk)) patternsByStop.set(sk, []);
+            patternsByStop.get(sk)!.push({ patternKey, seq: entry.stop_sequence });
+        }
+    }
+
     for (let round = 0; round < MAX_ROUNDS && marked.size > 0; round++) {
         const roundStart = Date.now();
 
@@ -316,17 +379,13 @@ async function runSearchOnIndex(
 
         const newlyMarked = new Set<StopKey>();
 
-        // For each marked stop, find every pattern serving it (via patternStops
-        // reverse lookup — build once per round scoped to marked stops only).
+        // For each marked stop, find every pattern serving it — O(marked
+        // stops) lookup against the reverse index built once above, instead
+        // of re-scanning every candidate pattern's every stop on every round.
         const patternsAtStop = new Map<StopKey, Array<{ patternKey: string; seq: number }>>();
-        for (const [patternKey, seqList] of index.patternStops) {
-            const { agency: patAgency } = parseKey(patternKey); // agency-first key, safe regardless of colons in pattern_id
-            for (const entry of seqList) {
-                const sk = keyOf(entry.stop_id, patAgency);
-                if (!marked.has(sk)) continue;
-                if (!patternsAtStop.has(sk)) patternsAtStop.set(sk, []);
-                patternsAtStop.get(sk)!.push({ patternKey, seq: entry.stop_sequence });
-            }
+        for (const sk of marked) {
+            const patterns = patternsByStop.get(sk);
+            if (patterns) patternsAtStop.set(sk, patterns);
         }
 
         // Group by pattern: which marked stops board it, and at what τ.
@@ -454,6 +513,14 @@ async function runSearchOnIndex(
             const d = haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon });
             if (d < closestToDestM) closestToDestM = d;
         }
+        if (debugMode) {
+            const coords: LatLng[] = [];
+            for (const key of marked) {
+                const s = index.stopsByKey.get(key);
+                if (s) coords.push({ latitude: s.stop_lat, longitude: s.stop_lon });
+            }
+            debugRoundMarkedStops.push(coords);
+        }
         console.log(`[gtfsRoute] round ${round}: ${Date.now() - roundStart}ms (marked=${marked.size}, closestToDestination=${Math.round(closestToDestM)}m)`);
     }
     t = Date.now();
@@ -546,9 +613,39 @@ async function runSearchOnIndex(
     journeys.sort((a, b) => a.arrivalTime.localeCompare(b.arrivalTime));
     lap(`path reconstruction (${journeys.length} journeys)`);
 
-    console.log(`[gtfsRoute] TOTAL search time: ${Date.now() - tStart}ms`);
+    let debug: GtfsDebugInfo | undefined;
+    if (debugMode) {
+        // corridorStopIds is keyed by plain stop_id (not the composite
+        // agency:stop_id key stopsByKey uses) — same convention as the
+        // corridorStops filter earlier in this function.
+        const corridorStops: LatLng[] = index.allStops
+            .filter(s => index.corridorStopIds.has(s.stop_id))
+            .map(s => ({ latitude: s.stop_lat, longitude: s.stop_lon }));
+        const seedPaths: LatLng[][] = index.debugSeedPaths.map(path =>
+            path.map(key => {
+                const s = index.stopsByKey.get(key); // seed path keys ARE composite (from coarseGraph)
+                return s ? { latitude: s.stop_lat, longitude: s.stop_lon } : null;
+            }).filter((p): p is LatLng => p !== null),
+        );
+        const bfsLevels: LatLng[][] = index.debugBfsLevels.map(level =>
+            level.map(key => {
+                const s = index.stopsByKey.get(key);
+                return s ? { latitude: s.stop_lat, longitude: s.stop_lon } : null;
+            }).filter((p): p is LatLng => p !== null),
+        );
+        // lat/lon -> latitude/longitude naming convention swap only; no
+        // computation happens here, corridorTagging.ts already did the work.
+        const corridorBoundary = index.debugCorridorBoundary.map(b => ({
+            left: b.left.map(p => ({ latitude: p.lat, longitude: p.lon })),
+            right: b.right.map(p => ({ latitude: p.lat, longitude: p.lon })),
+        }));
+        debug = { corridorStops, seedPaths, bfsLevels, roundMarkedStops: debugRoundMarkedStops, corridorBoundary };
+        lap(`debug payload assembled (${corridorStops.length} corridor stops, ${seedPaths.length} seed paths, ${bfsLevels.length} BFS levels, ${debugRoundMarkedStops.length} rounds, ${corridorBoundary.length} corridor boundaries)`);
+    }
 
-    return { journeys };
+    console.log(`[gtfsRoute] post-load search time: ${Date.now() - tStart}ms | TRUE total (incl. load): ${Date.now() - overallStart}ms`);
+
+    return { journeys, debug };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

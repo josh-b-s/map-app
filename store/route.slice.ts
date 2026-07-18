@@ -1,14 +1,21 @@
 import { createAsyncThunk, createSlice, PayloadAction } from '@reduxjs/toolkit';
 import type { LatLng } from '@/services/places';
 import { computeGtfsRoute, GtfsRouteResult, GtfsJourney } from '@/services/gtfsRouter';
+import { setDebugData } from './debug.slice';
 
 export const computeRoute = createAsyncThunk<
     GtfsRouteResult,
-    { origin: LatLng; destination: LatLng },
+    { origin: LatLng; destination: LatLng; debugMode?: boolean },
     { rejectValue: string }
->('route/compute', async ({ origin, destination }, { rejectWithValue }) => {
+>('route/compute', async ({ origin, destination, debugMode = false }, { rejectWithValue, dispatch }) => {
     try {
-        return await computeGtfsRoute(origin, destination);
+        const result = await computeGtfsRoute(origin, destination, undefined, undefined, debugMode);
+        // Dispatched here (inside the thunk) rather than via route.slice's own
+        // extraReducers, since debug data belongs in debug.slice, not route
+        // state — this keeps "what journey is displayed" and "what did the
+        // search look like internally" as separate concerns.
+        dispatch(setDebugData(debugMode ? (result.debug ?? null) : null));
+        return result;
     } catch (err) {
         return rejectWithValue(String(err));
     }
