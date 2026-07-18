@@ -57,7 +57,7 @@ export function invalidateStopsCache(): void {
     stopsCachePromise = null;
 }
 
-async function getAllStopsCached(db: Awaited<ReturnType<typeof getDb>>): Promise<StopInfo[]> {
+export async function getAllStopsCached(db: Awaited<ReturnType<typeof getDb>>): Promise<StopInfo[]> {
     if (stopsCache) return stopsCache;
     if (stopsCachePromise) return stopsCachePromise;
 
@@ -173,12 +173,26 @@ async function chunkedQuery<T, R>(
     items: T[],
     chunkSize: number,
     queryFn: (chunk: T[]) => Promise<R[]>,
+    // Optional label — when provided, logs each individual chunk's timing.
+    // Off by default (each call site opts in) since most callers already
+    // have a single lap() covering the whole chunked query and don't need
+    // per-chunk detail; this exists purely for tracking down variance that
+    // a single before/after timestamp can't distinguish (e.g. "is chunk 3
+    // of 12 disproportionately slow, or is the cost spread evenly?").
+    debugLabel?: string,
 ): Promise<R[]> {
     if (items.length === 0) return [];
     const out: R[] = [];
+    const numChunks = Math.ceil(items.length / chunkSize);
     for (let i = 0; i < items.length; i += chunkSize) {
         const chunk = items.slice(i, i + chunkSize);
+        const chunkIdx = Math.floor(i / chunkSize);
+        const cT0 = debugLabel ? Date.now() : 0;
         const rows = await queryFn(chunk);
+        if (debugLabel) {
+            console.log(`[gtfsLoader]   [DIAGNOSTIC] ${debugLabel} chunk ${chunkIdx + 1}/${numChunks} ` +
+                `(${chunk.length} items -> ${rows.length} rows): ${Date.now() - cT0}ms`);
+        }
         for (const r of rows) out.push(r);
     }
     return out;
@@ -293,18 +307,19 @@ export async function loadGtfsIndexForTrip(
         const json = JSON.stringify(stopIdList);
         await db.runAsync(
             `INSERT OR IGNORE INTO _corridor_stop_ids (stop_id)
-             SELECT value FROM json_each(?)`,
+            SELECT value FROM json_each(?)`,
             [json],
         );
     }
     t = lap(`corridor stop_ids staged into temp table (${stopIdList.length} rows)`, t);
 
-    // ── 3. Which patterns pass through the corridor? (chunked IN query) ──────
-    const candidatePatternRows = await chunkedQuery(stopIdList, SQL_CHUNK_SIZE, chunk =>
-        db.getAllAsync<{ pattern_id: string; agency: number }>(
-            `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (${placeholders(chunk.length)})`,
-            chunk,
-        ),
+    // ── 3. Which patterns pass through the corridor? Single json_each
+    //      statement instead of chunking — same reasoning as the queries
+    //      below; this one was already fast (59-237ms) so the win is
+    //      smaller, but no reason to leave a different pattern here ───────
+    const candidatePatternRows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
+        `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
+        [JSON.stringify(stopIdList)],
     );
     const candidatePatternKeys = new Set<string>(candidatePatternRows.map(r => makeKey(r.agency, r.pattern_id)));
     t = lap(`candidate patterns discovery (${candidatePatternKeys.size} patterns)`, t);
@@ -374,22 +389,27 @@ export async function loadGtfsIndexForTrip(
     // service_id (without agency) is used as the SQL-side filter — a looser
     // check than the exact (agency, service_id) match, but that exact check
     // still runs client-side below via activeServices.has(...), so this is
-    // purely a row-count reduction, not a correctness dependency. Chunk size
-    // is reduced here (not SQL_CHUNK_SIZE) since this query now binds BOTH
-    // the pattern-id chunk AND the full active-service-id list in one
-    // statement — needs to stay comfortably under the bound-parameter limit
-    // together, not just individually.
+    // purely a row-count reduction, not a correctness dependency.
+    // Single statement via json_each instead of a chunked multi-round-trip
+    // query. The old version needed BOTH the pattern-id chunk AND the full
+    // active-service-id list bound together (hence the awkward
+    // MAX_COMBINED_PARAMS/TRIPS_QUERY_PATTERN_CHUNK math above), which for
+    // 1343 candidate patterns meant ~27 separate round trips (profiled at
+    // 1.3-2.3s total, mostly round-trip overhead rather than SQLite's own
+    // work — individual chunks ran in 20-300ms regardless of row count).
+    // json_each expands BOTH lists server-side from two bound JSON-array
+    // parameters, so the whole query becomes ONE round trip no matter how
+    // many candidate patterns or active services there are.
     const activeServiceIdList = [...new Set([...activeServices].map(k => parseKey(k).id))];
-    const MAX_COMBINED_PARAMS = 700; // stay well under the 999 conservative bound
-    const TRIPS_QUERY_PATTERN_CHUNK = Math.max(50, Math.min(300, MAX_COMBINED_PARAMS - activeServiceIdList.length));
+    const patternIdsJson = JSON.stringify(uniquePatternIds);
+    const serviceIdsJson = JSON.stringify(activeServiceIdList);
     const tripRows = activeServiceIdList.length > 0
-        ? await chunkedQuery(uniquePatternIds, TRIPS_QUERY_PATTERN_CHUNK, chunk =>
-            db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string; service_id: string }>(
-                `SELECT trip_id, agency, pattern_id, service_id FROM trips
-                 WHERE pattern_id IN (${placeholders(chunk.length)})
-                   AND service_id IN (${placeholders(activeServiceIdList.length)})`,
-                [...chunk, ...activeServiceIdList],
-            ),
+        ? await db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string; service_id: string }>(
+            `SELECT t.trip_id, t.agency, t.pattern_id, t.service_id
+             FROM trips t
+             WHERE t.pattern_id IN (SELECT value FROM json_each(?))
+               AND t.service_id IN (SELECT value FROM json_each(?))`,
+            [patternIdsJson, serviceIdsJson],
         )
         : [];
     t = lap(`trips for candidates, pre-filtered (${tripRows.length} rows)`, t);
@@ -429,14 +449,14 @@ export async function loadGtfsIndexForTrip(
 
     // ── 6. Full pattern_stops for patterns running today (need whole
     //      sequence, not just in-corridor stops, so stop_sequence numbering
-    //      stays intact) — narrowed set, per the reorder above ────────────
-    const psRows = await chunkedQuery(patternIdsRunningToday, SQL_CHUNK_SIZE, chunk =>
-        db.getAllAsync<{ pattern_id: string; stop_id: string; stop_sequence: number; agency: number }>(
-            `SELECT pattern_id, stop_id, stop_sequence, agency FROM pattern_stops
-             WHERE pattern_id IN (${placeholders(chunk.length)})
-             ORDER BY pattern_id, stop_sequence`,
-            chunk,
-        ),
+    //      stays intact) — narrowed set, per the reorder above. Single
+    //      json_each statement instead of chunking (profiled: 3 chunks,
+    //      735-1179ms combined, mostly per-chunk overhead) ────────────────
+    const psRows = await db.getAllAsync<{ pattern_id: string; stop_id: string; stop_sequence: number; agency: number }>(
+        `SELECT pattern_id, stop_id, stop_sequence, agency FROM pattern_stops
+         WHERE pattern_id IN (SELECT value FROM json_each(?))
+         ORDER BY pattern_id, stop_sequence`,
+        [JSON.stringify(patternIdsRunningToday)],
     );
     t = lap(`pattern_stops for patterns running today (${psRows.length} rows)`, t);
 
@@ -448,21 +468,20 @@ export async function loadGtfsIndexForTrip(
         patternStops.get(key)!.push({ stop_id: r.stop_id, stop_sequence: r.stop_sequence });
     }
 
-    // ── 7. Pattern + route metadata, same narrowed set ─────────────────────
-    const patternRows = await chunkedQuery(patternIdsRunningToday, SQL_CHUNK_SIZE, chunk =>
-        db.getAllAsync<{
-            pattern_id: string; route_id: string; agency: number; shape_id: string | null;
-            route_short_name: string; route_long_name: string; route_type: number;
-            route_color: string; route_text_color: string;
-        }>(
-            `SELECT p.pattern_id, p.route_id, p.agency, p.shape_id,
-                    r.route_short_name, r.route_long_name, r.route_type,
-                    r.route_color, r.route_text_color
-             FROM patterns p
-                      JOIN routes r ON r.route_id = p.route_id AND r.agency = p.agency
-             WHERE p.pattern_id IN (${placeholders(chunk.length)})`,
-            chunk,
-        ),
+    // ── 7. Pattern + route metadata, same narrowed set — single json_each
+    //      statement instead of chunking ──────────────────────────────────
+    const patternRows = await db.getAllAsync<{
+        pattern_id: string; route_id: string; agency: number; shape_id: string | null;
+        route_short_name: string; route_long_name: string; route_type: number;
+        route_color: string; route_text_color: string;
+    }>(
+        `SELECT p.pattern_id, p.route_id, p.agency, p.shape_id,
+                r.route_short_name, r.route_long_name, r.route_type,
+                r.route_color, r.route_text_color
+         FROM patterns p
+                  JOIN routes r ON r.route_id = p.route_id AND r.agency = p.agency
+         WHERE p.pattern_id IN (SELECT value FROM json_each(?))`,
+        [JSON.stringify(patternIdsRunningToday)],
     );
     t = lap(`patterns+routes for patterns running today (${patternRows.length} rows)`, t);
 
@@ -515,7 +534,7 @@ export async function loadGtfsIndexForTrip(
         const json = JSON.stringify(activeTripRows.map(r => [r.id, r.agency]));
         await db.runAsync(
             `INSERT OR IGNORE INTO _active_trip_keys (trip_id, agency)
-             SELECT value ->> 0, value ->> 1 FROM json_each(?)`,
+            SELECT value ->> 0, value ->> 1 FROM json_each(?)`,
             [json],
         );
     }
@@ -581,15 +600,15 @@ export async function loadGtfsIndexForTrip(
         // stop in the time window (51K+ rows in testing) and discarded ~92%
         // of them in JS afterward; the discarded rows' bridge-marshal cost
         // was the actual bottleneck (~12.8s), not SQLite's query time itself.
-        windowedRows = await chunkedQuery(stopIdList, SQL_CHUNK_SIZE, chunk =>
-            db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string }>(
-                `SELECT DISTINCT st.trip_id, st.agency, st.pattern_id
-                 FROM stop_times st
-                          JOIN _active_trip_keys atk ON atk.trip_id = st.trip_id AND atk.agency = st.agency
-                 WHERE st.stop_id IN (${placeholders(chunk.length)})
-                   AND st.departure_sec BETWEEN ? AND ?`,
-                [...chunk, windowLo, windowHi],
-            ),
+        // Single json_each statement instead of chunking over stopIdList —
+        // same round-trip-elimination reasoning as the other queries above.
+        windowedRows = await db.getAllAsync<{ trip_id: string; agency: number; pattern_id: string }>(
+            `SELECT DISTINCT st.trip_id, st.agency, st.pattern_id
+             FROM stop_times st
+                      JOIN _active_trip_keys atk ON atk.trip_id = st.trip_id AND atk.agency = st.agency
+             WHERE st.stop_id IN (SELECT value FROM json_each(?))
+               AND st.departure_sec BETWEEN ? AND ?`,
+            [JSON.stringify(stopIdList), windowLo, windowHi],
         );
         t = lap(`time-windowed trip discovery, stage ${stageIdx} (${(windowSec / 3600).toFixed(1)}h -> ${windowedRows.length} candidate trips, pre-filtered)`, t);
 
@@ -614,27 +633,28 @@ export async function loadGtfsIndexForTrip(
         console.log(`[gtfsLoader] no active trips found even after widening to ${(WINDOW_STAGES_SEC[WINDOW_STAGES_SEC.length - 1] / 3600).toFixed(1)}h — likely genuinely no service in this window`);
     }
 
+    // Single json_each statement instead of chunking over
+    // windowedActiveTripIds — same round-trip-elimination reasoning as the
+    // other queries above. (Earlier COUNT(*)-only diagnostic confirmed
+    // ~85% of this query's cost was JS<->native row marshaling, not SQLite
+    // execution — removed now that its purpose is served.)
     const stopTimeRows = windowedActiveTripIds.length > 0
-        ? await chunkedQuery(windowedActiveTripIds, SQL_CHUNK_SIZE, chunk =>
-            db.getAllAsync<{
-                trip_id: string; agency: number; stop_id: string; stop_sequence: number;
-                arrival_sec: number; departure_sec: number; pattern_id: string;
-            }>(
-                // JOINed against the corridor stop set (see step 2b) instead of
-                // fetching every stop of every trip. Safe because gtfsRouter's
-                // trip-riding loop already does `if (!tripMap) continue` for any
-                // stop it has no data for — a long trip that only briefly
-                // passes through the corridor (e.g. a regional service mostly
-                // running elsewhere) previously had its ENTIRE stop sequence
-                // fetched; now only the corridor-relevant stops are. This was
-                // the single biggest remaining cost after the earlier
-                // active-trip-key fix (190K+ rows, ~5.5s in testing).
-                `SELECT st.trip_id, st.agency, st.stop_id, st.stop_sequence, st.arrival_sec, st.departure_sec, st.pattern_id
-                 FROM stop_times st
-                          JOIN _corridor_stop_ids csi ON csi.stop_id = st.stop_id
-                 WHERE st.trip_id IN (${placeholders(chunk.length)})`,
-                chunk,
-            ),
+        ? await db.getAllAsync<{
+            trip_id: string; agency: number; stop_id: string; stop_sequence: number;
+            arrival_sec: number; departure_sec: number; pattern_id: string;
+        }>(
+            // JOINed against the corridor stop set (see step 2b) instead of
+            // fetching every stop of every trip. Safe because gtfsRouter's
+            // trip-riding loop already does `if (!tripMap) continue` for any
+            // stop it has no data for — a long trip that only briefly
+            // passes through the corridor (e.g. a regional service mostly
+            // running elsewhere) previously had its ENTIRE stop sequence
+            // fetched; now only the corridor-relevant stops are.
+            `SELECT st.trip_id, st.agency, st.stop_id, st.stop_sequence, st.arrival_sec, st.departure_sec, st.pattern_id
+             FROM stop_times st
+                      JOIN _corridor_stop_ids csi ON csi.stop_id = st.stop_id
+             WHERE st.trip_id IN (SELECT value FROM json_each(?))`,
+            [JSON.stringify(windowedActiveTripIds)],
         )
         : [];
     t = lap(`stop_times for windowed trips (${stopTimeRows.length} rows)`, t);
