@@ -150,6 +150,10 @@ export interface GtfsDebugInfo {
      *  origin seed set. Lets a debug replay show the coarse-graph search
      *  expanding outward before any of the corridor/RAPTOR stages. */
     bfsLevels: LatLng[][];
+    /** The BFS exploration tree's (parent, child) edges as LatLng pairs —
+     *  lets a debug overlay draw the search as a connected "web" (merged
+     *  polylines along tree branches) instead of per-stop dots. */
+    bfsTreeEdges: { from: LatLng; to: LatLng }[];
     /** RAPTOR's marked-stop set at the END of each round, one entry per
      *  round actually run. Lets a debug overlay show the search frontier
      *  expanding round by round. */
@@ -158,6 +162,12 @@ export interface GtfsDebugInfo {
      *  polylines) — lets a debug overlay draw the corridor as a single
      *  shape instead of scattering a marker over every tagged stop. */
     corridorBoundary: { left: LatLng[]; right: LatLng[] }[];
+    /** Fixed walk-tolerance radius circles at origin/destination — see
+     *  corridorTagging.ts's ORIGIN_DEST_WALK_RADIUS_M. These get unioned
+     *  into the real corridor regardless of the taper, so without drawing
+     *  them explicitly the debug view understates the corridor's true
+     *  extent at both ends. */
+    walkRadiusCircles: { center: LatLng; radiusMeters: number }[];
 }
 
 export interface GtfsRouteResult {
@@ -633,13 +643,26 @@ async function runSearchOnIndex(
                 return s ? { latitude: s.stop_lat, longitude: s.stop_lon } : null;
             }).filter((p): p is LatLng => p !== null),
         );
+        const bfsTreeEdges = index.debugBfsTreeEdges.map(([fromKey, toKey]) => {
+            const fromStop = index.stopsByKey.get(fromKey);
+            const toStop = index.stopsByKey.get(toKey);
+            if (!fromStop || !toStop) return null;
+            return {
+                from: { latitude: fromStop.stop_lat, longitude: fromStop.stop_lon },
+                to: { latitude: toStop.stop_lat, longitude: toStop.stop_lon },
+            };
+        }).filter((e): e is { from: LatLng; to: LatLng } => e !== null);
         // lat/lon -> latitude/longitude naming convention swap only; no
         // computation happens here, corridorTagging.ts already did the work.
         const corridorBoundary = index.debugCorridorBoundary.map(b => ({
             left: b.left.map(p => ({ latitude: p.lat, longitude: p.lon })),
             right: b.right.map(p => ({ latitude: p.lat, longitude: p.lon })),
         }));
-        debug = { corridorStops, seedPaths, bfsLevels, roundMarkedStops: debugRoundMarkedStops, corridorBoundary };
+        const walkRadiusCircles = [
+            { center: origin, radiusMeters: index.debugWalkRadiusM },
+            { center: destination, radiusMeters: index.debugWalkRadiusM },
+        ];
+        debug = { corridorStops, seedPaths, bfsLevels, bfsTreeEdges, roundMarkedStops: debugRoundMarkedStops, corridorBoundary, walkRadiusCircles };
         lap(`debug payload assembled (${corridorStops.length} corridor stops, ${seedPaths.length} seed paths, ${bfsLevels.length} BFS levels, ${debugRoundMarkedStops.length} rounds, ${corridorBoundary.length} corridor boundaries)`);
     }
 

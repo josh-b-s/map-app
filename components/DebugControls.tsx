@@ -3,7 +3,7 @@ import { Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
-import { advanceStep, CORRIDOR_CHUNK_COUNT, DebugPhase, retreatStep, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
+import { advanceStep, BFS_REVEAL_STEPS, CORRIDOR_CHUNK_COUNT, DebugPhase, retreatStep, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 
 const PHASE_LABELS: Record<DebugPhase, string> = {
@@ -42,7 +42,11 @@ export default function DebugControls() {
     }, [playing, dispatch]);
 
     const hasData = !!data;
-    const stepLabel = phase === 'bfs' ? `Level ${stepIndex}/${Math.max(0, (data?.bfsLevels.length ?? 1) - 1)}`
+    // "BFS exploring" no longer maps to a real level count — it's now a
+    // fixed number of reveal-chunks over bfsTreeEdges in true discovery
+    // order (see debug.slice.ts's BFS_REVEAL_STEPS), so the label shows
+    // reveal progress rather than a level number.
+    const stepLabel = phase === 'bfs' ? `Exploring ${stepIndex + 1}/${BFS_REVEAL_STEPS}`
         : phase === 'raptor' ? `Round ${stepIndex}/${Math.max(0, (data?.roundMarkedStops.length ?? 1) - 1)}`
         : phase === 'corridor' ? `Chunk ${stepIndex + 1}/${CORRIDOR_CHUNK_COUNT}`
         : PHASE_LABELS[phase];

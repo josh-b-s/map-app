@@ -58,19 +58,32 @@ async function ensureTables(db: SQLiteDatabase): Promise<void> {
     `);
 }
 
+const FIELD_SEP = '\x1e';     // record separator — splits "to+kind" from the optional viaPatternKey
+
 // cost is fully determined by kind (transit=1, walk=0.5 — see coarseGraph.ts),
-// so we only ever need to persist the kind, not the cost, per edge.
+// so we only ever need to persist the kind (and now, optionally, which
+// pattern produced a transit edge — see CoarseEdge.viaPatternKey), not cost.
 function encodeEdges(edges: CoarseEdge[]): string {
-    return edges.map(e => `${e.to}${e.kind === 'transit' ? KIND_TRANSIT : KIND_WALK}`).join(EDGE_SEP);
+    return edges.map(e => {
+        const base = `${e.to}${e.kind === 'transit' ? KIND_TRANSIT : KIND_WALK}`;
+        // Only append the field separator + pattern key when there IS one —
+        // keeps walk edges (which never have a pattern) at their old,
+        // slightly shorter encoding rather than padding every row.
+        return e.viaPatternKey ? `${base}${FIELD_SEP}${e.viaPatternKey}` : base;
+    }).join(EDGE_SEP);
 }
 
 function decodeEdges(packed: string): CoarseEdge[] {
     if (!packed) return [];
     return packed.split(EDGE_SEP).map(tok => {
-        const kindChar = tok[tok.length - 1];
-        const to = tok.slice(0, -1); // always our appended marker char, never part of the key
+        // Backward-compatible with graphs persisted before viaPatternKey
+        // existed: those tokens never contain FIELD_SEP, so the split just
+        // returns a single-element array and viaPatternKey stays undefined.
+        const [core, viaPatternKey] = tok.split(FIELD_SEP);
+        const kindChar = core[core.length - 1];
+        const to = core.slice(0, -1); // always our appended marker char, never part of the key
         const kind: CoarseEdge['kind'] = kindChar === KIND_TRANSIT ? 'transit' : 'walk';
-        return { to, kind, cost: kind === 'transit' ? 1 : 0.5 };
+        return { to, kind, cost: kind === 'transit' ? 1 : 0.5, viaPatternKey: viaPatternKey || undefined };
     });
 }
 

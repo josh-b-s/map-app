@@ -18,6 +18,13 @@ export interface SeedPathResult {
      *  debug visualization (replaying "BFS expanding outward level by
      *  level"); routing never reads this. */
     levelFrontiers: string[][];
+    /** Every (parent, child) edge actually traversed while building the BFS
+     *  tree, in discovery order. Purely for debug visualization — lets an
+     *  overlay draw the exploration as a connected "web" (merged polylines
+     *  along tree branches) instead of a scatter of per-stop points. Not
+     *  read by routing itself; this is just parentsOf flattened into pairs,
+     *  which the search already builds anyway. */
+    treeEdges: [string, string][];
 }
 
 const SAFETY_MARGIN_LEVELS = 1; // expand one extra full level past first hit
@@ -87,8 +94,17 @@ export function findSeedPaths(
         if (frontier.size === 0) break;
     }
 
+    // Flatten parentsOf (child -> set of predecessors) into a plain edge
+    // list once, after the search loop is done — cheap (one pass over the
+    // same map the search already built) and purely for the debug overlay's
+    // web-view rendering. Not used by routing/reconstruction below.
+    const treeEdges: [string, string][] = [];
+    for (const [child, parents] of parentsOf) {
+        for (const parent of parents) treeEdges.push([parent, child]);
+    }
+
     if (firstHitLevel < 0) {
-        return { paths: [], levelsExpanded: level, levelFrontiers };
+        return { paths: [], levelsExpanded: level, levelFrontiers, treeEdges };
     }
 
     // Reconstruct every distinct origin -> destination path by walking
@@ -126,5 +142,5 @@ export function findSeedPaths(
         backtrack(dKey, [], new Set());
     }
 
-    return { paths, levelsExpanded: level, levelFrontiers };
+    return { paths, levelsExpanded: level, levelFrontiers, treeEdges };
 }

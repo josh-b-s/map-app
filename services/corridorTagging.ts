@@ -41,6 +41,10 @@ export interface CorridorResult {
     /** BFS's per-level frontier snapshots (see seedRouteBfs.ts) — passed
      *  straight through for the debug replay. */
     levelFrontiers: string[][];
+    /** BFS's exploration-tree edges (see seedRouteBfs.ts's treeEdges) —
+     *  passed straight through so a debug overlay can render the search as
+     *  a connected "web" instead of a scatter of per-stop points. */
+    bfsTreeEdges: [string, string][];
     /** One tapered-buffer outline per seed path, in the same order as
      *  seedPaths. Lets a debug overlay draw the actual corridor SHAPE (the
      *  taper this module computes) as a single Polygon per path, instead of
@@ -64,7 +68,7 @@ const MIN_ACCEPTABLE_STOPS = 8;  // below this, treat as "suspiciously small" pe
 // boarding point than something further away that happened to fall inside
 // the tapered buffer along a seed path. This is a fixed walk-tolerance
 // circle around each endpoint, applied on every pass regardless of taper.
-const ORIGIN_DEST_WALK_RADIUS_M = 900;
+export const ORIGIN_DEST_WALK_RADIUS_M = 900;
 
 function haversineMeters(a: LatLon, b: LatLon): number {
     const R = 6_371_000;
@@ -263,12 +267,12 @@ async function runOnce(
     const tGraph0 = Date.now();
     const graph = await getCoarseGraph();
     const tGraph1 = Date.now();
-    const { paths, levelFrontiers } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
+    const { paths, levelFrontiers, treeEdges: bfsTreeEdges } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
     const tBfs1 = Date.now();
     console.log(`[corridorTagging] getCoarseGraph: ${tGraph1 - tGraph0}ms, BFS: ${tBfs1 - tGraph1}ms (${paths.length} paths)`);
 
     if (paths.length === 0) {
-        return { stopIds: new Set(), widened: false, seedPathCount: 0, seedPaths: [], levelFrontiers: [], corridorBoundaries: [] };
+        return { stopIds: new Set(), widened: false, seedPathCount: 0, seedPaths: [], levelFrontiers: [], bfsTreeEdges: [], corridorBoundaries: [] };
     }
 
     const union = new Set<string>();
@@ -296,7 +300,7 @@ async function runOnce(
     }
     console.log(`[corridorTagging] tagging (${paths.length} paths x ${candidates.length} candidates, bbox-filtered): ${Date.now() - tBfs1}ms -> ${union.size} stops`);
 
-    return { stopIds: union, widened: false, seedPathCount: paths.length, seedPaths: paths, levelFrontiers, corridorBoundaries };
+    return { stopIds: union, widened: false, seedPathCount: paths.length, seedPaths: paths, levelFrontiers, bfsTreeEdges, corridorBoundaries };
 }
 
 /**
@@ -304,6 +308,12 @@ async function runOnce(
  * if the result looks too small (spec step 5). If even the widened corridor
  * comes back empty/tiny, returns widened:true with whatever it found — the
  * caller (gtfsLoader) can decide whether to fall back to the full network.
+ *
+ * KEPT ONLY as the fallback path now — see computeSeedPathCorridor below,
+ * which is the normal path. This full bbox-tag-every-candidate-stop pass
+ * (~800-1500ms per call, tagging all ~29K stops against the tapered buffer)
+ * is only worth paying when the seed-path-derived approach can't find
+ * enough patterns to work with (e.g. BFS came back with very few/no paths).
  */
 const DEFAULT_MAX_TRANSFERS = 5;
 
@@ -321,4 +331,119 @@ export async function computeCorridor(
     console.log(`[corridorTagging] first pass gave only ${first.stopIds.size} stops (${first.seedPathCount} seed paths) — widening and retrying`);
     const widened = await runOnce(origin, destination, originStopKeys, destStopKeys, candidates, WIDEN_MIN_WIDTH_M, WIDEN_TAPER_K_M, maxTransfers);
     return { ...widened, widened: true };
+}
+
+/** Minimal DB shape this module needs — avoids importing gtfsDb's concrete
+ *  SQLiteDatabase class here (would be a layering inversion: gtfsDb is
+ *  lower-level than corridorTagging). Structurally compatible with the real
+ *  SQLiteDatabase passed in from gtfsLoader.ts. */
+interface QueryableDb {
+    getAllAsync<T>(sql: string, params?: any[]): Promise<T[]>;
+}
+
+export interface SeedPathCorridorResult {
+    /** Patterns that actually contain a consecutive stop-pair from some seed
+     *  path, per the DB (authoritative — not coarseGraph's lossy
+     *  viaPatternKey). Typically ~99% fewer than the old bbox-tag-then-query
+     *  approach, since it's bounded by "lines BFS actually found," not
+     *  "every pattern that geographically passes near the buffer." */
+    patternKeys: Set<string>;
+    /** Stops within the fixed walk-tolerance radius of origin/destination —
+     *  see ORIGIN_DEST_WALK_RADIUS_M. Unioned into the caller's final
+     *  allowedStopIds alongside every stop the kept patterns actually visit,
+     *  so a nearby-but-off-pattern boarding stop still isn't silently
+     *  dropped. This is the ONLY per-stop geometry pass this path does —
+     *  no tagStopsForPath, no bbox pre-filter, no taper. */
+    walkRadiusStopIds: Set<string>;
+    seedPathCount: number;
+    seedPaths: string[][];
+    levelFrontiers: string[][];
+    bfsTreeEdges: [string, string][];
+    /** Same taper-outline shape as CorridorBoundary — computed directly from
+     *  the seed paths for debug display only, no relation to which stops/
+     *  patterns get kept. */
+    corridorBoundaries: CorridorBoundary[];
+}
+
+/**
+ * Normal path (replaces computeCorridor for the common case): skips bbox
+ * tagging of every candidate stop entirely. Instead of "which stops fall in
+ * a tapered buffer around the seed paths, then which patterns touch those
+ * stops," this asks directly "which patterns actually run along the seed
+ * paths' consecutive stop-pairs" — the same authoritative DB check
+ * gtfsLoader.ts used to run only as a comparison diagnostic. Falls back to
+ * the caller invoking computeCorridor's bbox approach when this comes back
+ * too thin (see gtfsLoader.ts's MIN_ACCEPTABLE_PATTERNS check).
+ */
+export async function computeSeedPathCorridor(
+    origin: LatLon,
+    destination: LatLon,
+    originStopKeys: string[],
+    destStopKeys: string[],
+    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    maxTransfers: number,
+    db: QueryableDb,
+): Promise<SeedPathCorridorResult> {
+    const tGraph0 = Date.now();
+    const graph = await getCoarseGraph();
+    const tGraph1 = Date.now();
+    const { paths, levelFrontiers, treeEdges: bfsTreeEdges } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
+    const tBfs1 = Date.now();
+    console.log(`[corridorTagging] getCoarseGraph: ${tGraph1 - tGraph0}ms, BFS: ${tBfs1 - tGraph1}ms (${paths.length} paths)`);
+
+    const walkRadiusStopIds = new Set<string>();
+    for (const c of candidates) {
+        if (haversineMeters(origin, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(c.stop_id);
+        if (haversineMeters(destination, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(c.stop_id);
+    }
+
+    if (paths.length === 0) {
+        return {
+            patternKeys: new Set(), walkRadiusStopIds, seedPathCount: 0,
+            seedPaths: [], levelFrontiers, bfsTreeEdges, corridorBoundaries: [],
+        };
+    }
+
+    const corridorBoundaries: CorridorBoundary[] = paths.map(stopKeyPath => {
+        const polyline: LatLon[] = stopKeyPath.map(key => {
+            const node = graph.nodesByKey.get(key);
+            return node ? { lat: node.stop_lat, lon: node.stop_lon } : { lat: origin.lat, lon: origin.lon };
+        });
+        return boundaryForPath(polyline, MIN_WIDTH_M, TAPER_K_M);
+    });
+
+    // Patterns to keep: any pattern that stops at ANY stop the seed paths
+    // actually pass through — not just "patterns containing this exact
+    // consecutive pair." The earlier, tighter version (exact-pair match)
+    // only ever found the ONE pattern variant coarseGraph's clique-BFS
+    // happened to traverse between two stops, silently excluding sibling
+    // pattern variants (express/local, inbound/outbound stopping
+    // differences, etc) that serve the SAME physical stops. Those sibling
+    // variants are exactly what a real trip search needs to transfer onto
+    // at an interchange — without them RAPTOR can board once, then stall
+    // (this was the actual cause of "destination never reached," not a
+    // time-window issue: widening the search window earlier changed
+    // nothing, because the corridor's pattern set was the real bottleneck).
+    // Still much smaller than the old bbox approach: bounded by "stops the
+    // BFS paths actually visit" (a few hundred), not "every stop within a
+    // tapered buffer" (1359 in testing).
+    const coreStopIds = new Set<string>();
+    for (const path of paths) {
+        for (const stopKey of path) coreStopIds.add(parseKey(stopKey).id);
+    }
+
+    const patternKeys = new Set<string>();
+    if (coreStopIds.size > 0) {
+        const rows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
+            `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
+            [JSON.stringify([...coreStopIds])],
+        );
+        for (const r of rows) patternKeys.add(`${r.agency}:${r.pattern_id}`);
+    }
+    console.log(`[corridorTagging] seed-path-derived patterns: ${patternKeys.size} from ${coreStopIds.size} core stops (${paths.length} paths): ${Date.now() - tBfs1}ms`);
+
+    return {
+        patternKeys, walkRadiusStopIds, seedPathCount: paths.length,
+        seedPaths: paths, levelFrontiers, bfsTreeEdges, corridorBoundaries,
+    };
 }

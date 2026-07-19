@@ -45,7 +45,7 @@
 import type { LatLng } from './gtfsDb';
 import { getDb } from './gtfsDb';
 import { makeKey, parseKey } from './gtfsKeyUtil';
-import { computeCorridor } from './corridorTagging';
+import { computeCorridor, computeSeedPathCorridor, ORIGIN_DEST_WALK_RADIUS_M } from './corridorTagging';
 import type { CorridorBoundary } from './corridorTagging';
 
 let stopsCache: StopInfo[] | null = null;
@@ -134,6 +134,17 @@ export interface GtfsIndex {
      *  levelFrontiers. Purely for the debug replay's "BFS expanding
      *  outward" phase. */
     debugBfsLevels: string[][];
+    /** BFS exploration-tree edges (see corridorTagging.ts's
+     *  bfsTreeEdges) — lets the debug overlay render a connected "web"
+     *  instead of per-stop dots. */
+    debugBfsTreeEdges: [string, string][];
+    /** Fixed walk-tolerance radius (meters) that's always unioned into the
+     *  corridor around origin/destination regardless of the taper — see
+     *  corridorTagging.ts's ORIGIN_DEST_WALK_RADIUS_M. Exposed so the debug
+     *  overlay can draw the two radius circles explicitly; without this,
+     *  the debug view only showed the tapered polygon, understating the
+     *  real corridor's extent at both ends. */
+    debugWalkRadiusM: number;
     /** Tapered-buffer outline per seed path — see corridorTagging.ts's
      *  CorridorBoundary. Purely for the debug overlay's corridor-shape
      *  phase; routing never reads this. */
@@ -265,30 +276,118 @@ export async function loadGtfsIndexForTrip(
     const originSeedKeys = nearestForSeed(origin, NEAREST_FOR_CORRIDOR_SEED);
     const destSeedKeys = nearestForSeed(destination, NEAREST_FOR_CORRIDOR_SEED);
 
-    const corridor = await computeCorridor(
+    // ── 2. Corridor -> candidate patterns, derived DIRECTLY from seed paths ──
+    // Previously this ran an expensive bbox-tag-every-candidate-stop pass
+    // (~800-1500ms tagging all ~29K stops against a tapered buffer) just to
+    // then ask "which patterns touch these tagged stops" — which for a
+    // typical trip pulled in ~1300+ geographically-nearby patterns, most of
+    // which the BFS never actually used. Skip straight to "which patterns
+    // actually run along the seed paths' consecutive stop-pairs" — same
+    // authoritative DB check, ~99% fewer patterns, and no per-stop geometry
+    // pass at all (only origin/destination walk-radius stops get a
+    // haversine check now, not all 29K candidates against a taper).
+    const MIN_ACCEPTABLE_PATTERNS = 3; // below this, treat as suspiciously thin — fall back to the bbox corridor
+
+    let seedCorridor = await computeSeedPathCorridor(
         { lat: origin.latitude, lon: origin.longitude },
         { lat: destination.latitude, lon: destination.longitude },
         originSeedKeys,
         destSeedKeys,
         candidateAll,
         MAX_TRANSFERS,
+        db,
     );
 
+    let candidatePatternKeys: Set<string>;
     let allowedStopIds: Set<string>;
-    if (corridor.stopIds.size > 0) {
-        allowedStopIds = corridor.stopIds;
+    let widened = false;
+    let debugSeedPaths = seedCorridor.seedPaths;
+    let debugBfsLevels = seedCorridor.levelFrontiers;
+    let debugBfsTreeEdges = seedCorridor.bfsTreeEdges;
+    let debugCorridorBoundary = seedCorridor.corridorBoundaries;
+    let seedPathCount = seedCorridor.seedPathCount;
+
+    if (seedCorridor.patternKeys.size >= MIN_ACCEPTABLE_PATTERNS) {
+        candidatePatternKeys = seedCorridor.patternKeys;
+        t = lap(
+            `candidate patterns discovery, seed-path-derived (${candidatePatternKeys.size} patterns, ` +
+            `${seedCorridor.seedPathCount} seed paths)`,
+            t,
+        );
+
+        // allowedStopIds is derived from THREE sources, unioned:
+        //  1. The kept patterns' own full stop lists (they need to be loaded
+        //     for RAPTOR anyway).
+        //  2. The fixed walk-radius floor around origin/destination.
+        //  3. Every stop the seed paths themselves actually pass through —
+        //     INCLUDING walk-edge transfer stops. A seed path can hop
+        //     between two lines via a walk edge (coarseGraph.ts's
+        //     kind:'walk') where neither stop is necessarily on the same
+        //     pattern as the other — there IS no pattern connecting them,
+        //     by definition. Source (1) alone silently drops that transfer
+        //     stop if it doesn't happen to also sit on one of the kept
+        //     patterns' footprints, which starves RAPTOR at exactly that
+        //     transfer (this is what broke the destination-unreachable case
+        //     — round 1 marked collapsed from 326 to 44 with nothing left
+        //     to expand). Adding every path stopKey directly closes that gap.
+        if (candidatePatternKeys.size > 0) {
+            const patternIdList = [...candidatePatternKeys].map(k => parseKey(k).id);
+            const patternStopIdRows = await chunkedQuery(patternIdList, SQL_CHUNK_SIZE, chunk =>
+                db.getAllAsync<{ stop_id: string }>(
+                    `SELECT DISTINCT stop_id FROM pattern_stops WHERE pattern_id IN (${placeholders(chunk.length)})`,
+                    chunk,
+                ),
+            );
+            allowedStopIds = new Set(patternStopIdRows.map(r => r.stop_id));
+        } else {
+            allowedStopIds = new Set();
+        }
+        for (const s of seedCorridor.walkRadiusStopIds) allowedStopIds.add(s);
+        for (const path of seedCorridor.seedPaths) {
+            for (const stopKey of path) allowedStopIds.add(parseKey(stopKey).id);
+        }
+        t = lap(`corridor stops derived from kept patterns + walk radius + seed path stops (${allowedStopIds.size} stops)`, t);
     } else {
-        // Coarse BFS found nothing at all (e.g. disconnected topology data,
-        // or origin/destination not near any known stop) — fall back to the
-        // full network rather than returning zero stops.
-        console.log('[gtfsLoader] corridor came back empty even after widening — falling back to full network');
-        allowedStopIds = new Set(allStops.map(s => s.stop_id));
+        // Too thin (BFS found very few/no usable paths) — fall back to the
+        // old bbox-tag-then-query approach rather than risk under-serving a
+        // genuinely sparse or unusual trip.
+        console.log(`[gtfsLoader] seed-path corridor gave only ${seedCorridor.patternKeys.size} patterns — ` +
+            `falling back to bbox corridor tagging`);
+        const corridor = await computeCorridor(
+            { lat: origin.latitude, lon: origin.longitude },
+            { lat: destination.latitude, lon: destination.longitude },
+            originSeedKeys,
+            destSeedKeys,
+            candidateAll,
+            MAX_TRANSFERS,
+        );
+        widened = corridor.widened;
+        debugSeedPaths = corridor.seedPaths;
+        debugBfsLevels = corridor.levelFrontiers;
+        debugBfsTreeEdges = corridor.bfsTreeEdges;
+        debugCorridorBoundary = corridor.corridorBoundaries;
+        seedPathCount = corridor.seedPathCount;
+
+        if (corridor.stopIds.size > 0) {
+            allowedStopIds = corridor.stopIds;
+        } else {
+            console.log('[gtfsLoader] corridor came back empty even after widening — falling back to full network');
+            allowedStopIds = new Set(allStops.map(s => s.stop_id));
+        }
+        t = lap(
+            `corridor filter, bbox fallback (${allowedStopIds.size}/${allStops.length} stops kept, ` +
+            `${corridor.seedPathCount} seed paths, widened=${corridor.widened})`,
+            t,
+        );
+
+        const stopIdListForPatterns = [...allowedStopIds];
+        const candidatePatternRows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
+            `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
+            [JSON.stringify(stopIdListForPatterns)],
+        );
+        candidatePatternKeys = new Set<string>(candidatePatternRows.map(r => makeKey(r.agency, r.pattern_id)));
+        t = lap(`candidate patterns discovery, bbox fallback (${candidatePatternKeys.size} patterns)`, t);
     }
-    t = lap(
-        `corridor filter (${allowedStopIds.size}/${allStops.length} stops kept, ` +
-        `${corridor.seedPathCount} seed paths, widened=${corridor.widened})`,
-        t,
-    );
 
     // ── 2b. Stage corridor stop_ids into a temp table for later JOINs ────────
     // Reused by step 8b below to filter stop_times by corridor membership
@@ -300,10 +399,6 @@ export async function loadGtfsIndexForTrip(
          DELETE FROM _corridor_stop_ids;`,
     );
     {
-        // Same json_each approach as _active_trip_keys below — one
-        // statement instead of chunked round-trips. Fewer chunks here (only
-        // ~4 for 1359 stops) so the win is smaller, but no reason to leave
-        // a different pattern in place for a nearly-identical case.
         const json = JSON.stringify(stopIdList);
         await db.runAsync(
             `INSERT OR IGNORE INTO _corridor_stop_ids (stop_id)
@@ -313,17 +408,6 @@ export async function loadGtfsIndexForTrip(
     }
     t = lap(`corridor stop_ids staged into temp table (${stopIdList.length} rows)`, t);
 
-    // ── 3. Which patterns pass through the corridor? Single json_each
-    //      statement instead of chunking — same reasoning as the queries
-    //      below; this one was already fast (59-237ms) so the win is
-    //      smaller, but no reason to leave a different pattern here ───────
-    const candidatePatternRows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
-        `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
-        [JSON.stringify(stopIdList)],
-    );
-    const candidatePatternKeys = new Set<string>(candidatePatternRows.map(r => makeKey(r.agency, r.pattern_id)));
-    t = lap(`candidate patterns discovery (${candidatePatternKeys.size} patterns)`, t);
-
     if (candidatePatternKeys.size === 0) {
         return {
             stopsByKey, allStops, corridorStopIds: allowedStopIds, patternsByKey: new Map(), patternStops: new Map(),
@@ -331,6 +415,8 @@ export async function loadGtfsIndexForTrip(
             noServiceFound: true,
             debugSeedPaths: [],
             debugBfsLevels: [],
+            debugBfsTreeEdges: [],
+            debugWalkRadiusM: ORIGIN_DEST_WALK_RADIUS_M,
             debugCorridorBoundary: [],
         };
     }
@@ -434,9 +520,11 @@ export async function loadGtfsIndexForTrip(
             stopsByKey, allStops, corridorStopIds: allowedStopIds, patternsByKey: new Map(), patternStops: new Map(),
             stopTimesByStop: new Map(), stopTimesByStopAndTrip: new Map(), shapePoints: new Map(), serviceDate: dateStr,
             noServiceFound: true,
-            debugSeedPaths: corridor.seedPaths,
-            debugBfsLevels: corridor.levelFrontiers,
-            debugCorridorBoundary: corridor.corridorBoundaries,
+            debugSeedPaths,
+            debugBfsLevels,
+            debugBfsTreeEdges,
+            debugWalkRadiusM: ORIGIN_DEST_WALK_RADIUS_M,
+            debugCorridorBoundary,
         };
     }
 
@@ -695,8 +783,9 @@ export async function loadGtfsIndexForTrip(
     return {
         stopsByKey, allStops, corridorStopIds: allowedStopIds, patternsByKey, patternStops,
         stopTimesByStop, stopTimesByStopAndTrip, shapePoints, serviceDate: dateStr, noServiceFound,
-        debugSeedPaths: corridor.seedPaths, debugBfsLevels: corridor.levelFrontiers,
-        debugCorridorBoundary: corridor.corridorBoundaries,
+        debugSeedPaths, debugBfsLevels,
+        debugBfsTreeEdges, debugWalkRadiusM: ORIGIN_DEST_WALK_RADIUS_M,
+        debugCorridorBoundary,
     };
 }
 

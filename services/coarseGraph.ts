@@ -33,6 +33,17 @@ export interface CoarseEdge {
     to: string;      // stopKey
     cost: number;     // 1 = transit hop, 0.5 = walking edge
     kind: 'transit' | 'walk';
+    /** Which pattern (line) this transit edge came from — undefined for
+     *  walk edges. NOT used by routing/BFS itself (a coarse hop's cost is
+     *  still just kind-determined); this exists PURELY so a debug overlay
+     *  can later draw "the actual line just discovered" (its real stop
+     *  sequence) instead of a meaningless straight clique edge between two
+     *  arbitrary stops on that line. Previously this info was discarded
+     *  once the per-pattern clique was built, which is why the debug web
+     *  view could only ever draw clique geometry (straight lines between
+     *  stop-pairs that have no geographic meaning) rather than the actual
+     *  route shape. */
+    viaPatternKey?: string;
 }
 
 export interface CoarseGraph {
@@ -142,11 +153,18 @@ function buildAdjacencyFromScratch(
     const flushPattern = () => {
         if (patternStopKeys.length < 2) return;
         const n = patternStopKeys.length;
+        // NOTE ON DEDUP: addEdge dedups by `${kind}:${to}` per source stop —
+        // if two DIFFERENT patterns would produce the identical (from, to)
+        // transit edge (rare, but possible at a shared interchange), only
+        // the FIRST pattern's viaPatternKey attribution survives. Acceptable
+        // for a debug-only field: it just means the debug web might
+        // occasionally credit a shared edge to pattern A instead of B, with
+        // zero effect on routing itself (cost/kind are unaffected).
         if (n <= FULL_CLIQUE_MAX_STOPS) {
             for (let i = 0; i < n; i++) {
                 for (let j = i + 1; j < n; j++) {
-                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit' });
-                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit' });
+                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
+                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
                 }
             }
         } else {
@@ -157,8 +175,8 @@ function buildAdjacencyFromScratch(
             for (let i = 0; i < n; i++) {
                 for (const j of samples) {
                     if (j === i) continue;
-                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit' });
-                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit' });
+                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
+                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
                 }
             }
         }

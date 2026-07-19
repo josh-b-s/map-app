@@ -5,19 +5,45 @@ export type DebugPhase = 'bfs' | 'seed' | 'corridor' | 'raptor';
 const PHASE_ORDER: DebugPhase[] = ['bfs', 'seed', 'corridor', 'raptor'];
 
 // How many reveal-steps the corridor phase is broken into. Corridor tagging
-// itself doesn't have natural sequential steps the way BFS levels or RAPTOR
-// rounds do (it's one pass over precomputed seed paths), so this is an
-// artificial chunking purely for the "corridor assembling" visual — each
-// step reveals one more chunk of corridor stops.
+// itself doesn't have natural sequential steps the way RAPTOR rounds do
+// (it's one pass over precomputed seed paths), so this is an artificial
+// chunking purely for the "corridor assembling" visual — each step reveals
+// one more chunk of corridor stops.
 export const CORRIDOR_CHUNK_COUNT = 10;
 
+// BFS used to reveal one whole LEVEL per step (all of a level's frontier
+// appearing at once) — jarring for a big level, and doesn't read as "watch
+// it explore in the order it actually happened," which is what a debug viz
+// is for. This instead reveals bfsTreeEdges (already in true discovery
+// order — see seedRouteBfs.ts) progressively, in small batches, the same
+// artificial-chunking idea CORRIDOR_CHUNK_COUNT already uses one line up.
+export const BFS_REVEAL_STEPS = 40;
+
+// Hard cap on the number of edges fed into DebugMapOverlay's chain-merge
+// per render. NOT a visual preference: mergeEdgesIntoChains reduces the
+// NUMBER of native Polyline objects only as far as the graph's actual
+// branching allows, and this app's coarse graph deliberately builds
+// per-pattern CLIQUE edges (coarseGraph.ts: "a busy interchange stop can
+// pick up hundreds of edges") plus seedRouteBfs.ts's multi-parent tracking
+// (every sibling route reaching a stop at the same level is kept) — so a
+// big corridor's BFS tree can be large AND densely branched, which is
+// exactly the shape that does NOT collapse into a few long chains. This
+// cap is what actually bounds worst-case native object count regardless of
+// how well any one search's tree happens to merge; a still-images crash
+// log (java.lang.OutOfMemoryError, GL-Map thread, heap already at
+// 190-191MB/192MB before failing a 56-byte allocation) confirmed this gap
+// existed once the old per-stop Circle rendering (and its matching
+// MAX_DEBUG_MARKERS cap) was replaced with unbounded merged Polylines.
+export const MAX_BFS_DEBUG_EDGES = 600;
+
 // Hard cap on individually-rendered map markers (Circle) per debug step.
-// This is NOT a visual preference — react-native-maps backs each Circle with
-// a real native Google Maps object, and rendering hundreds-to-thousands of
-// them in one frame is what caused the OOM crash (corridor stops alone hit
-// 1359, RAPTOR rounds hit 2000-3000 marked stops in testing). Polylines
-// don't need this — one polyline is one native object regardless of point
-// count. See DebugMapOverlay.tsx's sampleForDisplay.
+// Still used by the corridor phase's walk-radius circles (always exactly
+// 2, well under this) and kept as the general reference cap for anything
+// that renders one native object per data point rather than merging into
+// lines — react-native-maps backs each Circle with a real native Google
+// Maps object, and rendering hundreds-to-thousands of them in one frame is
+// what caused the ORIGINAL OOM crash (corridor stops alone hit 1359,
+// RAPTOR rounds hit 2000-3000 marked stops in testing).
 export const MAX_DEBUG_MARKERS = 120;
 
 type State = {
@@ -29,9 +55,10 @@ type State = {
     data: GtfsDebugInfo | null;
     /** Which stage of the search is currently being shown. */
     phase: DebugPhase;
-    /** Meaning depends on phase: index into bfsLevels for 'bfs', index into
-     *  roundMarkedStops for 'raptor', chunk index (0..CORRIDOR_CHUNK_COUNT-1)
-     *  for 'corridor'. Unused (stays 0) for 'seed', a single-shot reveal. */
+    /** Meaning depends on phase: reveal-chunk index (0..BFS_REVEAL_STEPS-1)
+     *  into bfsTreeEdges for 'bfs', index into roundMarkedStops for
+     *  'raptor', chunk index (0..CORRIDOR_CHUNK_COUNT-1) for 'corridor'.
+     *  Unused (stays 0) for 'seed', a single-shot reveal. */
     stepIndex: number;
     /** Whether DebugControls' auto-advance timer is currently running. */
     playing: boolean;
@@ -50,7 +77,7 @@ const initialState: State = {
  *  duplicated between the two. */
 function phaseLength(phase: DebugPhase, data: GtfsDebugInfo): number {
     switch (phase) {
-        case 'bfs':      return Math.max(1, data.bfsLevels.length);
+        case 'bfs':      return BFS_REVEAL_STEPS;
         case 'raptor':   return Math.max(1, data.roundMarkedStops.length);
         case 'corridor': return CORRIDOR_CHUNK_COUNT;
         case 'seed':     return 1;
