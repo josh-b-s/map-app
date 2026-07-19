@@ -21,6 +21,7 @@
 import { getDb } from './gtfsDb';
 import { makeKey, parseKey } from './gtfsKeyUtil';
 import { computeGraphSignature, loadPersistedGraph, savePersistedGraph } from './coarseGraphStore';
+import { haversineMeters } from './geoUtil';
 
 export interface CoarseNode {
     stop_id: string;
@@ -90,16 +91,6 @@ export function invalidateCoarseGraphCache(): void {
     buildPromise = null;
 }
 
-function haversineMeters(aLat: number, aLon: number, bLat: number, bLon: number): number {
-    const R = 6_371_000;
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(bLat - aLat);
-    const dLon = toRad(bLon - aLon);
-    const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLon / 2);
-    const x = s1 * s1 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * s2 * s2;
-    return R * 2 * Math.asin(Math.sqrt(x));
-}
-
 /**
  * Full from-scratch build: per-line transit cliques + spatially-bucketed
  * walking edges. This is the O(k^2)-per-pattern, ~12-14s path — only run
@@ -153,18 +144,35 @@ function buildAdjacencyFromScratch(
     const flushPattern = () => {
         if (patternStopKeys.length < 2) return;
         const n = patternStopKeys.length;
-        // NOTE ON DEDUP: addEdge dedups by `${kind}:${to}` per source stop —
-        // if two DIFFERENT patterns would produce the identical (from, to)
-        // transit edge (rare, but possible at a shared interchange), only
-        // the FIRST pattern's viaPatternKey attribution survives. Acceptable
-        // for a debug-only field: it just means the debug web might
-        // occasionally credit a shared edge to pattern A instead of B, with
-        // zero effect on routing itself (cost/kind are unaffected).
+        // DIRECTION: patternStopKeys is already ordered by real stop_sequence
+        // (psRows is queried `ORDER BY agency, pattern_id, stop_sequence`), so
+        // i < j here always means "genuinely earlier in this pattern's real
+        // direction of travel." GTFS patterns are inherently directional —
+        // a separate pattern_id exists for the other direction/return trip —
+        // so there is never a legitimate reason to add a j -> i edge here.
+        //
+        // An earlier version of this function added BOTH i->j and j->i for
+        // every pair, on the reasoning that "ride this line" should be a
+        // single BFS hop regardless of which end you start from. That's true
+        // for genuinely picking a DIFFERENT stop to board vs alight — but it
+        // also silently created edges representing riding a pattern
+        // BACKWARD, opposite its actual direction of travel, which no real
+        // trip can do. BFS then could (and did) discover a "path" that
+        // depended on one of these backward edges — landing on a stop that's
+        // downstream of where you actually needed to board, with no way to
+        // ride forward to the real destination. That corridor/reachability
+        // bug (RAPTOR reaching a structurally-wrong-direction board stop with
+        // no valid boarding candidate ever marked upstream) could only be
+        // patched around downstream with increasingly fragile heuristics
+        // (geometric sweeps, hop-length thresholds) that either didn't catch
+        // it or over-corrected and blew up corridor size/search cost for
+        // unrelated long-haul trips. Removing the reverse edge at the source
+        // makes the wrong-direction jump impossible to construct in the
+        // first place, so none of that downstream patching is needed.
         if (n <= FULL_CLIQUE_MAX_STOPS) {
             for (let i = 0; i < n; i++) {
                 for (let j = i + 1; j < n; j++) {
                     addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
-                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
                 }
             }
         } else {
@@ -174,9 +182,8 @@ function buildAdjacencyFromScratch(
             const samples = [...sampleIdx];
             for (let i = 0; i < n; i++) {
                 for (const j of samples) {
-                    if (j === i) continue;
+                    if (j <= i) continue; // direction-respecting — see note above
                     addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
-                    addEdge(patternStopKeys[j], { to: patternStopKeys[i], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
                 }
             }
         }
@@ -216,7 +223,7 @@ function buildAdjacencyFromScratch(
                     const oKey = makeKey(other.agency, other.stop_id);
                     // Only compute the pair once (canonical ordering by key string).
                     if (oKey <= sKey) continue;
-                    const d = haversineMeters(s.stop_lat, s.stop_lon, other.stop_lat, other.stop_lon);
+                    const d = haversineMeters({ lat: s.stop_lat, lon: s.stop_lon }, { lat: other.stop_lat, lon: other.stop_lon });
                     if (d <= WALK_EDGE_THRESHOLD_M) {
                         addEdge(sKey, { to: oKey, cost: 0.5, kind: 'walk' });
                         addEdge(oKey, { to: sKey, cost: 0.5, kind: 'walk' });

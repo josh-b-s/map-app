@@ -15,13 +15,12 @@
  *    McRAPTOR (which keeps a frontier at every stop — much more expensive and
  *    unnecessary here since we only care about journeys that actually finish).
  *
- * Ellipse pre-filter: before RAPTOR starts, stops whose combined distance from
- * origin + destination exceeds (straight-line origin→destination distance ×
- * margin) are excluded from consideration entirely. This is a needle-nose
- * ellipse with origin/destination as foci — computed with two haversine calls
- * and one comparison per stop, no trigonometry needed. It keeps every round's
- * candidate set roughly proportional to the journey's geographic footprint
- * instead of the whole network.
+ * Corridor pre-filter: gtfsLoader.ts computes which stops are in-scope for
+ * this trip (index.corridorStopIds) BEFORE this file ever runs — via a
+ * schedule-agnostic BFS over stop topology, not a geometric ellipse (that
+ * was an earlier version's approach). RAPTOR here just consumes that
+ * pre-computed stop set; see corridorResolver.ts / corridorTagging.ts for
+ * how it's derived.
  */
 
 import type { LatLng } from './gtfsDb';
@@ -268,8 +267,8 @@ async function runSearchOnIndex(
     const allowedStopIds = index.corridorStopIds;
     lap(`corridor from loader (${allowedStopIds.size}/${index.allStops.length} stops kept)`);
 
-    // ── Nearest stops at both ends (within the ellipse) ──────────────────────
-    // Pre-filter the stop list to the ellipse ONCE. Footpath relaxation used to
+    // ── Nearest stops at both ends (within the corridor) ──────────────────────
+    // Pre-filter the stop list to the corridor ONCE. Footpath relaxation used to
     // iterate index.allStops (the full ~32K-stop network) and check ellipse
     // membership per-element inside the loop — with hundreds of newly-marked
     // stops per round, that was tens of millions of wasted iterations. Scanning
@@ -340,6 +339,24 @@ async function runSearchOnIndex(
     // there's no reason to pay it on every normal search.
     const debugRoundMarkedStops: LatLng[][] = [];
 
+    // Unconditional (not debug-gated) history of which stops were marked
+    // entering each round — cheap (a few hundred keys, a handful of rounds)
+    // and needed for the failure diagnostic below: it lets us check, for a
+    // pattern that DOES serve the destination and DOES have loaded trips,
+    // whether ANY of its stops were ever actually reached/marked at all —
+    // distinguishing "topologically never reachable within the corridor/
+    // round budget" from "reachable but RAPTOR's boarding logic missed it."
+    const markedHistory: Set<StopKey>[] = [];
+    // Snapshot BEFORE the trim block runs each round — needed to tell apart
+    // "this stop was reached but the BEST_MARKED_CAP trim discarded it
+    // before it could be used for boarding" from "this stop was never
+    // reached by any round in the first place." markedHistory alone (below,
+    // captured post-trim) can't distinguish these — both look like "never
+    // marked" to it, but they point at completely different fixes (raising/
+    // fixing the trim's protection logic vs a genuine corridor/reachability
+    // gap upstream in BFS).
+    const markedHistoryPreTrim: Set<StopKey>[] = [];
+
     // ── RAPTOR rounds ─────────────────────────────────────────────────────────
     // Reverse index: stopKey -> every pattern that serves it, built ONCE
     // before the round loop (a pattern's stop membership never changes
@@ -366,6 +383,8 @@ async function runSearchOnIndex(
     for (let round = 0; round < MAX_ROUNDS && marked.size > 0; round++) {
         const roundStart = Date.now();
 
+        markedHistoryPreTrim.push(new Set(marked));
+
         // Trim to bound per-round work — but NOT by raw arrival time alone.
         // Plain "earliest τ first" systematically discards long-distance trunk
         // routes in favor of numerous nearby local stops, since a train/bus
@@ -374,8 +393,58 @@ async function runSearchOnIndex(
         // stop that's actually making progress. Score with an A*-style
         // heuristic instead: τ + estimated remaining time to destination. This
         // protects geographically-progressing stops from being pruned away.
+        //
+        // That heuristic alone still has a gap: a stop can be genuinely close
+        // to the destination (small remainingSec) but have a LATE tau (e.g.
+        // reached only after a long, roundabout first leg) — its combined
+        // score can still lose to plenty of nearer-in-time-but-wrong-direction
+        // stops, discarding it even though it's the one stop that actually
+        // connects to the final local service. Reserve a fixed slice of the
+        // trim budget for the stops nearest the destination BY DISTANCE ALONE
+        // (ignoring tau), so a correct-but-late-arriving connector always
+        // survives into the next round instead of being silently dropped —
+        // this was the actual cause of a Mornington -> Clayton search failing
+        // at the very last local-bus connection despite a valid, boardable
+        // departure existing for it.
         if (marked.size > BEST_MARKED_CAP) {
-            const scored = [...marked].map(key => {
+            // Two layers of protection, tried in order of confidence:
+            //
+            // 1. Stops BFS itself confirmed are part of a verified seed path
+            //    (index.debugSeedPaths — see corridorResolver.ts/seedRouteBfs.ts).
+            //    This isn't a heuristic guess: coarseGraph's BFS already
+            //    proved these specific stops connect via some existing
+            //    pattern. Discarding one of them here would throw away a
+            //    known-good link in the route, not just a plausible one — so
+            //    they're exempt from trimming outright, independent of score.
+            // 2. A distance-based fallback (nearest-to-destination stops,
+            //    ignoring tau) for anything the seed paths don't cover — a
+            //    correct-but-late-arriving connector (e.g. a local bus
+            //    reached only after a long first leg) can still lose to
+            //    nearer-in-time-but-wrong-direction stops on tau score alone.
+            //
+            // This was the actual cause of a Mornington -> Clayton search
+            // failing at the very last local-bus connection: the trim (score
+            // = tau + remaining distance) discarded the one stop with a
+            // valid, boardable departure for the final leg, and neither
+            // layer existed before this fix.
+            const seedPathStopKeys = new Set<StopKey>();
+            for (const path of index.debugSeedPaths) {
+                for (const stopKey of path) seedPathStopKeys.add(stopKey as StopKey);
+            }
+            const seedProtected = new Set([...marked].filter(key => seedPathStopKeys.has(key)));
+
+            const PROTECTED_NEAREST_DEST = Math.floor(BEST_MARKED_CAP * 0.25);
+            const remainingForDistanceProtection = [...marked].filter(key => !seedProtected.has(key));
+            const byDistance = remainingForDistanceProtection.map(key => {
+                const s = index.stopsByKey.get(key);
+                const d = s ? haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon }) : Infinity;
+                return { key, d };
+            }).sort((a, b) => a.d - b.d).slice(0, PROTECTED_NEAREST_DEST);
+            const distanceProtected = new Set(byDistance.map(x => x.key));
+
+            const protectedKeys = new Set([...seedProtected, ...distanceProtected]);
+
+            const scored = [...marked].filter(key => !protectedKeys.has(key)).map(key => {
                 const tauS = tau.get(key) ?? INF;
                 const s = index.stopsByKey.get(key);
                 const remainingSec = s
@@ -384,8 +453,17 @@ async function runSearchOnIndex(
                 return { key, score: tauS + remainingSec };
             });
             scored.sort((a, b) => a.score - b.score);
-            marked = new Set(scored.slice(0, BEST_MARKED_CAP).map(x => x.key));
+            const remainingBudget = Math.max(0, BEST_MARKED_CAP - protectedKeys.size);
+            marked = new Set([...protectedKeys, ...scored.slice(0, remainingBudget).map(x => x.key)]);
         }
+
+        // Snapshot AFTER trimming — this needs to reflect the stops actually
+        // used for boarding this round, not whatever entered the round before
+        // trimming. Snapshotting pre-trim (as an earlier version of this
+        // diagnostic did) gave false "reachable" positives: a stop could show
+        // up as "marked in round N" while having actually been discarded by
+        // the trim above and never processed at all.
+        markedHistory.push(new Set(marked));
 
         const newlyMarked = new Set<StopKey>();
 
@@ -422,7 +500,22 @@ async function runSearchOnIndex(
             let bestBoardSeq = -1;
             let bestDepartSec = INF;
 
-            for (const b of boardings) {
+            // IMPORTANT: pick the boarding candidate with the LOWEST stop_sequence
+            // first, not the one with the earliest raw departure time. A loop or
+            // bidirectional pattern can have two marked stops at wildly different
+            // points in its stop_sequence — e.g. one just past where you're trying
+            // to go (high seq) and one genuinely upstream of it (low seq). If the
+            // downstream one happens to have an earlier next-departure, picking
+            // "earliest departure overall" boards there — and riding forward from
+            // a high seq can structurally never reach a lower-seq destination
+            // stop, silently discarding the one boarding that would have worked.
+            // Scanning candidates in ascending stop_sequence order and taking the
+            // FIRST one that yields a valid trip guarantees bestBoardSeq is always
+            // the lowest usable sequence number, so "ride forward" always has a
+            // real destination ahead of it, not behind it.
+            const sortedBoardings = [...boardings].sort((a, b) => a.seq - b.seq);
+
+            for (const b of sortedBoardings) {
                 const entries = index.stopTimesByStop.get(b.stopKey);
                 if (!entries || entries.length === 0) continue;
 
@@ -434,14 +527,17 @@ async function runSearchOnIndex(
                 for (let i = idx; i < entries.length; i++) {
                     const e = entries[i];
                     if (e.pattern_id !== patternIdOnly) continue;
-                    if (e.departure_sec < bestDepartSec) {
-                        bestDepartSec = e.departure_sec;
-                        bestTripId    = e.trip_id;
-                        bestBoardKey  = b.stopKey;
-                        bestBoardSeq  = e.stop_sequence;
-                    }
+                    // First valid boarding found, in ascending-sequence order, wins —
+                    // do NOT keep scanning later (higher-seq) candidates for an
+                    // earlier raw departure time; that's exactly the comparison
+                    // that caused the wrong-direction boarding bug above.
+                    bestDepartSec = e.departure_sec;
+                    bestTripId    = e.trip_id;
+                    bestBoardKey  = b.stopKey;
+                    bestBoardSeq  = e.stop_sequence;
                     break; // entries sorted by time; first pattern match at/after idx is earliest for this stop
                 }
+                if (bestTripId) break; // lowest-sequence candidate with a valid trip found — stop scanning
             }
 
             if (!bestTripId) continue;
@@ -543,12 +639,12 @@ async function runSearchOnIndex(
 
         // Diagnostic: how close did the search actually get to any destination
         // stop, even if it never fully reached one? This distinguishes three
-        // failure modes: (a) search reached NO destination-area stop at all
-        // (ellipse/pattern-discovery excluded the corridor), (b) search reached
-        // a destination stop's general AREA but tau is still undefined (never
-        // touched by a marked round — likely time-window cutoff), or (c) some
-        // destKeyMap stop DOES have a tau, meaning a candidate should have been
-        // recorded — which would point at a bug in tryRecordDestination itself.
+        // failure modes: (a) search reached NO destination-area stop at all,
+        // (b) search reached a destination stop's general AREA but tau is
+        // still undefined (never touched by a marked round — likely time-
+        // window cutoff), or (c) some destKeyMap stop DOES have a tau, meaning
+        // a candidate should have been recorded — which would point at a bug
+        // in tryRecordDestination itself.
         let closestDistM = Infinity;
         let closestStopName = '';
         let anyDestStopTouched = false;
@@ -562,9 +658,174 @@ async function runSearchOnIndex(
                 }
             }
         }
+
+        // Case (a) diagnostic in detail: for each near-destination stop, is
+        // there ANY pattern that physically serves it among the patterns
+        // gtfsLoader actually loaded (index.patternStops — already scoped to
+        // "in the corridor AND active today")? If yes, that pattern has stop
+        // sequence data but log whether it also has any loaded stop_times
+        // (index.stopTimesByStop) — a pattern can be in patternStops (its
+        // stop sequence/geometry) while having zero trips actually running
+        // in the search's time window, which looks identical to "no route"
+        // from RAPTOR's perspective but has a completely different cause
+        // (schedule/time-window vs corridor/pattern-discovery).
+        if (!anyDestStopTouched) {
+            for (const { s, d } of destNearby.slice(0, 5)) {
+                const dKey = keyOf(s.stop_id, s.agency);
+                const servingPatterns = patternsByStop.get(dKey) ?? [];
+                if (servingPatterns.length === 0) {
+                    console.log(`[gtfsRoute]   [DIAGNOSTIC] dest stop "${s.stop_name}" (${Math.round(d)}m from destination point): ` +
+                        `NO pattern in the loaded corridor serves this stop at all — corridor/pattern-discovery excluded it.`);
+                    continue;
+                }
+                const patternDetails = servingPatterns.map(({ patternKey }) => {
+                    const hasStopTimes = index.stopTimesByStop.has(dKey) &&
+                        (index.stopTimesByStop.get(dKey) ?? []).some(st => st.pattern_id === parseKey(patternKey).id);
+                    if (!hasStopTimes) return `${parseKey(patternKey).id} (NO loaded trips in window)`;
+
+                    // This pattern DOES serve the destination stop AND has a
+                    // loaded trip today. The alightSeq (destination's own
+                    // stop_sequence on this pattern) is needed FIRST, before
+                    // picking which marked stop to report — otherwise we
+                    // report whichever marked stop happened to appear first
+                    // in history order, even if it's downstream of the
+                    // destination on a loop route and a genuinely-usable
+                    // upstream stop was ALSO marked in some other round.
+                    const patternStopSeq = index.patternStops.get(patternKey) ?? [];
+                    const patternAgency = parseKey(patternKey).agency;
+                    const alightSeqEntry = patternStopSeq.find(ps => keyOf(ps.stop_id, patternAgency) === dKey);
+                    const alightSeq = alightSeqEntry?.stop_sequence;
+
+                    // Scan every stop this pattern serves, across every
+                    // round's marked history, and split into two buckets:
+                    // "upstream" (seq < alightSeq — a legitimate boarding
+                    // candidate for reaching the destination) and
+                    // "downstream" (seq >= alightSeq — can never reach the
+                    // destination by riding forward, regardless of how
+                    // boarding-selection logic picks among candidates).
+                    // Reporting whichever of these was EVER marked, in
+                    // EITHER bucket, tells us definitively whether this is a
+                    // "boarding-selection could have worked but didn't" case
+                    // or a "the useful half of this pattern was never
+                    // reached at all" case — the two look identical from a
+                    // single first-marked-stop check, but need completely
+                    // different fixes (RAPTOR round-loop bug vs corridor/
+                    // BFS reachability gap upstream of this pattern).
+                    let bestUpstreamStopName: string | null = null;
+                    let bestUpstreamStopKey: StopKey | null = null;
+                    let bestUpstreamSeq = Infinity;
+                    let bestUpstreamRound = -1;
+                    let anyDownstreamMarked = false;
+                    let downstreamStopName: string | null = null;
+                    let downstreamRound = -1;
+                    for (let r = 0; r < markedHistory.length; r++) {
+                        for (const ps of patternStopSeq) {
+                            const psKey = keyOf(ps.stop_id, patternAgency);
+                            if (!markedHistory[r].has(psKey)) continue;
+                            const isUpstream = alightSeq !== undefined && ps.stop_sequence < alightSeq;
+                            if (isUpstream) {
+                                if (ps.stop_sequence < bestUpstreamSeq) {
+                                    bestUpstreamSeq = ps.stop_sequence;
+                                    bestUpstreamStopKey = psKey;
+                                    bestUpstreamStopName = index.stopsByKey.get(psKey)?.stop_name ?? psKey;
+                                    bestUpstreamRound = r;
+                                }
+                            } else if (!anyDownstreamMarked) {
+                                anyDownstreamMarked = true;
+                                downstreamStopName = index.stopsByKey.get(psKey)?.stop_name ?? psKey;
+                                downstreamRound = r;
+                            }
+                        }
+                    }
+
+                    // If no upstream stop was ever marked POST-trim, check
+                    // whether one existed PRE-trim — i.e. RAPTOR's search
+                    // actually reached it, but the BEST_MARKED_CAP trim cut
+                    // it before it could be used for boarding. This is a
+                    // completely different fix (protection logic) than a
+                    // genuine corridor/BFS reachability gap.
+                    let trimmedAwayStopName: string | null = null;
+                    let trimmedAwayRound = -1;
+                    let trimmedAwaySeq = -1;
+                    if (!bestUpstreamStopKey) {
+                        outerPreTrim:
+                            for (let r = 0; r < markedHistoryPreTrim.length; r++) {
+                                for (const ps of patternStopSeq) {
+                                    if (alightSeq === undefined || ps.stop_sequence >= alightSeq) continue;
+                                    const psKey = keyOf(ps.stop_id, patternAgency);
+                                    if (markedHistoryPreTrim[r].has(psKey) && !markedHistory[r].has(psKey)) {
+                                        trimmedAwayStopName = index.stopsByKey.get(psKey)?.stop_name ?? psKey;
+                                        trimmedAwayRound = r;
+                                        trimmedAwaySeq = ps.stop_sequence;
+                                        break outerPreTrim;
+                                    }
+                                }
+                            }
+                    }
+
+                    if (!bestUpstreamStopKey && !anyDownstreamMarked && !trimmedAwayStopName) {
+                        return `${parseKey(patternKey).id} (NEVER marked at any of its ${patternStopSeq.length} stops in any round, pre- or post-trim — this pattern's own boarding point was never reached; corridor/topology gap upstream of it)`;
+                    }
+                    if (!bestUpstreamStopKey && trimmedAwayStopName) {
+                        return `${parseKey(patternKey).id} (upstream stop "${trimmedAwayStopName}" (seq ${trimmedAwaySeq}) WAS reached pre-trim in round ${trimmedAwayRound} but was DISCARDED by the BEST_MARKED_CAP trim before boarding could use it — this is a trim/protection bug, not a corridor gap)`;
+                    }
+                    if (!bestUpstreamStopKey) {
+                        // Only downstream (post-destination) stops were ever
+                        // marked — the genuinely useful, upstream-of-
+                        // destination portion of this pattern was NEVER
+                        // reached by any round. This is a reachability gap
+                        // (corridor/BFS/transfer-budget), not a boarding-
+                        // selection bug — no amount of re-ordering boarding
+                        // candidates helps if the right candidate never
+                        // existed in `marked` in the first place.
+                        return `${parseKey(patternKey).id} (only DOWNSTREAM stop "${downstreamStopName}" (round ${downstreamRound}) was ever marked — the upstream-of-destination half of this pattern (seq < ${alightSeq}) was NEVER reached by any round, pre- or post-trim; this is a corridor/reachability gap, not a boarding-selection bug)`;
+                    }
+
+                    // A genuinely usable upstream stop WAS marked at some
+                    // point — replay the EXACT boarding check RAPTOR itself
+                    // does at that stop, for this pattern (same call —
+                    // earliestDepartureIndex + pattern_id match — the main
+                    // loop uses), to tell whether the miss is "no boardable
+                    // departure existed" (real schedule/timing gap) vs "one
+                    // existed and RAPTOR still didn't board it" (a genuine
+                    // remaining bug in the round loop, e.g. this candidate
+                    // got trimmed out of `marked` before its own round ran).
+                    const boardKey = bestUpstreamStopKey;
+                    const tauAtBoard = tau.get(boardKey);
+                    const entries = index.stopTimesByStop.get(boardKey) ?? [];
+                    const everMarkedStopName = bestUpstreamStopName;
+                    const everMarkedRound = bestUpstreamRound;
+                    const boardSeq = bestUpstreamSeq;
+
+                    if (boardSeq !== undefined && alightSeq !== undefined && boardSeq >= alightSeq) {
+                        return `${parseKey(patternKey).id} (STRUCTURAL: board stop's sequence=${boardSeq} is NOT before ` +
+                            `destination stop's sequence=${alightSeq} on this pattern — this is a loop/direction issue, ` +
+                            `not a marking or trimming bug. Need to board this pattern at an EARLIER stop, before ` +
+                            `sequence ${alightSeq}, not at "${everMarkedStopName}".)`;
+                    }
+
+                    let replayResult: string;
+                    if (tauAtBoard === undefined) {
+                        replayResult = 'tau at that stop is now undefined (overwritten/cleared after the round it was marked in) — cannot replay';
+                    } else {
+                        const idx = earliestDepartureIndex(entries, tauAtBoard);
+                        const match = entries.slice(idx).find(e => e.pattern_id === parseKey(patternKey).id);
+                        replayResult = match
+                            ? `a boardable departure DOES exist (trip ${match.trip_id} at ${formatSec(match.departure_sec)}) — this is a genuine RAPTOR boarding-logic bug, not a data/schedule gap`
+                            : `NO entry for this pattern departs at/after tau=${formatSec(tauAtBoard)} at that stop (last entries there: ${entries.slice(-3).map(e => `${e.pattern_id}@${formatSec(e.departure_sec)}`).join(', ') || 'none loaded'}) — likely arrived too late for this pattern's remaining trips today`;
+                    }
+                    return `${parseKey(patternKey).id} (marked at "${everMarkedStopName}" in round ${everMarkedRound}; replay: ${replayResult})`;
+                }).join(', ');
+                console.log(`[gtfsRoute]   [DIAGNOSTIC] dest stop "${s.stop_name}" (${Math.round(d)}m from destination point): ` +
+                    `served by pattern(s) [${patternDetails}] — if all say "NO loaded trips," the corridor is right but ` +
+                    `those patterns aren't active/scheduled in this search's window; if patterns are listed WITHOUT that ` +
+                    `suffix, the failure is inside RAPTOR's boarding/riding logic, not corridor scoping.`);
+            }
+        }
+
         console.log(
             `[gtfsRoute] search failure diagnostic: anyDestStopTouched=${anyDestStopTouched}` +
-            (anyDestStopTouched ? `, closest touched dest stop="${closestStopName}" (${Math.round(closestDistM)}m from destination point)` : ', NO destination-area stop was ever reached by RAPTOR — likely ellipse excluded the corridor, or the connecting pattern never appeared in candidatePatternKeys'),
+            (anyDestStopTouched ? `, closest touched dest stop="${closestStopName}" (${Math.round(closestDistM)}m from destination point)` : ', NO destination-area stop was ever reached by RAPTOR — see per-stop DIAGNOSTIC lines above for the specific cause.'),
         );
 
         throw new Error(`No route found within ${MAX_ROUNDS} transfers.\nNear origin: ${oNames}\nNear destination: ${dNames}`);

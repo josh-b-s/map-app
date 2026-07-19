@@ -15,8 +15,8 @@
 import { getCoarseGraph } from './coarseGraph';
 import { findSeedPaths } from './seedRouteBfs';
 import { parseKey } from './gtfsKeyUtil';
-
-export interface LatLon { lat: number; lon: number; }
+import { haversineMeters, type LatLon } from './geoUtil';
+export type { LatLon };
 
 /** Tapered-buffer outline for one seed path, as two parallel polylines (one
  *  per side) sampled at even arc-length steps along the path. Concatenating
@@ -69,16 +69,6 @@ const MIN_ACCEPTABLE_STOPS = 8;  // below this, treat as "suspiciously small" pe
 // the tapered buffer along a seed path. This is a fixed walk-tolerance
 // circle around each endpoint, applied on every pass regardless of taper.
 export const ORIGIN_DEST_WALK_RADIUS_M = 900;
-
-function haversineMeters(a: LatLon, b: LatLon): number {
-    const R = 6_371_000;
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(b.lat - a.lat);
-    const dLon = toRad(b.lon - a.lon);
-    const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLon / 2);
-    const x = s1 * s1 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * s2 * s2;
-    return R * 2 * Math.asin(Math.sqrt(x));
-}
 
 /** Perpendicular distance (meters) from `p` to segment a->b, plus how far
  *  along the segment (0..1) the closest point falls — needed for the taper. */
@@ -420,13 +410,22 @@ export async function computeSeedPathCorridor(
     // pattern variants (express/local, inbound/outbound stopping
     // differences, etc) that serve the SAME physical stops. Those sibling
     // variants are exactly what a real trip search needs to transfer onto
-    // at an interchange — without them RAPTOR can board once, then stall
-    // (this was the actual cause of "destination never reached," not a
-    // time-window issue: widening the search window earlier changed
-    // nothing, because the corridor's pattern set was the real bottleneck).
-    // Still much smaller than the old bbox approach: bounded by "stops the
-    // BFS paths actually visit" (a few hundred), not "every stop within a
-    // tapered buffer" (1359 in testing).
+    // at an interchange — without them RAPTOR can board once, then stall.
+    //
+    // NOTE: an earlier version of this function ALSO swept a geometric
+    // buffer around BFS's paths (first the whole path, then just
+    // "suspiciously long" hops) to compensate for coarseGraph treating a
+    // pattern's stops as a direction-agnostic clique — BFS could clique-jump
+    // to a stop downstream of where you'd actually need to board, and the
+    // sweep was a downstream patch to net in whatever correctly-directioned
+    // connector happened to sit nearby. Both attempts either missed the
+    // case or ballooned corridor size/search cost on unrelated long-haul
+    // trips (regional rail routinely has genuine multi-km adjacent-stop
+    // hops, indistinguishable from a clique-jump by distance alone). The
+    // actual fix is upstream in coarseGraph.ts: transit clique edges are now
+    // direction-respecting (only i -> j for i < j in real stop_sequence
+    // order), so BFS can no longer construct a wrong-direction jump in the
+    // first place — no sweep needed here anymore.
     const coreStopIds = new Set<string>();
     for (const path of paths) {
         for (const stopKey of path) coreStopIds.add(parseKey(stopKey).id);

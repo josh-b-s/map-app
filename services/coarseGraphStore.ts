@@ -36,6 +36,16 @@ const KIND_TRANSIT = 't';
 const KIND_WALK = 'w';
 const INSERT_CHUNK = 200;      // rows per multi-value INSERT, comfortably under SQLite's bound-variable limit
 
+// Bumped whenever the ALGORITHM that builds the adjacency changes, not just
+// when the underlying GTFS data does. computeGraphSignature/loadPersistedGraph
+// only ever compared row counts before this — fine for detecting a feed
+// update, but silent about a code change that produces different edges from
+// the SAME rows (e.g. the transit-clique direction fix below: patternStopCount
+// is identical before and after, so without this version bump every existing
+// install would keep loading its old, now-incorrect bidirectional-clique
+// graph from disk forever, never rebuilding.
+const GRAPH_ALGO_VERSION = 2; // v2: transit clique edges are direction-respecting (i->j only, i<j in real stop_sequence order) — see coarseGraph.ts's flushPattern()
+
 export interface GraphSignature {
     stopCount: number;
     patternStopCount: number;
@@ -48,7 +58,7 @@ export async function computeGraphSignature(db: SQLiteDatabase): Promise<GraphSi
 }
 
 function signatureKey(sig: GraphSignature): string {
-    return `${sig.stopCount}:${sig.patternStopCount}`;
+    return `${GRAPH_ALGO_VERSION}:${sig.stopCount}:${sig.patternStopCount}`;
 }
 
 async function ensureTables(db: SQLiteDatabase): Promise<void> {
