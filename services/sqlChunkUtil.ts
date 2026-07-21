@@ -9,6 +9,24 @@
  * this is the shared leaf both sit on top of.
  */
 
+/**
+ * Minimal DB shape shared by any module that only needs a structural
+ * subset of gtfsDb's SQLiteDatabase (avoids a concrete dependency on that
+ * class, which would be a layering inversion for higher-level modules like
+ * corridorResolver.ts/corridorTagging.ts). Previously corridorResolver.ts
+ * and corridorTagging.ts each declared their own copy of this (with
+ * corridorTagging.ts's version only exposing getAllAsync) — kept here
+ * instead, alongside chunkedQuery, since this is already the shared leaf
+ * both corridor files sit on top of.
+ */
+export interface QueryableDb {
+    getAllAsync<T>(sql: string, params?: any[]): Promise<T[]>;
+
+    execAsync(sql: string): Promise<void>;
+
+    runAsync(sql: string, params?: any[]): Promise<{ lastInsertRowId: number; changes: number }>;
+}
+
 /** SQLite's default bound-parameter limit is 999; stay comfortably under it. */
 export const SQL_CHUNK_SIZE = 400;
 

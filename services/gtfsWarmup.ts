@@ -28,9 +28,9 @@
  * just awaits the same in-flight promise instead of triggering a second load.
  */
 
-import { getDb, isDbReady } from './gtfsDb';
-import { getAllStopsCached } from './gtfsLoader';
-import { getCoarseGraph } from './coarseGraph';
+import {getDb, isDbReady} from './gtfsDb';
+import {getAllStopsCached} from './gtfsLoader';
+import {getCoarseGraph} from './coarseGraph';
 
 let warmedUp = false;
 

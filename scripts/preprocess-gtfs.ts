@@ -1,13 +1,21 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import * as readline from 'readline';
 import AdmZip from 'adm-zip';
 import Database from 'better-sqlite3';
+import {GTFS_SCHEMA_SQL, GTFS_INDEXES_SQL} from './gtfsSchema';
 
-const AGENCIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-const GTFS_DIR = path.join(__dirname, '../assets/gtfs');
-const DB_PATH  = path.join(__dirname, '../assets/gtfs.db');
+const GTFS_INPUT = path.join(__dirname, '../assets/gtfs.zip');
+const DB_PATH    = path.join(__dirname, '../assets/gtfs.db');
+const ESSENTIAL_FILE = 'agency.txt';
+const RUN_INTEGRITY_CHECK = process.env.GTFS_SKIP_INTEGRITY_CHECK !== '1';
+
+const buildStart = Date.now();
+function elapsed(): string {
+    const s = (Date.now() - buildStart) / 1000;
+    return s >= 60 ? `${(s / 60).toFixed(1)}m` : `${s.toFixed(1)}s`;
+}
+
+const COORD_SCALE = 1_000_000;
 
 function splitCSVLine(line: string): string[] {
     const fields: string[] = [];
@@ -30,17 +38,31 @@ function normalizeHexColor(value?: string | null): string {
     return /^[0-9A-F]{6}$/.test(hex) ? `#${hex}` : '';
 }
 
-async function* streamCSV(filePath: string): AsyncGenerator<Record<string, string>> {
-    if (!fs.existsSync(filePath)) return;
-    const rl = readline.createInterface({ input: fs.createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity });
+function* parseCSV(buf: Buffer): Generator<Record<string, string>> {
+    if (!buf || buf.length === 0) return;
     let headers: string[] | null = null;
-    for await (const line of rl) {
-        if (!line.trim()) continue;
-        if (!headers) { headers = splitCSVLine(line).map(h => stripBOM(h.trim())); continue; }
-        const parts = splitCSVLine(line);
-        const row: Record<string, string> = {};
-        headers.forEach((h, i) => { row[h] = (parts[i] ?? '').trim(); });
-        yield row;
+    let start = 0;
+    const len = buf.length;
+    const NL = 0x0a, CR = 0x0d;
+    while (start < len) {
+        let end = buf.indexOf(NL, start);
+        if (end === -1) end = len;
+        let lineEnd = end;
+        if (lineEnd > start && buf[lineEnd - 1] === CR) lineEnd--;
+        if (lineEnd > start) {
+            const line = buf.toString('utf8', start, lineEnd);
+            if (line.trim()) {
+                if (!headers) {
+                    headers = splitCSVLine(line).map(h => stripBOM(h.trim()));
+                } else {
+                    const parts = splitCSVLine(line);
+                    const row: Record<string, string> = {};
+                    for (let i = 0; i < headers.length; i++) row[headers[i]] = (parts[i] ?? '').trim();
+                    yield row;
+                }
+            }
+        }
+        start = end + 1;
     }
 }
 
@@ -50,199 +72,185 @@ function parseGtfsTimeSec(s: string): number {
     return parseInt(h ?? '0', 10) * 3600 + parseInt(m ?? '0', 10) * 60 + parseInt(sec ?? '0', 10);
 }
 
-function createSchema(db: Database.Database) {
-    db.exec(`
-        CREATE TABLE stops (
-                               stop_id   TEXT    NOT NULL,
-                               stop_name TEXT,
-                               stop_lat  REAL    NOT NULL,
-                               stop_lon  REAL    NOT NULL,
-                               agency    INTEGER NOT NULL,
-                               PRIMARY KEY (stop_id, agency)
-        );
-
-        CREATE TABLE routes (
-                                route_id         TEXT    NOT NULL,
-                                route_short_name TEXT,
-                                route_long_name  TEXT,
-                                route_type       INTEGER,
-                                route_color      TEXT,
-                                route_text_color TEXT,
-                                agency           INTEGER NOT NULL,
-                                PRIMARY KEY (route_id, agency)
-        );
-
-        CREATE TABLE calendar (
-                                  service_id TEXT    NOT NULL,
-                                  agency     INTEGER NOT NULL,
-                                  monday     INTEGER NOT NULL DEFAULT 0,
-                                  tuesday    INTEGER NOT NULL DEFAULT 0,
-                                  wednesday  INTEGER NOT NULL DEFAULT 0,
-                                  thursday   INTEGER NOT NULL DEFAULT 0,
-                                  friday     INTEGER NOT NULL DEFAULT 0,
-                                  saturday   INTEGER NOT NULL DEFAULT 0,
-                                  sunday     INTEGER NOT NULL DEFAULT 0,
-                                  start_date TEXT    NOT NULL,
-                                  end_date   TEXT    NOT NULL,
-                                  PRIMARY KEY (service_id, agency)
-        );
-
-        CREATE TABLE calendar_dates (
-                                        service_id     TEXT    NOT NULL,
-                                        agency         INTEGER NOT NULL,
-                                        date           TEXT    NOT NULL,
-                                        exception_type INTEGER NOT NULL,
-                                        PRIMARY KEY (service_id, agency, date)
-        );
-
-        CREATE TABLE trips (
-                               trip_id    TEXT    NOT NULL,
-                               agency     INTEGER NOT NULL,
-                               pattern_id TEXT    NOT NULL,
-                               service_id TEXT    NOT NULL DEFAULT '',
-                               PRIMARY KEY (trip_id, agency)
-        );
-
-        CREATE TABLE patterns (
-                                  pattern_id   TEXT PRIMARY KEY,
-                                  route_id     TEXT    NOT NULL,
-                                  agency       INTEGER NOT NULL,
-                                  direction_id INTEGER NOT NULL DEFAULT 0,
-                                  shape_id     TEXT,
-                                  trip_id      TEXT    NOT NULL
-        );
-
-        CREATE TABLE pattern_stops (
-                                       pattern_id    TEXT    NOT NULL,
-                                       stop_id       TEXT    NOT NULL,
-                                       stop_sequence INTEGER NOT NULL,
-                                       agency        INTEGER NOT NULL
-        );
-
-        CREATE TABLE stop_times (
-                                    trip_id       TEXT    NOT NULL,
-                                    agency        INTEGER NOT NULL,
-                                    stop_sequence INTEGER NOT NULL,
-                                    stop_id       TEXT    NOT NULL,
-                                    pattern_id    TEXT    NOT NULL,
-                                    arrival_sec   INTEGER NOT NULL,
-                                    departure_sec INTEGER NOT NULL,
-                                    PRIMARY KEY (trip_id, agency, stop_sequence)
-        );
-
-        CREATE TABLE shapes (
-                                shape_id          TEXT    NOT NULL,
-                                agency            INTEGER NOT NULL,
-                                shape_pt_lat      REAL    NOT NULL,
-                                shape_pt_lon      REAL    NOT NULL,
-                                shape_pt_sequence INTEGER NOT NULL
-        );
-    `);
+function packCoord(v: string): number | null {
+    const f = parseFloat(v);
+    if (isNaN(f)) return null;
+    return Math.round(f * COORD_SCALE);
 }
 
-async function processAgency(agencyId: number, db: Database.Database) {
-    const zipPath = path.join(GTFS_DIR, String(agencyId), 'google_transit.zip');
-    if (!fs.existsSync(zipPath)) { console.log(`Agency ${agencyId}: zip not found, skipping`); return; }
+function createSchema(db: Database.Database) {
+    // DDL now lives in gtfsSchema.ts, shared with gtfsImporter.ts (the
+    // on-device build) — see that file's module doc for why.
+    db.exec(GTFS_SCHEMA_SQL);
+}
 
-    const tempDir = path.join(os.tmpdir(), `gtfs_agency_${agencyId}`);
-    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
-    fs.mkdirSync(tempDir, { recursive: true });
+interface GtfsSource {
+    file(name: string): Buffer;
+    describe: string;
+}
 
-    console.log(`Agency ${agencyId}: extracting...`);
-    new AdmZip(zipPath).extractAllTo(tempDir, true);
+const EMPTY = Buffer.alloc(0);
 
-    const file = (name: string) => path.join(tempDir, name);
+function collectFromZip(zip: AdmZip, prefix: string, label: string, out: GtfsSource[]): void {
+    const entries = zip.getEntries();
+    const hasAgencyHere = entries.some(e => !e.isDirectory && e.entryName === prefix + ESSENTIAL_FILE);
+    if (hasAgencyHere) {
+        out.push({
+            describe: label,
+            file: (name: string) => {
+                const entry = zip.getEntry(prefix + name);
+                return entry ? entry.getData() : EMPTY;
+            },
+        });
+        return;
+    }
 
+    const childDirs = new Set<string>();
+    const childZips = new Set<string>();
+    for (const e of entries) {
+        if (!e.entryName.startsWith(prefix)) continue;
+        const rest = e.entryName.slice(prefix.length);
+        if (!rest) continue;
+        const slash = rest.indexOf('/');
+        if (slash === -1) {
+            if (!e.isDirectory && rest.toLowerCase().endsWith('.zip')) childZips.add(rest);
+        } else {
+            childDirs.add(rest.slice(0, slash));
+        }
+    }
+    for (const d of childDirs) collectFromZip(zip, `${prefix}${d}/`, `${label}/${d}`, out);
+    for (const z of childZips) {
+        const entry = zip.getEntry(prefix + z);
+        if (entry) collectFromZipBuffer(entry.getData(), `${label}/${z}`, out);
+    }
+}
+
+function collectFromZipBuffer(buf: Buffer, label: string, out: GtfsSource[]): void {
+    let zip: AdmZip;
+    try { zip = new AdmZip(buf); } catch { return; }
+    collectFromZip(zip, '', label, out);
+}
+
+function collectFromDisk(rootPath: string, label: string, out: GtfsSource[]): void {
+    const stat = fs.statSync(rootPath);
+
+    if (stat.isFile()) {
+        if (rootPath.toLowerCase().endsWith('.zip')) collectFromZipBuffer(fs.readFileSync(rootPath), label, out);
+        return;
+    }
+    if (!stat.isDirectory()) return;
+
+    const entries = fs.readdirSync(rootPath, { withFileTypes: true });
+    if (entries.some(e => e.isFile() && e.name === ESSENTIAL_FILE)) {
+        out.push({
+            describe: rootPath,
+            file: (name: string) => {
+                try { return fs.readFileSync(path.join(rootPath, name)); }
+                catch { return EMPTY; }
+            },
+        });
+        return;
+    }
+
+    for (const e of entries) {
+        const full = path.join(rootPath, e.name);
+        if (e.isDirectory()) collectFromDisk(full, `${label}/${e.name}`, out);
+        else if (e.isFile() && e.name.toLowerCase().endsWith('.zip')) collectFromZipBuffer(fs.readFileSync(full), `${label}/${e.name}`, out);
+    }
+}
+
+function findAllGtfsSources(inputPath: string): GtfsSource[] {
+    if (!fs.existsSync(inputPath)) return [];
+    const out: GtfsSource[] = [];
+    collectFromDisk(inputPath, inputPath, out);
+    return out;
+}
+
+function processAgency(agencyId: number, source: GtfsSource, db: Database.Database) {
+    console.log(`Agency ${agencyId}: reading ${source.describe}`);
+    const file = (name: string) => source.file(name);
+
+    let nextStopPk = (db.prepare(`SELECT COALESCE(MAX(stop_pk), 0) AS m FROM stops`).get() as any).m + 1;
+    let nextTripPk = (db.prepare(`SELECT COALESCE(MAX(trip_pk), 0) AS m FROM trips`).get() as any).m + 1;
+    let nextPatternPk = (db.prepare(`SELECT COALESCE(MAX(pattern_pk), 0) AS m FROM patterns`).get() as any).m + 1;
+    let nextShapePk = (db.prepare(`SELECT COALESCE(MAX(shape_pk), 0) AS m FROM shape_meta`).get() as any).m + 1;
+
+    const stopIdToPk = new Map<string, number>();
     {
-        const ins = db.prepare(`INSERT OR IGNORE INTO stops (stop_id,stop_name,stop_lat,stop_lon,agency) VALUES (?,?,?,?,?)`);
-        const batch: Array<[string,string,number,number,number]> = [];
-        for await (const r of streamCSV(file('stops.txt'))) {
-            const lat = parseFloat(r.stop_lat), lon = parseFloat(r.stop_lon);
-            if (isNaN(lat) || isNaN(lon)) continue;
-            // location_type: 0 or blank = actual boardable stop/platform.
-            // 1 = parent station (groups platforms, never appears in stop_times),
-            // 2 = entrance, 3 = generic node, 4 = boarding area. None of these
-            // are boardable, and including them lets nearestStops() pick a dead
-            // end (e.g. a station's parent record) over the real platform next
-            // to it, silently losing every pattern that stops there.
+        const ins = db.prepare(`INSERT INTO stops (stop_pk,stop_id,stop_name,stop_lat,stop_lon,agency) VALUES (?,?,?,?,?,?)`);
+        let count = 0;
+        for (const r of parseCSV(file('stops.txt'))) {
+            const lat = packCoord(r.stop_lat), lon = packCoord(r.stop_lon);
+            if (lat === null || lon === null) continue;
             const locType = (r.location_type ?? '').trim();
             if (locType !== '' && locType !== '0') continue;
-            batch.push([r.stop_id, r.stop_name ?? '', lat, lon, agencyId]);
+            if (stopIdToPk.has(r.stop_id)) continue;
+            const pk = nextStopPk++;
+            stopIdToPk.set(r.stop_id, pk);
+            ins.run(pk, r.stop_id, r.stop_name ?? '', lat, lon, agencyId);
+            count++;
         }
-        db.transaction(() => { for (const a of batch) ins.run(...a); })();
-        console.log(`  stops: ${batch.length}`);
+        console.log(`  stops: ${count}`);
     }
 
     {
         const ins = db.prepare(`INSERT OR IGNORE INTO routes (route_id,route_short_name,route_long_name,route_type,route_color,route_text_color,agency) VALUES (?,?,?,?,?,?,?)`);
-        const batch: Array<[string,string,string,number,string,string,number]> = [];
-        for await (const r of streamCSV(file('routes.txt'))) {
-            batch.push([r.route_id, r.route_short_name ?? '', r.route_long_name ?? '', parseInt(r.route_type ?? '3', 10),
-                normalizeHexColor(r.route_color), normalizeHexColor(r.route_text_color) || '#FFFFFF', agencyId]);
+        let count = 0;
+        for (const r of parseCSV(file('routes.txt'))) {
+            ins.run(r.route_id, r.route_short_name ?? '', r.route_long_name ?? '', parseInt(r.route_type ?? '3', 10),
+                normalizeHexColor(r.route_color), normalizeHexColor(r.route_text_color) || '#FFFFFF', agencyId);
+            count++;
         }
-        db.transaction(() => { for (const a of batch) ins.run(...a); })();
-        console.log(`  routes: ${batch.length}`);
+        console.log(`  routes: ${count}`);
     }
 
     {
         const ins = db.prepare(`INSERT OR IGNORE INTO calendar
             (service_id,agency,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-        const batch: Array<[string,number,number,number,number,number,number,number,number,string,string]> = [];
-        for await (const r of streamCSV(file('calendar.txt'))) {
-            batch.push([r.service_id, agencyId,
+        let count = 0;
+        for (const r of parseCSV(file('calendar.txt'))) {
+            ins.run(r.service_id, agencyId,
                 parseInt(r.monday ?? '0', 10), parseInt(r.tuesday ?? '0', 10),
                 parseInt(r.wednesday ?? '0', 10), parseInt(r.thursday ?? '0', 10),
                 parseInt(r.friday ?? '0', 10), parseInt(r.saturday ?? '0', 10),
                 parseInt(r.sunday ?? '0', 10),
-                r.start_date ?? '', r.end_date ?? '']);
+                r.start_date ?? '', r.end_date ?? '');
+            count++;
         }
-        db.transaction(() => { for (const a of batch) ins.run(...a); })();
-        console.log(`  calendar entries: ${batch.length}`);
+        console.log(`  calendar entries: ${count}`);
     }
-
     {
         const ins = db.prepare(`INSERT OR IGNORE INTO calendar_dates (service_id,agency,date,exception_type) VALUES (?,?,?,?)`);
-        const batch: Array<[string,number,string,number]> = [];
-        for await (const r of streamCSV(file('calendar_dates.txt'))) {
-            batch.push([r.service_id, agencyId, r.date ?? '', parseInt(r.exception_type ?? '1', 10)]);
+        let count = 0;
+        for (const r of parseCSV(file('calendar_dates.txt'))) {
+            ins.run(r.service_id, agencyId, r.date ?? '', parseInt(r.exception_type ?? '1', 10));
+            count++;
         }
-        db.transaction(() => { for (const a of batch) ins.run(...a); })();
-        console.log(`  calendar_dates entries: ${batch.length}`);
+        console.log(`  calendar_dates entries: ${count}`);
     }
 
-    // ── Trip metadata (route/direction/shape/service), NOT yet grouped ───────
-    const tripMeta = new Map<string, { route_id: string; direction_id: string; shape_id: string; service_id: string }>();
-    for await (const t of streamCSV(file('trips.txt'))) {
+    interface TripMeta { pk: number; route_id: string; direction_id: string; shape_id: string; service_id: string }
+    const tripMeta = new Map<string, TripMeta>();
+    for (const t of parseCSV(file('trips.txt'))) {
         tripMeta.set(t.trip_id, {
+            pk: nextTripPk++,
             route_id: t.route_id, direction_id: t.direction_id ?? '0',
             shape_id: t.shape_id ?? '', service_id: t.service_id ?? '',
         });
     }
+    console.log(`  trips.txt entries: ${tripMeta.size}`);
 
-    // ── Read stop_times.txt ONCE into memory, per-trip, sorted by sequence ───
-    // This is the key structural fix. The old version grouped patterns by
-    // (route_id, direction_id, shape_id) and used only ONE representative
-    // trip's stops for pattern_stops. Real GTFS feeds routinely have express
-    // and all-stops services sharing the exact same shape_id (same physical
-    // rail alignment) while stopping at different subsets of stations. If the
-    // first-encountered trip for a shape happened to be an express, every
-    // station the express skips silently vanished from pattern_stops — even
-    // though many other trips of that "pattern" genuinely stop there. This is
-    // exactly what happened to Springvale on the Pakenham/Cranbourne line.
-    //
-    // Fix: a pattern is now defined by the ACTUAL SEQUENCE OF STOP_IDS a trip
-    // visits, not by shape_id. Two trips only belong to the same pattern if
-    // they stop at exactly the same stations in the same order. shape_id is
-    // still recorded per pattern for drawing the route line, but it no longer
-    // determines which stops belong to the pattern.
-    interface TripStopRow { stop_id: string; stop_sequence: number; arrival_sec: number; departure_sec: number }
+    interface TripStopRow { stop_pk: number; stop_sequence: number; arrival_sec: number; departure_sec: number }
     const tripStopTimes = new Map<string, TripStopRow[]>();
+    let skippedNoStop = 0;
 
-    for await (const r of streamCSV(file('stop_times.txt'))) {
-        if (!tripMeta.has(r.trip_id)) continue; // orphan stop_times row, no matching trip
+    for (const r of parseCSV(file('stop_times.txt'))) {
+        if (!tripMeta.has(r.trip_id)) continue;
+        const stopPk = stopIdToPk.get(r.stop_id);
+        if (stopPk === undefined) { skippedNoStop++; continue; }
         const row: TripStopRow = {
-            stop_id: r.stop_id,
+            stop_pk: stopPk,
             stop_sequence: parseInt(r.stop_sequence ?? '0', 10),
             arrival_sec: parseGtfsTimeSec(r.arrival_time),
             departure_sec: parseGtfsTimeSec(r.departure_time || r.arrival_time),
@@ -251,123 +259,108 @@ async function processAgency(agencyId: number, db: Database.Database) {
         tripStopTimes.get(r.trip_id)!.push(row);
     }
     for (const arr of tripStopTimes.values()) arr.sort((a, b) => a.stop_sequence - b.stop_sequence);
-    console.log(`  trips with stop_times: ${tripStopTimes.size}`);
-
-    // ── Group trips into patterns keyed by their actual stop_id sequence ─────
-    function hashString(s: string): string {
-        // djb2 — fast, deterministic, good enough to disambiguate pattern keys
-        // (not cryptographic; collisions would only cause two genuinely
-        // different stop sequences to share a pattern_id, which we additionally
-        // guard against by keeping the full sequence in the Map key itself).
-        let h = 5381;
-        for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-        return (h >>> 0).toString(16);
-    }
+    console.log(`  trips with stop_times: ${tripStopTimes.size}${skippedNoStop ? ` (skipped ${skippedNoStop} rows referencing unimported stops)` : ''}`);
 
     interface PatternGroup {
-        pattern_id: string; route_id: string; direction_id: string; shape_id: string;
-        trip_id: string; // representative trip, used only for shape fallback bookkeeping
-        stops: TripStopRow[]; // the authoritative, shared stop sequence for this pattern
+        pk: number; route_id: string; direction_id: string; shape_id: string;
+        trip_pk: number;
+        stops: TripStopRow[];
     }
-    const patternGroups = new Map<string, PatternGroup>(); // groupKey -> group
-    const tripToPatternId = new Map<string, string>();
+    const patternGroups = new Map<string, PatternGroup>();
+    const tripToPatternPk = new Map<string, number>();
 
     for (const [tripId, meta] of tripMeta) {
         const stops = tripStopTimes.get(tripId);
-        if (!stops || stops.length === 0) continue; // trip has no timetable rows at all — skip
+        if (!stops || stops.length === 0) continue;
 
-        const stopIdSeq = stops.map(s => s.stop_id).join(',');
-        const groupKey = `${meta.route_id}|${meta.direction_id}|${stopIdSeq}`;
+        const stopPkSeq = stops.map(s => s.stop_pk).join(',');
+        const groupKey = `${meta.route_id}|${meta.direction_id}|${stopPkSeq}`;
 
         let group = patternGroups.get(groupKey);
         if (!group) {
-            const patternId = `${agencyId}_${meta.route_id}_${meta.direction_id}_${hashString(stopIdSeq)}`;
             group = {
-                pattern_id: patternId, route_id: meta.route_id, direction_id: meta.direction_id,
-                shape_id: meta.shape_id, trip_id: tripId, stops,
+                pk: nextPatternPk++, route_id: meta.route_id, direction_id: meta.direction_id,
+                shape_id: meta.shape_id, trip_pk: meta.pk, stops,
             };
             patternGroups.set(groupKey, group);
         }
-        tripToPatternId.set(tripId, group.pattern_id);
+        tripToPatternPk.set(tripId, group.pk);
     }
     console.log(`  patterns (grouped by actual stop sequence): ${patternGroups.size}`);
 
-    // ── Insert trips ───────────────────────────────────────────────────────────
     {
-        const ins = db.prepare(`INSERT OR IGNORE INTO trips (trip_id,agency,pattern_id,service_id) VALUES (?,?,?,?)`);
-        const batch: Array<[string,number,string,string]> = [];
-        for (const [tripId, patId] of tripToPatternId) {
-            batch.push([tripId, agencyId, patId, tripMeta.get(tripId)?.service_id ?? '']);
+        const ins = db.prepare(`INSERT INTO trips (trip_pk,trip_id,agency,pattern_pk,service_id) VALUES (?,?,?,?,?)`);
+        let count = 0;
+        for (const [tripId, patternPk] of tripToPatternPk) {
+            const meta = tripMeta.get(tripId)!;
+            ins.run(meta.pk, tripId, agencyId, patternPk, meta.service_id);
+            count++;
         }
-        db.transaction(() => { for (const a of batch) ins.run(...a); })();
-        console.log(`  trips: ${batch.length}`);
+        console.log(`  trips: ${count}`);
     }
 
-    // ── Insert stop_times (every trip, using its now-known pattern_id) ────────
+    // No pattern_pk column in stop_times — it's derivable via trip_pk.
     {
-        const insStopTime = db.prepare(`INSERT OR IGNORE INTO stop_times
-            (trip_id,agency,stop_sequence,stop_id,pattern_id,arrival_sec,departure_sec) VALUES (?,?,?,?,?,?,?)`);
-        let stBatch: Array<[string,number,number,string,string,number,number]> = [];
-        let stCount = 0;
-        const flushST = () => {
-            if (!stBatch.length) return;
-            db.transaction(() => { for (const a of stBatch) insStopTime.run(...a); })();
-            stBatch = [];
-        };
+        const ins = db.prepare(`INSERT INTO stop_times
+                                (trip_pk,stop_sequence,stop_pk,arrival_sec,departure_sec) VALUES (?,?,?,?,?)`);
+        let count = 0;
         for (const [tripId, stops] of tripStopTimes) {
-            const patId = tripToPatternId.get(tripId);
-            if (!patId) continue;
+            const patternPk = tripToPatternPk.get(tripId);
+            if (!patternPk) continue; // gates on pattern membership only, doesn't store it
+            const tripPk = tripMeta.get(tripId)!.pk;
             for (const s of stops) {
-                stBatch.push([tripId, agencyId, s.stop_sequence, s.stop_id, patId, s.arrival_sec, s.departure_sec]);
-                stCount++;
-                if (stBatch.length >= 50_000) flushST();
+                ins.run(tripPk, s.stop_sequence, s.stop_pk, s.arrival_sec, s.departure_sec);
+                count++;
             }
         }
-        flushST();
-        console.log(`  stop_times: ${stCount}`);
-    }
-
-    // ── Insert patterns + pattern_stops (from the group's authoritative stops) ─
-    {
-        const insPat = db.prepare(`INSERT OR IGNORE INTO patterns (pattern_id,route_id,agency,direction_id,shape_id,trip_id) VALUES (?,?,?,?,?,?)`);
-        const insPS  = db.prepare(`INSERT INTO pattern_stops (pattern_id,stop_id,stop_sequence,agency) VALUES (?,?,?,?)`);
-        db.transaction(() => {
-            for (const group of patternGroups.values()) {
-                insPat.run(group.pattern_id, group.route_id, agencyId, parseInt(group.direction_id, 10), group.shape_id, group.trip_id);
-                for (const s of group.stops) insPS.run(group.pattern_id, s.stop_id, s.stop_sequence, agencyId);
-            }
-        })();
+        console.log(`  stop_times: ${count}`);
     }
 
     {
-        const insShape = db.prepare(`INSERT INTO shapes (shape_id,agency,shape_pt_lat,shape_pt_lon,shape_pt_sequence) VALUES (?,?,?,?,?)`);
+        const insPat = db.prepare(`INSERT INTO patterns (pattern_pk,route_id,agency,direction_id,shape_id,trip_pk) VALUES (?,?,?,?,?,?)`);
+        const insPS  = db.prepare(`INSERT INTO pattern_stops (pattern_pk,stop_pk,stop_sequence) VALUES (?,?,?)`);
+        for (const group of patternGroups.values()) {
+            insPat.run(group.pk, group.route_id, agencyId, parseInt(group.direction_id, 10), group.shape_id, group.trip_pk);
+            for (const s of group.stops) insPS.run(group.pk, s.stop_pk, s.stop_sequence);
+        }
+    }
+
+    {
+        const insMeta  = db.prepare(`INSERT INTO shape_meta (shape_pk,shape_id,agency) VALUES (?,?,?)`);
+        const insShape = db.prepare(`INSERT INTO shapes (shape_pk,shape_pt_lat,shape_pt_lon,shape_pt_sequence) VALUES (?,?,?,?)`);
+        const shapeIdToPk = new Map<string, number>();
         const ptCount = new Map<string, number>();
-        let shBatch: Array<[string,number,number,number,number]> = [];
         let stored = 0;
-        const flushSh = () => {
-            if (!shBatch.length) return;
-            db.transaction(() => { for (const a of shBatch) insShape.run(...a); })();
-            shBatch = [];
-        };
-        for await (const r of streamCSV(file('shapes.txt'))) {
-            const lat = parseFloat(r.shape_pt_lat), lon = parseFloat(r.shape_pt_lon);
-            if (!r.shape_id || isNaN(lat) || isNaN(lon)) continue;
+        for (const r of parseCSV(file('shapes.txt'))) {
+            const lat = packCoord(r.shape_pt_lat), lon = packCoord(r.shape_pt_lon);
+            if (!r.shape_id || lat === null || lon === null) continue;
             const cnt = ptCount.get(r.shape_id) ?? 0;
             ptCount.set(r.shape_id, cnt + 1);
             if (cnt !== 0 && cnt % 3 !== 0) continue;
-            shBatch.push([r.shape_id, agencyId, lat, lon, parseInt(r.shape_pt_sequence ?? '0', 10)]);
+            let shapePk = shapeIdToPk.get(r.shape_id);
+            if (shapePk === undefined) {
+                shapePk = nextShapePk++;
+                shapeIdToPk.set(r.shape_id, shapePk);
+                insMeta.run(shapePk, r.shape_id, agencyId);
+            }
+            insShape.run(shapePk, lat, lon, parseInt(r.shape_pt_sequence ?? '0', 10));
             stored++;
-            if (shBatch.length >= 50_000) flushSh();
         }
-        flushSh();
         console.log(`  shape points stored: ${stored}`);
     }
-
-    fs.rmSync(tempDir, { recursive: true });
 }
 
-async function main() {
+function main() {
     if (fs.existsSync(DB_PATH)) { fs.unlinkSync(DB_PATH); console.log('Removed existing database\n'); }
+
+    console.log(`Scanning ${GTFS_INPUT} for GTFS feeds…`);
+    const sources = findAllGtfsSources(GTFS_INPUT);
+    if (sources.length === 0) {
+        console.error(`No ${ESSENTIAL_FILE} found anywhere under ${GTFS_INPUT} — nothing to import.`);
+        process.exit(1);
+    }
+    console.log(`Found ${sources.length} feed(s):`);
+    sources.forEach((s, i) => console.log(`  [${i + 1}] ${s.describe}`));
 
     const db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
@@ -377,32 +370,39 @@ async function main() {
 
     createSchema(db);
 
-    for (const id of AGENCIES) { console.log(`\nAgency ${id}:`); await processAgency(id, db); }
+    db.transaction(() => {
+        sources.forEach((source, i) => {
+            const agencyId = i + 1;
+            console.log(`\nAgency ${agencyId}: [${elapsed()} elapsed]`);
+            processAgency(agencyId, source, db);
+        });
+    })();
+    console.log(`\nAll agencies imported. [${elapsed()} elapsed]`);
 
     console.log('\nBuilding indexes…');
-    db.exec(`
-        CREATE INDEX idx_stops_lat       ON stops(stop_lat);
-        CREATE INDEX idx_stops_lon       ON stops(stop_lon);
-        CREATE INDEX idx_ps_stop         ON pattern_stops(stop_id, agency);
-        CREATE INDEX idx_ps_pattern      ON pattern_stops(pattern_id);
-        CREATE INDEX idx_pat_route       ON patterns(route_id, agency);
-        CREATE INDEX idx_shapes          ON shapes(shape_id, agency, shape_pt_sequence);
-        CREATE INDEX idx_trips_pattern   ON trips(pattern_id, agency);
-        CREATE INDEX idx_trips_service   ON trips(service_id, agency);
-        CREATE INDEX idx_st_stop_dep     ON stop_times(stop_id, departure_sec);
-        CREATE INDEX idx_st_trip_seq     ON stop_times(trip_id, agency, stop_sequence);
-        CREATE INDEX idx_st_pat_stop_dep ON stop_times(pattern_id, stop_id, departure_sec);
-        CREATE INDEX idx_cal_service     ON calendar(service_id, agency);
-        CREATE INDEX idx_caldt_date      ON calendar_dates(date, agency);
-    `);
+    db.exec(GTFS_INDEXES_SQL);
+    console.log(`Indexes built. [${elapsed()} elapsed]`);
 
     console.log('\nCheckpointing WAL…');
     db.pragma('wal_checkpoint(TRUNCATE)');
     db.exec('PRAGMA journal_mode = DELETE');
-    db.pragma('integrity_check');
+    console.log(`WAL checkpointed. [${elapsed()} elapsed]`);
+
+    if (RUN_INTEGRITY_CHECK) {
+        console.log('\nRunning integrity check…');
+        db.pragma('integrity_check');
+        console.log(`Integrity check done. [${elapsed()} elapsed]`);
+    } else {
+        console.log('\nSkipping integrity check (RUN_INTEGRITY_CHECK = false)');
+    }
+
+    console.log('\nVacuuming (this can take a while on a multi-GB db)…');
+    db.exec('VACUUM;');
+    console.log(`Vacuum done. [${elapsed()} elapsed]`);
 
     db.close();
-    console.log(`\nDone → ${DB_PATH}`);
+    const stats = fs.statSync(DB_PATH);
+    console.log(`\nDone → ${DB_PATH} (${(stats.size / 1024 / 1024).toFixed(1)} MB) in ${elapsed()}`);
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main();

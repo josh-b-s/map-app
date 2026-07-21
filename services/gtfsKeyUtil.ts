@@ -23,5 +23,5 @@ export function makeKey(agency: number, id: string): string {
 
 export function parseKey(key: string): { agency: number; id: string } {
     const idx = key.indexOf(':');
-    return { agency: Number(key.slice(0, idx)), id: key.slice(idx + 1) };
+    return {agency: Number(key.slice(0, idx)), id: key.slice(idx + 1)};
 }

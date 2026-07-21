@@ -23,21 +23,23 @@
  * how it's derived.
  */
 
-import type { LatLng } from './gtfsDb';
-import { loadGtfsIndexForTrip, loadShapesForShapeIds, type GtfsIndex, type StopTimeEntry } from './gtfsLoader';
-import { fallbackRouteColor } from './routeTypeUtil';
-import { makeKey, parseKey } from './gtfsKeyUtil';
+import type {LatLng} from './gtfsDb';
+import {type GtfsIndex, loadGtfsIndexForTrip, loadShapesForShapeIds, type StopTimeEntry} from './gtfsLoader';
+import {fallbackRouteColor} from './routeTypeUtil';
+import {makeKey, parseKey} from './gtfsKeyUtil';
+import {haversineMeters as haversineMetersShared} from './geoUtil';
+import {MAX_TRANSFER_WALK_SEC, NEARBY_STOPS} from './routingSettings';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Walking speed presets (m/s)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const WALK_SPEED_MPS = {
-    SLOW:   0.8,
+    SLOW: 0.8,
     NORMAL: 1.4,
-    FAST:   1.8,
-    JOG:    2.5,
-    RUN:    4.0,
+    FAST: 1.8,
+    JOG: 2.5,
+    RUN: 4.0,
     SPRINT: 7.0,
 } as const;
 
@@ -46,10 +48,12 @@ export const WALK_SPEED_MPS = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MAX_ROUNDS = 5;
-const MAX_TRANSFER_WALK_SEC = 20 * 60; // was 7min (only ~588m at normal speed) — too tight for
-// real cross-mode transfers (e.g. train station to a bus stop 1.8km away, as seen on Google
-// Maps for the Mornington Peninsula trip). 20min covers ~1.68km at normal walking speed.
-const NEARBY_STOPS = 50;
+// MAX_TRANSFER_WALK_SEC / NEARBY_STOPS now live in routingSettings.ts —
+// imported below. See that file's header comment for how these relate to
+// coarseGraph.ts's WALK_EDGE_THRESHOLD_M and corridorResolver.ts's
+// SEED_RADIUS_M (three separate "how far would someone walk" radii serving
+// three different purposes: topology-graph transfers, BFS seeding, and
+// mid-journey RAPTOR transfers respectively).
 const BEST_MARKED_CAP = 400; // was 200 — raised as extra headroom now that trimming is goal-directed (see ASSUMED_TRANSIT_SPEED_MPS below), not just earliest-arrival-first
 
 const INF = Number.MAX_SAFE_INTEGER;
@@ -58,20 +62,32 @@ const INF = Number.MAX_SAFE_INTEGER;
 // Geometry helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Thin adapter over geoUtil.ts's shared haversineMeters (single source of
+// truth for the formula — see geoUtil.ts's header for why this used to be
+// copy-pasted across files and the drift risk that caused). Kept as a local
+// wrapper, rather than updating every call site in this file, purely so
+// existing call sites here (which pass a LatLng {latitude,longitude} as `a`)
+// don't all need to change shape.
 function haversineMeters(a: LatLng, b: { lat: number; lon: number }): number {
-    const R = 6_371_000;
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(b.lat - a.latitude);
-    const dLon = toRad(b.lon - a.longitude);
-    const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLon / 2);
-    const x = s1 * s1 + Math.cos(toRad(a.latitude)) * Math.cos(toRad(b.lat)) * s2 * s2;
-    return R * 2 * Math.asin(Math.sqrt(x));
+    return haversineMetersShared({lat: a.latitude, lon: a.longitude}, b);
 }
 
-function walkTimeSec(meters: number, speedMps: number): number { return meters / speedMps; }
-function walkTimeMin(meters: number, speedMps: number): number { return meters / speedMps / 60; }
-function transferRadiusM(speedMps: number): number { return speedMps * MAX_TRANSFER_WALK_SEC; }
-function toSecsMidnight(d: Date): number { return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds(); }
+function walkTimeSec(meters: number, speedMps: number): number {
+    return meters / speedMps;
+}
+
+function walkTimeMin(meters: number, speedMps: number): number {
+    return meters / speedMps / 60;
+}
+
+function transferRadiusM(speedMps: number): number {
+    return speedMps * MAX_TRANSFER_WALK_SEC;
+}
+
+function toSecsMidnight(d: Date): number {
+    return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+}
+
 function formatSec(sec: number): string {
     const h = Math.floor(sec / 3600) % 24;
     const m = Math.floor((sec % 3600) / 60);
@@ -87,6 +103,7 @@ function normalizeHexColor(color?: string | null): string | undefined {
 function resolveRouteColor(c: string | undefined, type: number, name: string): string {
     return normalizeHexColor(c) ?? fallbackRouteColor(type, name);
 }
+
 function resolveTextColor(c: string | undefined): string {
     return normalizeHexColor(c) ?? '#FFFFFF';
 }
@@ -101,8 +118,10 @@ const keyOf = (stopId: string, agency: number): StopKey => makeKey(agency, stopI
 type ParentInfo =
     | { type: 'origin-walk'; distM: number }
     | { type: 'footpath'; fromKey: StopKey; distM: number }
-    | { type: 'transit'; tripId: string; patternId: string; agency: number;
-    boardKey: StopKey; boardSeq: number; alightSeq: number };
+    | {
+    type: 'transit'; tripId: string; patternId: string; agency: number;
+    boardKey: StopKey; boardSeq: number; alightSeq: number
+};
 
 export interface RouteSegment {
     coords: LatLng[];
@@ -182,8 +201,8 @@ export interface GtfsRouteResult {
 
 function nearestStops(index: GtfsIndex, center: LatLng, limit: number, allowedIds: Set<string> | null) {
     const withDist = index.allStops
-        .filter(s => !allowedIds || allowedIds.has(s.stop_id))
-        .map(s => ({ s, d: haversineMeters(center, { lat: s.stop_lat, lon: s.stop_lon }) }))
+        .filter(s => !allowedIds || allowedIds.has(makeKey(s.agency, s.stop_id)))
+        .map(s => ({s, d: haversineMeters(center, {lat: s.stop_lat, lon: s.stop_lon})}))
         .sort((a, b) => a.d - b.d)
         .slice(0, limit);
     return withDist;
@@ -241,12 +260,14 @@ export async function computeGtfsRoute(
         if (index.noServiceFound) throw err;
 
         console.log('[gtfsRoute] search failed despite active trips in window — retrying once with a forced-wide (10h) window');
-        index = await loadGtfsIndexForTrip(origin, destination, departureTime, { forceWindowSec: 10 * 3600 });
+        index = await loadGtfsIndexForTrip(origin, destination, departureTime, {forceWindowSec: 10 * 3600});
         return await runSearchOnIndex(index, origin, destination, departureTime, walkingSpeedMps, debugMode, overallStart);
     }
 }
 
-async function runSearchOnIndex(
+// computeGtfsRoute is the normal entry point; this is split out separately
+// only so it can be called with an already-loaded GtfsIndex.
+export async function runSearchOnIndex(
     index: GtfsIndex,
     origin: LatLng,
     destination: LatLng,
@@ -257,10 +278,13 @@ async function runSearchOnIndex(
 ): Promise<GtfsRouteResult> {
     const tStart = Date.now();
     let t = tStart;
-    const lap = (label: string) => { console.log(`[gtfsRoute] ${label}: ${Date.now() - t}ms`); t = Date.now(); };
+    const lap = (label: string) => {
+        console.log(`[gtfsRoute] ${label}: ${Date.now() - t}ms`);
+        t = Date.now();
+    };
     lap(`post-load setup (load itself took ${tStart - overallStart}ms — see gtfsLoader's own TOTAL log for its breakdown)`);
 
-    const departSec  = toSecsMidnight(departureTime);
+    const departSec = toSecsMidnight(departureTime);
     const xferRadius = transferRadiusM(walkingSpeedMps);
 
     // ── Corridor (computed once, upstream, in gtfsLoader.ts) ──────────────────
@@ -273,40 +297,77 @@ async function runSearchOnIndex(
     // membership per-element inside the loop — with hundreds of newly-marked
     // stops per round, that was tens of millions of wasted iterations. Scanning
     // this much smaller pre-filtered array directly removes that cost.
-    const corridorStops = index.allStops.filter(s => allowedStopIds.has(s.stop_id));
+    const corridorStops = index.allStops.filter(s => allowedStopIds.has(makeKey(s.agency, s.stop_id)));
+
+    // ── Precomputed footpath neighbor grid ────────────────────────────────────
+    // Footpath relaxation below used to scan ALL of corridorStops for every
+    // newly-marked stop, every round — O(newlyMarked × corridorStops.length),
+    // unconditionally. Bucketing stops into a grid (same approach as
+    // coarseGraph.ts's walking-edge construction) lets each stop check only
+    // its own cell + 8 neighbors once, instead of a flat scan per
+    // newly-marked stop per round. Cell size must stay >= xferRadius or the
+    // 3x3-neighbor-cell scan can miss real neighbors just outside a smaller
+    // fixed cell — unlike coarseGraph.ts's fixed 450m WALK_EDGE_THRESHOLD_M,
+    // xferRadius here scales with the rider's walking speed (e.g. ~1680m at
+    // NORMAL/20min), so cell size is derived from it rather than hardcoded.
+    const FOOTPATH_GRID_CELL_DEG = Math.max(0.006, (xferRadius / 111_000) * 1.1);
+    const footpathGrid = new Map<string, typeof corridorStops>();
+    const footpathCellOf = (lat: number, lon: number) =>
+        `${Math.floor(lat / FOOTPATH_GRID_CELL_DEG)}:${Math.floor(lon / FOOTPATH_GRID_CELL_DEG)}`;
+    for (const s of corridorStops) {
+        const c = footpathCellOf(s.stop_lat, s.stop_lon);
+        if (!footpathGrid.has(c)) footpathGrid.set(c, []);
+        footpathGrid.get(c)!.push(s);
+    }
+
+    function nearbyForFootpath(lat: number, lon: number): typeof corridorStops {
+        const [cy, cx] = footpathCellOf(lat, lon).split(':').map(Number);
+        const out: typeof corridorStops = [];
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+                const bucket = footpathGrid.get(`${cy + dy}:${cx + dx}`);
+                if (bucket) out.push(...bucket);
+            }
+        }
+        return out;
+    }
 
     const originNearby = nearestStops(index, origin, NEARBY_STOPS, allowedStopIds);
-    const destNearby    = nearestStops(index, destination, NEARBY_STOPS, allowedStopIds);
+    const destNearby = nearestStops(index, destination, NEARBY_STOPS, allowedStopIds);
     lap('nearest-stops scan (origin + destination)');
 
     if (originNearby.length === 0) throw new Error('No stops near your location.');
     if (destNearby.length === 0) throw new Error('No stops near destination.');
 
     // ── RAPTOR state ──────────────────────────────────────────────────────────
-    const tau     = new Map<StopKey, number>();
-    const parent  = new Map<StopKey, ParentInfo>();
+    const tau = new Map<StopKey, number>();
+    const parent = new Map<StopKey, ParentInfo>();
     const transfersUsed = new Map<StopKey, number>(); // # transit legs taken to reach this stop
-    const walkSoFar      = new Map<StopKey, number>(); // cumulative walking metres to reach this stop
+    const walkSoFar = new Map<StopKey, number>(); // cumulative walking metres to reach this stop
 
     let marked = new Set<StopKey>();
-    for (const { s, d } of originNearby) {
+    for (const {s, d} of originNearby) {
         const key = keyOf(s.stop_id, s.agency);
         const arr = departSec + walkTimeSec(d, walkingSpeedMps);
         tau.set(key, arr);
-        parent.set(key, { type: 'origin-walk', distM: d });
+        parent.set(key, {type: 'origin-walk', distM: d});
         transfersUsed.set(key, 0);
         walkSoFar.set(key, d);
         marked.add(key);
     }
 
     const destKeyMap = new Map<StopKey, number>(); // stopKey -> distance to actual destination point
-    for (const { s, d } of destNearby) destKeyMap.set(keyOf(s.stop_id, s.agency), d);
+    for (const {s, d} of destNearby) destKeyMap.set(keyOf(s.stop_id, s.agency), d);
 
     // Journeys collected at the destination, kept if non-dominated.
     interface Candidate {
-        destKey: StopKey; finalWalkM: number; arrivalSec: number;
-        totalWalkM: number; transfers: number;
+        destKey: StopKey;
+        finalWalkM: number;
+        arrivalSec: number;
+        totalWalkM: number;
+        transfers: number;
     }
+
     const candidates: Candidate[] = [];
 
     function tryRecordDestination(stopKey: StopKey) {
@@ -317,9 +378,9 @@ async function runSearchOnIndex(
 
         const arrivalSec = tauS + walkTimeSec(distM, walkingSpeedMps);
         const totalWalkM = (walkSoFar.get(stopKey) ?? 0) + distM;
-        const transfers  = transfersUsed.get(stopKey) ?? 0;
+        const transfers = transfersUsed.get(stopKey) ?? 0;
 
-        candidates.push({ destKey: stopKey, finalWalkM: distM, arrivalSec, totalWalkM, transfers });
+        candidates.push({destKey: stopKey, finalWalkM: distM, arrivalSec, totalWalkM, transfers});
     }
 
     // Assumed average transit speed (m/s) used ONLY to estimate remaining
@@ -329,7 +390,22 @@ async function runSearchOnIndex(
     // "closer to destination" above "further from destination".
     const ASSUMED_TRANSIT_SPEED_MPS = 10;
 
+    // Best confirmed arrival at ANY destination-area stop so far. Once set,
+    // any marked stop whose tau + a lower-bound travel-time-to-destination
+    // already exceeds this can be dropped — it CANNOT produce a better
+    // journey than one already found, unlike BEST_MARKED_CAP's heuristic
+    // trim below (which can and does discard genuinely-better candidates,
+    // hence that trim's own protection logic). Safe because
+    // ASSUMED_TRANSIT_SPEED_MPS is a generous (fast) estimate, making the
+    // bound optimistic, never pessimistic.
+    let bestDestArrivalSec = INF;
+
+    function updateBestDestArrival() {
+        for (const c of candidates) if (c.arrivalSec < bestDestArrivalSec) bestDestArrivalSec = c.arrivalSec;
+    }
+
     for (const key of marked) tryRecordDestination(key);
+    updateBestDestArrival();
     lap('seed + initial destination check');
 
     // Debug-only: snapshot marked-stop coordinates at the end of each round,
@@ -372,11 +448,11 @@ async function runSearchOnIndex(
     // work, but exactly once per search, not once per round.
     const patternsByStop = new Map<StopKey, Array<{ patternKey: string; seq: number }>>();
     for (const [patternKey, seqList] of index.patternStops) {
-        const { agency: patAgency } = parseKey(patternKey); // agency-first key, safe regardless of colons in pattern_id
+        const {agency: patAgency} = parseKey(patternKey); // agency-first key, safe regardless of colons in pattern_id
         for (const entry of seqList) {
             const sk = keyOf(entry.stop_id, patAgency);
             if (!patternsByStop.has(sk)) patternsByStop.set(sk, []);
-            patternsByStop.get(sk)!.push({ patternKey, seq: entry.stop_sequence });
+            patternsByStop.get(sk)!.push({patternKey, seq: entry.stop_sequence});
         }
     }
 
@@ -406,6 +482,25 @@ async function runSearchOnIndex(
         // this was the actual cause of a Mornington -> Clayton search failing
         // at the very last local-bus connection despite a valid, boardable
         // departure existing for it.
+        // Provably-safe pruning: once any candidate journey to the
+        // destination is known, drop any marked stop that cannot possibly
+        // beat it (tau + optimistic remaining time already exceeds the best
+        // confirmed arrival). Runs BEFORE the heuristic trim below so it
+        // shrinks `marked` for free in the common case and reduces how much
+        // work that trim's own protection logic has to do.
+        if (bestDestArrivalSec < INF) {
+            marked = new Set([...marked].filter(key => {
+                const s = index.stopsByKey.get(key);
+                if (!s) return true; // don't drop on missing data, just skip pruning it
+                const tauS = tau.get(key) ?? INF;
+                const lowerBoundRemaining = haversineMeters(destination, {
+                    lat: s.stop_lat,
+                    lon: s.stop_lon
+                }) / ASSUMED_TRANSIT_SPEED_MPS;
+                return tauS + lowerBoundRemaining <= bestDestArrivalSec;
+            }));
+        }
+
         if (marked.size > BEST_MARKED_CAP) {
             // Two layers of protection, tried in order of confidence:
             //
@@ -437,8 +532,8 @@ async function runSearchOnIndex(
             const remainingForDistanceProtection = [...marked].filter(key => !seedProtected.has(key));
             const byDistance = remainingForDistanceProtection.map(key => {
                 const s = index.stopsByKey.get(key);
-                const d = s ? haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon }) : Infinity;
-                return { key, d };
+                const d = s ? haversineMeters(destination, {lat: s.stop_lat, lon: s.stop_lon}) : Infinity;
+                return {key, d};
             }).sort((a, b) => a.d - b.d).slice(0, PROTECTED_NEAREST_DEST);
             const distanceProtected = new Set(byDistance.map(x => x.key));
 
@@ -448,9 +543,9 @@ async function runSearchOnIndex(
                 const tauS = tau.get(key) ?? INF;
                 const s = index.stopsByKey.get(key);
                 const remainingSec = s
-                    ? haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon }) / ASSUMED_TRANSIT_SPEED_MPS
+                    ? haversineMeters(destination, {lat: s.stop_lat, lon: s.stop_lon}) / ASSUMED_TRANSIT_SPEED_MPS
                     : 0;
-                return { key, score: tauS + remainingSec };
+                return {key, score: tauS + remainingSec};
             });
             scored.sort((a, b) => a.score - b.score);
             const remainingBudget = Math.max(0, BEST_MARKED_CAP - protectedKeys.size);
@@ -481,9 +576,9 @@ async function runSearchOnIndex(
         for (const [stopKey, patterns] of patternsAtStop) {
             const tauAtStop = tau.get(stopKey) ?? INF;
             if (tauAtStop === INF) continue;
-            for (const { patternKey, seq } of patterns) {
+            for (const {patternKey, seq} of patterns) {
                 if (!boardingsByPattern.has(patternKey)) boardingsByPattern.set(patternKey, []);
-                boardingsByPattern.get(patternKey)!.push({ stopKey, seq, tauAtStop });
+                boardingsByPattern.get(patternKey)!.push({stopKey, seq, tauAtStop});
             }
         }
 
@@ -493,7 +588,7 @@ async function runSearchOnIndex(
         // candidate boarding stop using pre-sorted stopTimesByStop), then ride
         // it forward updating τ at every downstream stop.
         for (const [patternKey, boardings] of boardingsByPattern) {
-            const { id: patternIdOnly } = parseKey(patternKey); // real pattern_id, colons intact
+            const {id: patternIdOnly} = parseKey(patternKey); // real pattern_id, colons intact
 
             let bestTripId: string | null = null;
             let bestBoardKey: StopKey = '';
@@ -513,9 +608,9 @@ async function runSearchOnIndex(
             // FIRST one that yields a valid trip guarantees bestBoardSeq is always
             // the lowest usable sequence number, so "ride forward" always has a
             // real destination ahead of it, not behind it.
-            const sortedBoardings = [...boardings].sort((a, b) => a.seq - b.seq);
+            boardings.sort((a, b) => a.seq - b.seq);
 
-            for (const b of sortedBoardings) {
+            for (const b of boardings) {
                 const entries = index.stopTimesByStop.get(b.stopKey);
                 if (!entries || entries.length === 0) continue;
 
@@ -532,9 +627,9 @@ async function runSearchOnIndex(
                     // earlier raw departure time; that's exactly the comparison
                     // that caused the wrong-direction boarding bug above.
                     bestDepartSec = e.departure_sec;
-                    bestTripId    = e.trip_id;
-                    bestBoardKey  = b.stopKey;
-                    bestBoardSeq  = e.stop_sequence;
+                    bestTripId = e.trip_id;
+                    bestBoardKey = b.stopKey;
+                    bestBoardSeq = e.stop_sequence;
                     break; // entries sorted by time; first pattern match at/after idx is earliest for this stop
                 }
                 if (bestTripId) break; // lowest-sequence candidate with a valid trip found — stop scanning
@@ -553,7 +648,10 @@ async function runSearchOnIndex(
             let scanning = false;
             for (const ps of patternStopSeq) {
                 if (ps.stop_sequence < bestBoardSeq) continue;
-                if (ps.stop_sequence === bestBoardSeq) { scanning = true; continue; }
+                if (ps.stop_sequence === bestBoardSeq) {
+                    scanning = true;
+                    continue;
+                }
                 if (!scanning) continue;
 
                 const stopKey = keyOf(ps.stop_id, agency);
@@ -580,18 +678,18 @@ async function runSearchOnIndex(
         // ── Footpath relaxation for newly reached stops ───────────────────────
         if (newlyMarked.size > 0) {
             for (const key of [...newlyMarked]) {
-                const { agency, id: stopId } = parseKey(key);
+                const {agency, id: stopId} = parseKey(key);
                 const stop = index.stopsByKey.get(key);
                 if (!stop) continue;
                 const tauS = tau.get(key) ?? INF;
                 if (tauS === INF) continue;
 
-                for (const other of corridorStops) {
+                for (const other of nearbyForFootpath(stop.stop_lat, stop.stop_lon)) {
                     if (other.stop_id === stopId && other.agency === agency) continue;
 
                     const distM = haversineMeters(
-                        { latitude: stop.stop_lat, longitude: stop.stop_lon },
-                        { lat: other.stop_lat, lon: other.stop_lon },
+                        {latitude: stop.stop_lat, longitude: stop.stop_lon},
+                        {lat: other.stop_lat, lon: other.stop_lon},
                     );
                     if (distM > xferRadius) continue;
 
@@ -600,7 +698,7 @@ async function runSearchOnIndex(
                     const currentBest = tau.get(nKey) ?? INF;
                     if (arrAtN < currentBest) {
                         tau.set(nKey, arrAtN);
-                        parent.set(nKey, { type: 'footpath', fromKey: key, distM });
+                        parent.set(nKey, {type: 'footpath', fromKey: key, distM});
                         transfersUsed.set(nKey, transfersUsed.get(key) ?? 0);
                         walkSoFar.set(nKey, (walkSoFar.get(key) ?? 0) + distM);
                         newlyMarked.add(nKey);
@@ -610,20 +708,21 @@ async function runSearchOnIndex(
         }
 
         for (const key of newlyMarked) tryRecordDestination(key);
+        updateBestDestArrival();
 
         marked = newlyMarked;
         let closestToDestM = Infinity;
         for (const key of marked) {
             const s = index.stopsByKey.get(key);
             if (!s) continue;
-            const d = haversineMeters(destination, { lat: s.stop_lat, lon: s.stop_lon });
+            const d = haversineMeters(destination, {lat: s.stop_lat, lon: s.stop_lon});
             if (d < closestToDestM) closestToDestM = d;
         }
         if (debugMode) {
             const coords: LatLng[] = [];
             for (const key of marked) {
                 const s = index.stopsByKey.get(key);
-                if (s) coords.push({ latitude: s.stop_lat, longitude: s.stop_lon });
+                if (s) coords.push({latitude: s.stop_lat, longitude: s.stop_lon});
             }
             debugRoundMarkedStops.push(coords);
         }
@@ -670,7 +769,7 @@ async function runSearchOnIndex(
         // from RAPTOR's perspective but has a completely different cause
         // (schedule/time-window vs corridor/pattern-discovery).
         if (!anyDestStopTouched) {
-            for (const { s, d } of destNearby.slice(0, 5)) {
+            for (const {s, d} of destNearby.slice(0, 5)) {
                 const dKey = keyOf(s.stop_id, s.agency);
                 const servingPatterns = patternsByStop.get(dKey) ?? [];
                 if (servingPatterns.length === 0) {
@@ -678,7 +777,7 @@ async function runSearchOnIndex(
                         `NO pattern in the loaded corridor serves this stop at all — corridor/pattern-discovery excluded it.`);
                     continue;
                 }
-                const patternDetails = servingPatterns.map(({ patternKey }) => {
+                const patternDetails = servingPatterns.map(({patternKey}) => {
                     const hasStopTimes = index.stopTimesByStop.has(dKey) &&
                         (index.stopTimesByStop.get(dKey) ?? []).some(st => st.pattern_id === parseKey(patternKey).id);
                     if (!hasStopTimes) return `${parseKey(patternKey).id} (NO loaded trips in window)`;
@@ -831,13 +930,45 @@ async function runSearchOnIndex(
         throw new Error(`No route found within ${MAX_ROUNDS} transfers.\nNear origin: ${oNames}\nNear destination: ${dNames}`);
     }
 
+    // ── DIAGNOSTIC: log every pre-Pareto candidate's actual route sequence ──
+    // Answers "was an alternative (e.g. a train leg) ever found and then
+    // correctly dominated, or did it never get discovered at all" — those
+    // are very different bugs (one is a Pareto/RAPTOR outcome working as
+    // intended, the other is a corridor/BFS gap) and this is the only way
+    // to tell them apart from the outside. Walks the SAME `parent` chain
+    // reconstructPath() uses below, just to pull route names instead of
+    // building full segments — cheap (≤ MAX_ROUNDS hops per candidate) and
+    // only runs for the handful of destination candidates that exist by
+    // this point, not the whole search.
+    for (const c of candidates) {
+        const routeSeq: string[] = [];
+        let cur: StopKey | undefined = c.destKey;
+        let guard = 0;
+        while (cur !== undefined && guard++ < MAX_ROUNDS + 2) {
+            const p = parent.get(cur);
+            if (!p) break;
+            if (p.type === 'transit') {
+                const meta = index.patternsByKey.get(makeKey(p.agency, p.patternId));
+                routeSeq.unshift(meta ? `${meta.route_name} (${meta.pattern_id})` : p.patternId);
+                cur = p.boardKey;
+            } else if (p.type === 'footpath') {
+                routeSeq.unshift('walk');
+                cur = p.fromKey;
+            } else {
+                cur = undefined; // origin-walk — chain ends here
+            }
+        }
+        console.log(`[gtfsRoute]   [DIAGNOSTIC] candidate: arrival=${formatSec(c.arrivalSec)}, ` +
+            `walk=${Math.round(c.totalWalkM)}m, transfers=${c.transfers}, route=[${routeSeq.join(' -> ')}]`);
+    }
+
     // ── Reduce to non-dominated set (Pareto frontier on arrival/walk/transfers) ─
     const nonDominated = candidates.filter((c, i) =>
         !candidates.some((o, j) =>
             j !== i &&
-            o.arrivalSec   <= c.arrivalSec &&
-            o.totalWalkM   <= c.totalWalkM &&
-            o.transfers    <= c.transfers &&
+            o.arrivalSec <= c.arrivalSec &&
+            o.totalWalkM <= c.totalWalkM &&
+            o.transfers <= c.transfers &&
             (o.arrivalSec < c.arrivalSec || o.totalWalkM < c.totalWalkM || o.transfers < c.transfers)
         )
     );
@@ -869,7 +1000,7 @@ async function runSearchOnIndex(
     const neededShapeIds = [...usedPatternKeys]
         .map(k => index.patternsByKey.get(k))
         .filter((p): p is NonNullable<typeof p> => !!p?.shape_id)
-        .map(p => ({ shape_id: p.shape_id as string, agency: p.agency }));
+        .map(p => ({shape_id: p.shape_id as string, agency: p.agency}));
     const loadedShapes = await loadShapesForShapeIds(neededShapeIds);
     for (const [key, pts] of loadedShapes) index.shapePoints.set(key, pts);
     lap(`shapes for kept journeys (${usedPatternKeys.size} patterns, ${loadedShapes.size} shapes)`);
@@ -886,22 +1017,24 @@ async function runSearchOnIndex(
 
     let debug: GtfsDebugInfo | undefined;
     if (debugMode) {
-        // corridorStopIds is keyed by plain stop_id (not the composite
-        // agency:stop_id key stopsByKey uses) — same convention as the
-        // corridorStops filter earlier in this function.
+        // corridorStopIds is now keyed the same way stopsByKey is
+        // (agency-qualified, via makeKey) — tightened alongside
+        // corridorResolver.ts/corridorTagging.ts to remove a cross-agency
+        // stop_id collision risk. Same convention as the corridorStops
+        // filter earlier in this function.
         const corridorStops: LatLng[] = index.allStops
-            .filter(s => index.corridorStopIds.has(s.stop_id))
-            .map(s => ({ latitude: s.stop_lat, longitude: s.stop_lon }));
+            .filter(s => index.corridorStopIds.has(makeKey(s.agency, s.stop_id)))
+            .map(s => ({latitude: s.stop_lat, longitude: s.stop_lon}));
         const seedPaths: LatLng[][] = index.debugSeedPaths.map(path =>
             path.map(key => {
                 const s = index.stopsByKey.get(key); // seed path keys ARE composite (from coarseGraph)
-                return s ? { latitude: s.stop_lat, longitude: s.stop_lon } : null;
+                return s ? {latitude: s.stop_lat, longitude: s.stop_lon} : null;
             }).filter((p): p is LatLng => p !== null),
         );
         const bfsLevels: LatLng[][] = index.debugBfsLevels.map(level =>
             level.map(key => {
                 const s = index.stopsByKey.get(key);
-                return s ? { latitude: s.stop_lat, longitude: s.stop_lon } : null;
+                return s ? {latitude: s.stop_lat, longitude: s.stop_lon} : null;
             }).filter((p): p is LatLng => p !== null),
         );
         const bfsTreeEdges = index.debugBfsTreeEdges.map(([fromKey, toKey]) => {
@@ -909,27 +1042,35 @@ async function runSearchOnIndex(
             const toStop = index.stopsByKey.get(toKey);
             if (!fromStop || !toStop) return null;
             return {
-                from: { latitude: fromStop.stop_lat, longitude: fromStop.stop_lon },
-                to: { latitude: toStop.stop_lat, longitude: toStop.stop_lon },
+                from: {latitude: fromStop.stop_lat, longitude: fromStop.stop_lon},
+                to: {latitude: toStop.stop_lat, longitude: toStop.stop_lon},
             };
         }).filter((e): e is { from: LatLng; to: LatLng } => e !== null);
         // lat/lon -> latitude/longitude naming convention swap only; no
         // computation happens here, corridorTagging.ts already did the work.
         const corridorBoundary = index.debugCorridorBoundary.map(b => ({
-            left: b.left.map(p => ({ latitude: p.lat, longitude: p.lon })),
-            right: b.right.map(p => ({ latitude: p.lat, longitude: p.lon })),
+            left: b.left.map(p => ({latitude: p.lat, longitude: p.lon})),
+            right: b.right.map(p => ({latitude: p.lat, longitude: p.lon})),
         }));
         const walkRadiusCircles = [
-            { center: origin, radiusMeters: index.debugWalkRadiusM },
-            { center: destination, radiusMeters: index.debugWalkRadiusM },
+            {center: origin, radiusMeters: index.debugWalkRadiusM},
+            {center: destination, radiusMeters: index.debugWalkRadiusM},
         ];
-        debug = { corridorStops, seedPaths, bfsLevels, bfsTreeEdges, roundMarkedStops: debugRoundMarkedStops, corridorBoundary, walkRadiusCircles };
+        debug = {
+            corridorStops,
+            seedPaths,
+            bfsLevels,
+            bfsTreeEdges,
+            roundMarkedStops: debugRoundMarkedStops,
+            corridorBoundary,
+            walkRadiusCircles
+        };
         lap(`debug payload assembled (${corridorStops.length} corridor stops, ${seedPaths.length} seed paths, ${bfsLevels.length} BFS levels, ${debugRoundMarkedStops.length} rounds, ${corridorBoundary.length} corridor boundaries)`);
     }
 
     console.log(`[gtfsRoute] post-load search time: ${Date.now() - tStart}ms | TRUE total (incl. load): ${Date.now() - overallStart}ms`);
 
-    return { journeys, debug };
+    return {journeys, debug};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -950,8 +1091,10 @@ function reconstructPath(
     type Step =
         | { type: 'origin-walk'; toKey: StopKey; originWalkM: number }
         | { type: 'footpath'; fromKey: StopKey; fpToKey: StopKey; footpathM: number }
-        | { type: 'transit'; tripId: string; patternId: string; agency: number;
-        boardKey: StopKey; alightKey: StopKey; boardSeq: number; alightSeq: number };
+        | {
+        type: 'transit'; tripId: string; patternId: string; agency: number;
+        boardKey: StopKey; alightKey: StopKey; boardSeq: number; alightSeq: number
+    };
 
     const steps: Step[] = [];
     let cur = destKey;
@@ -960,7 +1103,7 @@ function reconstructPath(
         const p = parent.get(cur);
         if (!p) break;
         if (p.type === 'origin-walk') {
-            steps.push({ type: 'origin-walk', toKey: cur, originWalkM: p.distM });
+            steps.push({type: 'origin-walk', toKey: cur, originWalkM: p.distM});
             break;
         } else if (p.type === 'transit') {
             steps.push({
@@ -969,7 +1112,7 @@ function reconstructPath(
             });
             cur = p.boardKey;
         } else {
-            steps.push({ type: 'footpath', fromKey: p.fromKey, fpToKey: cur, footpathM: p.distM });
+            steps.push({type: 'footpath', fromKey: p.fromKey, fpToKey: cur, footpathM: p.distM});
             cur = p.fromKey;
         }
     }
@@ -992,7 +1135,7 @@ function reconstructPath(
     for (const step of steps) {
         if (step.type === 'origin-walk') {
             const toStop = index.stopsByKey.get(step.toKey)!;
-            const toLL = { latitude: toStop.stop_lat, longitude: toStop.stop_lon };
+            const toLL = {latitude: toStop.stop_lat, longitude: toStop.stop_lon};
             if (step.originWalkM > 1) {
                 segments.push(walkSegment(origin, toLL, 'Your location', toStop.stop_name, step.originWalkM));
                 allCoords.push(toLL);
@@ -1003,9 +1146,9 @@ function reconstructPath(
 
         if (step.type === 'footpath') {
             const from = index.stopsByKey.get(step.fromKey)!;
-            const to   = index.stopsByKey.get(step.fpToKey)!;
-            const fromLL = { latitude: from.stop_lat, longitude: from.stop_lon };
-            const toLL   = { latitude: to.stop_lat, longitude: to.stop_lon };
+            const to = index.stopsByKey.get(step.fpToKey)!;
+            const fromLL = {latitude: from.stop_lat, longitude: from.stop_lon};
+            const toLL = {latitude: to.stop_lat, longitude: to.stop_lon};
             const walkMin = Math.max(1, Math.round(walkTimeMin(step.footpathM, walkingSpeedMps)));
             transferStopName = from.stop_name === to.stop_name
                 ? from.stop_name
@@ -1019,21 +1162,21 @@ function reconstructPath(
         }
 
         // transit
-        const { tripId, patternId, agency, boardKey, alightKey, boardSeq, alightSeq } = step;
-        const boardStop  = index.stopsByKey.get(boardKey)!;
+        const {tripId, patternId, agency, boardKey, alightKey, boardSeq, alightSeq} = step;
+        const boardStop = index.stopsByKey.get(boardKey)!;
         const alightStop = index.stopsByKey.get(alightKey)!;
         const patMeta = index.patternsByKey.get(makeKey(agency, patternId));
 
-        const routeName      = patMeta?.route_name ?? '?';
-        const routeType      = patMeta?.route_type ?? 3;
-        const routeColor     = resolveRouteColor(patMeta?.route_color, routeType, routeName);
+        const routeName = patMeta?.route_name ?? '?';
+        const routeType = patMeta?.route_type ?? 3;
+        const routeColor = resolveRouteColor(patMeta?.route_color, routeType, routeName);
         const routeTextColor = resolveTextColor(patMeta?.route_text_color);
 
-        const boardEntry  = index.stopTimesByStopAndTrip.get(boardKey)?.get(tripId);
+        const boardEntry = index.stopTimesByStopAndTrip.get(boardKey)?.get(tripId);
         const alightEntry = index.stopTimesByStopAndTrip.get(alightKey)?.get(tripId);
 
-        const departTimeStr = boardEntry  ? formatSec(boardEntry.departure_sec) : undefined;
-        const arriveTimeStr = alightEntry ? formatSec(alightEntry.arrival_sec)  : undefined;
+        const departTimeStr = boardEntry ? formatSec(boardEntry.departure_sec) : undefined;
+        const arriveTimeStr = alightEntry ? formatSec(alightEntry.arrival_sec) : undefined;
 
         let coords: LatLng[] = [];
         if (patMeta?.shape_id) {
@@ -1047,15 +1190,18 @@ function reconstructPath(
                 const nearestIndex = (target: { latitude: number; longitude: number }) => {
                     let bestIdx = 0, bestDist = Infinity;
                     for (let i = 0; i < pts.length; i++) {
-                        const d = haversineMeters(target, { lat: pts[i].latitude, lon: pts[i].longitude });
-                        if (d < bestDist) { bestDist = d; bestIdx = i; }
+                        const d = haversineMeters(target, {lat: pts[i].latitude, lon: pts[i].longitude});
+                        if (d < bestDist) {
+                            bestDist = d;
+                            bestIdx = i;
+                        }
                     }
                     return bestIdx;
                 };
-                const boardLL  = { latitude: boardStop.stop_lat,  longitude: boardStop.stop_lon };
-                const alightLL = { latitude: alightStop.stop_lat, longitude: alightStop.stop_lon };
+                const boardLL = {latitude: boardStop.stop_lat, longitude: boardStop.stop_lon};
+                const alightLL = {latitude: alightStop.stop_lat, longitude: alightStop.stop_lon};
                 const startIdx = nearestIndex(boardLL);
-                const endIdx   = nearestIndex(alightLL);
+                const endIdx = nearestIndex(alightLL);
                 const lo = Math.min(startIdx, endIdx);
                 const hi = Math.max(startIdx, endIdx);
                 coords = pts.slice(lo, hi + 1);
@@ -1068,14 +1214,14 @@ function reconstructPath(
                 .filter(s => s.stop_sequence >= lo && s.stop_sequence <= hi)
                 .map(s => {
                     const st = index.stopsByKey.get(keyOf(s.stop_id, agency));
-                    return st ? { latitude: st.stop_lat, longitude: st.stop_lon } : null;
+                    return st ? {latitude: st.stop_lat, longitude: st.stop_lon} : null;
                 })
                 .filter((x): x is LatLng => x !== null);
         }
         if (coords.length === 0) {
             coords = [
-                { latitude: boardStop.stop_lat, longitude: boardStop.stop_lon },
-                { latitude: alightStop.stop_lat, longitude: alightStop.stop_lon },
+                {latitude: boardStop.stop_lat, longitude: boardStop.stop_lon},
+                {latitude: alightStop.stop_lat, longitude: alightStop.stop_lon},
             ];
         }
 
@@ -1091,12 +1237,12 @@ function reconstructPath(
         });
 
         for (const c of coords) allCoords.push(c);
-        allCoords.push({ latitude: alightStop.stop_lat, longitude: alightStop.stop_lon });
+        allCoords.push({latitude: alightStop.stop_lat, longitude: alightStop.stop_lon});
         transferCount++;
     }
 
     const destStop = index.stopsByKey.get(destKey)!;
-    const destStopLL = { latitude: destStop.stop_lat, longitude: destStop.stop_lon };
+    const destStopLL = {latitude: destStop.stop_lat, longitude: destStop.stop_lon};
     if (finalWalkM > 1) {
         segments.push(walkSegment(destStopLL, destination, destStop.stop_name, 'Your destination', finalWalkM));
         allCoords.push(destination);
@@ -1104,7 +1250,7 @@ function reconstructPath(
     }
 
     const firstLeg = legs[0];
-    const lastLeg  = legs[legs.length - 1];
+    const lastLeg = legs[legs.length - 1];
 
     return {
         coords: allCoords,

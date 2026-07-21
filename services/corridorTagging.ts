@@ -12,11 +12,38 @@
  * world" stop that's close as the crow flies but topologically unrelated).
  */
 
-import { getCoarseGraph } from './coarseGraph';
-import { findSeedPaths } from './seedRouteBfs';
-import { parseKey } from './gtfsKeyUtil';
-import { haversineMeters, type LatLon } from './geoUtil';
-export type { LatLon };
+import {getCoarseGraph} from './coarseGraph';
+import {findSeedPaths} from './seedRouteBfs';
+import {makeKey} from './gtfsKeyUtil';
+import {haversineMeters, type LatLon} from './geoUtil';
+import type {QueryableDb} from './sqlChunkUtil';
+import {getPatternKeysForStopKeys} from './gtfsRepo';
+import {
+    CORRIDOR_MIN_ACCEPTABLE_STOPS as MIN_ACCEPTABLE_STOPS,
+    CORRIDOR_MIN_WIDTH_M as MIN_WIDTH_M,
+    CORRIDOR_TAPER_K_M as TAPER_K_M,
+    CORRIDOR_WIDEN_MIN_WIDTH_M as WIDEN_MIN_WIDTH_M,
+    CORRIDOR_WIDEN_TAPER_K_M as WIDEN_TAPER_K_M,
+    MAX_TRANSFERS as DEFAULT_MAX_TRANSFERS,
+    ORIGIN_DEST_WALK_RADIUS_M,
+} from './routingSettings';
+
+export type {LatLon};
+
+/** A stop candidate for corridor tagging — carries agency so tagging can
+ *  produce agency-qualified stop KEYS, not bare stop_id text. Bare ids can
+ *  collide across agencies/feeds (two different GTFS feeds both using
+ *  "1001" for a stop, say); qualifying by agency here is what lets every
+ *  downstream consumer (corridorResolver.ts, gtfsLoader.ts, gtfsRouter.ts)
+ *  do EXACT stop/pattern lookups instead of "matches this id text in any
+ *  agency" ones — this matters more as multiple feeds become simultaneously
+ *  active, not just as a multi-feed nicety. */
+export interface CorridorCandidate {
+    stop_id: string;
+    agency: number;
+    lat: number;
+    lon: number;
+}
 
 /** Tapered-buffer outline for one seed path, as two parallel polylines (one
  *  per side) sampled at even arc-length steps along the path. Concatenating
@@ -29,7 +56,7 @@ export interface CorridorBoundary {
 }
 
 export interface CorridorResult {
-    stopIds: Set<string>;   // unqualified stop_id, matches ellipseFilterStops' old return shape
+    stopIds: Set<string>;   // agency-qualified stop KEYS (makeKey(agency,stop_id)) — see CorridorCandidate's doc
     widened: boolean;       // true if the fallback (widen or full-network) kicked in
     seedPathCount: number;
     /** The raw seed paths BFS found (stop-key sequences, origin->destination),
@@ -54,11 +81,19 @@ export interface CorridorResult {
     corridorBoundaries: CorridorBoundary[];
 }
 
-const MIN_WIDTH_M = 350;
-const TAPER_K_M = 900;           // width(t) = MIN_WIDTH_M + TAPER_K_M * sin(pi * t)
-const WIDEN_MIN_WIDTH_M = 700;
-const WIDEN_TAPER_K_M = 1600;
-const MIN_ACCEPTABLE_STOPS = 8;  // below this, treat as "suspiciously small" per spec step 5
+// Re-exported (not just imported) — corridorResolver.ts imports this FROM
+// corridorTagging.ts and re-exports it again in turn for gtfsLoader.ts.
+// Keeping that chain intact rather than pointing every caller at
+// routingSettings.ts directly avoids touching two extra files' import
+// lists for a rename that's purely internal reorganization.
+export {ORIGIN_DEST_WALK_RADIUS_M};
+
+// MIN_WIDTH_M / TAPER_K_M / WIDEN_MIN_WIDTH_M / WIDEN_TAPER_K_M /
+// MIN_ACCEPTABLE_STOPS / ORIGIN_DEST_WALK_RADIUS_M now live in
+// routingSettings.ts (imported above, aliased to keep this file's existing
+// shorter names) — see that file's header comment for how
+// ORIGIN_DEST_WALK_RADIUS_M relates to corridorResolver.ts's
+// SEED_RADIUS_M and coarseGraph.ts's WALK_EDGE_THRESHOLD_M.
 
 // How far someone will plausibly walk to/from a stop, independent of the
 // path-taper width. These used to be the same number (minWidthM, 350m on
@@ -68,7 +103,6 @@ const MIN_ACCEPTABLE_STOPS = 8;  // below this, treat as "suspiciously small" pe
 // boarding point than something further away that happened to fall inside
 // the tapered buffer along a seed path. This is a fixed walk-tolerance
 // circle around each endpoint, applied on every pass regardless of taper.
-export const ORIGIN_DEST_WALK_RADIUS_M = 900;
 
 /** Perpendicular distance (meters) from `p` to segment a->b, plus how far
  *  along the segment (0..1) the closest point falls — needed for the taper. */
@@ -83,7 +117,7 @@ function distanceToSegment(p: LatLon, a: LatLon, b: LatLon): { distM: number; t:
         x: (q.lon - a.lon) * mPerDegLon,
         y: (q.lat - a.lat) * mPerDegLat,
     });
-    const A = { x: 0, y: 0 };
+    const A = {x: 0, y: 0};
     const B = toXY(b);
     const P = toXY(p);
 
@@ -91,12 +125,14 @@ function distanceToSegment(p: LatLon, a: LatLon, b: LatLon): { distM: number; t:
     const lenSq = abx * abx + aby * aby;
     let t = lenSq === 0 ? 0 : ((P.x - A.x) * abx + (P.y - A.y) * aby) / lenSq;
     t = Math.max(0, Math.min(1, t));
-    const closest = { x: A.x + t * abx, y: A.y + t * aby };
+    const closest = {x: A.x + t * abx, y: A.y + t * aby};
     const dx = P.x - closest.x, dy = P.y - closest.y;
-    return { distM: Math.sqrt(dx * dx + dy * dy), t };
+    return {distM: Math.sqrt(dx * dx + dy * dy), t};
 }
 
-function toRadSafe(d: number): number { return (d * Math.PI) / 180; }
+function toRadSafe(d: number): number {
+    return (d * Math.PI) / 180;
+}
 
 /**
  * Cheap lat/lon bounding-box pre-filter, run once per path before the
@@ -110,9 +146,9 @@ function toRadSafe(d: number): number { return (d * Math.PI) / 180; }
  */
 function bboxFilterCandidates(
     path: LatLon[],
-    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    candidates: CorridorCandidate[],
     maxWidthM: number,
-): Array<{ stop_id: string; lat: number; lon: number }> {
+): CorridorCandidate[] {
     let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
     for (const p of path) {
         if (p.lat < minLat) minLat = p.lat;
@@ -141,7 +177,7 @@ function bboxFilterCandidates(
  */
 function tagStopsForPath(
     path: LatLon[],
-    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    candidates: CorridorCandidate[],
     minWidthM: number,
     taperKM: number,
 ): Set<string> {
@@ -163,11 +199,12 @@ function tagStopsForPath(
         const segLen = segLengths[i];
 
         for (const c of candidates) {
-            if (tagged.has(c.stop_id)) continue;
-            const { distM, t: localT } = distanceToSegment({ lat: c.lat, lon: c.lon }, a, b);
+            const key = makeKey(c.agency, c.stop_id);
+            if (tagged.has(key)) continue;
+            const {distM, t: localT} = distanceToSegment({lat: c.lat, lon: c.lon}, a, b);
             const globalT = totalLength > 0 ? (cumBefore + localT * segLen) / totalLength : 0;
             const width = minWidthM + taperKM * Math.sin(Math.PI * globalT);
-            if (distM <= width) tagged.add(c.stop_id);
+            if (distM <= width) tagged.add(key);
         }
         cumBefore += segLen;
     }
@@ -192,7 +229,7 @@ const BOUNDARY_SAMPLES_PER_PATH = 20;
 function boundaryForPath(path: LatLon[], minWidthM: number, taperKM: number): CorridorBoundary {
     const left: LatLon[] = [];
     const right: LatLon[] = [];
-    if (path.length < 2) return { left, right };
+    if (path.length < 2) return {left, right};
 
     const segLengths: number[] = [];
     let totalLength = 0;
@@ -201,7 +238,7 @@ function boundaryForPath(path: LatLon[], minWidthM: number, taperKM: number): Co
         segLengths.push(d);
         totalLength += d;
     }
-    if (totalLength === 0) return { left, right };
+    if (totalLength === 0) return {left, right};
 
     for (let s = 0; s <= BOUNDARY_SAMPLES_PER_PATH; s++) {
         const targetLen = (s / BOUNDARY_SAMPLES_PER_PATH) * totalLength;
@@ -237,11 +274,11 @@ function boundaryForPath(path: LatLon[], minWidthM: number, taperKM: number): Co
         const dLat = (perpYM * width) / mPerDegLat;
         const dLon = (perpXM * width) / mPerDegLon;
 
-        left.push({ lat: lat + dLat, lon: lon + dLon });
-        right.push({ lat: lat - dLat, lon: lon - dLon });
+        left.push({lat: lat + dLat, lon: lon + dLon});
+        right.push({lat: lat - dLat, lon: lon - dLon});
     }
 
-    return { left, right };
+    return {left, right};
 }
 
 async function runOnce(
@@ -249,7 +286,7 @@ async function runOnce(
     destination: LatLon,
     originStopKeys: string[],
     destStopKeys: string[],
-    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    candidates: CorridorCandidate[],
     minWidthM: number,
     taperKM: number,
     maxTransfers: number,
@@ -257,12 +294,24 @@ async function runOnce(
     const tGraph0 = Date.now();
     const graph = await getCoarseGraph();
     const tGraph1 = Date.now();
-    const { paths, levelFrontiers, treeEdges: bfsTreeEdges } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
+    const {
+        paths,
+        levelFrontiers,
+        treeEdges: bfsTreeEdges
+    } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
     const tBfs1 = Date.now();
     console.log(`[corridorTagging] getCoarseGraph: ${tGraph1 - tGraph0}ms, BFS: ${tBfs1 - tGraph1}ms (${paths.length} paths)`);
 
     if (paths.length === 0) {
-        return { stopIds: new Set(), widened: false, seedPathCount: 0, seedPaths: [], levelFrontiers: [], bfsTreeEdges: [], corridorBoundaries: [] };
+        return {
+            stopIds: new Set(),
+            widened: false,
+            seedPathCount: 0,
+            seedPaths: [],
+            levelFrontiers: [],
+            bfsTreeEdges: [],
+            corridorBoundaries: []
+        };
     }
 
     const union = new Set<string>();
@@ -270,7 +319,7 @@ async function runOnce(
     for (const stopKeyPath of paths) {
         const polyline: LatLon[] = stopKeyPath.map(key => {
             const node = graph.nodesByKey.get(key);
-            return node ? { lat: node.stop_lat, lon: node.stop_lon } : { lat: origin.lat, lon: origin.lon };
+            return node ? {lat: node.stop_lat, lon: node.stop_lon} : {lat: origin.lat, lon: origin.lon};
         });
         const maxWidthM = minWidthM + taperKM; // sin() peaks at 1, so this is the true max buffer width
         const localCandidates = bboxFilterCandidates(polyline, candidates, maxWidthM);
@@ -285,12 +334,21 @@ async function runOnce(
     // consistent (and realistic) across both the narrow first pass and the
     // widened retry — see ORIGIN_DEST_WALK_RADIUS_M above.
     for (const c of candidates) {
-        if (haversineMeters(origin, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) union.add(c.stop_id);
-        if (haversineMeters(destination, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) union.add(c.stop_id);
+        const key = makeKey(c.agency, c.stop_id);
+        if (haversineMeters(origin, {lat: c.lat, lon: c.lon}) <= ORIGIN_DEST_WALK_RADIUS_M) union.add(key);
+        if (haversineMeters(destination, {lat: c.lat, lon: c.lon}) <= ORIGIN_DEST_WALK_RADIUS_M) union.add(key);
     }
     console.log(`[corridorTagging] tagging (${paths.length} paths x ${candidates.length} candidates, bbox-filtered): ${Date.now() - tBfs1}ms -> ${union.size} stops`);
 
-    return { stopIds: union, widened: false, seedPathCount: paths.length, seedPaths: paths, levelFrontiers, bfsTreeEdges, corridorBoundaries };
+    return {
+        stopIds: union,
+        widened: false,
+        seedPathCount: paths.length,
+        seedPaths: paths,
+        levelFrontiers,
+        bfsTreeEdges,
+        corridorBoundaries
+    };
 }
 
 /**
@@ -305,14 +363,13 @@ async function runOnce(
  * is only worth paying when the seed-path-derived approach can't find
  * enough patterns to work with (e.g. BFS came back with very few/no paths).
  */
-const DEFAULT_MAX_TRANSFERS = 5;
 
 export async function computeCorridor(
     origin: LatLon,
     destination: LatLon,
     originStopKeys: string[],
     destStopKeys: string[],
-    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    candidates: CorridorCandidate[],
     maxTransfers: number = DEFAULT_MAX_TRANSFERS,
 ): Promise<CorridorResult> {
     const first = await runOnce(origin, destination, originStopKeys, destStopKeys, candidates, MIN_WIDTH_M, TAPER_K_M, maxTransfers);
@@ -320,15 +377,7 @@ export async function computeCorridor(
 
     console.log(`[corridorTagging] first pass gave only ${first.stopIds.size} stops (${first.seedPathCount} seed paths) — widening and retrying`);
     const widened = await runOnce(origin, destination, originStopKeys, destStopKeys, candidates, WIDEN_MIN_WIDTH_M, WIDEN_TAPER_K_M, maxTransfers);
-    return { ...widened, widened: true };
-}
-
-/** Minimal DB shape this module needs — avoids importing gtfsDb's concrete
- *  SQLiteDatabase class here (would be a layering inversion: gtfsDb is
- *  lower-level than corridorTagging). Structurally compatible with the real
- *  SQLiteDatabase passed in from gtfsLoader.ts. */
-interface QueryableDb {
-    getAllAsync<T>(sql: string, params?: any[]): Promise<T[]>;
+    return {...widened, widened: true};
 }
 
 export interface SeedPathCorridorResult {
@@ -370,21 +419,29 @@ export async function computeSeedPathCorridor(
     destination: LatLon,
     originStopKeys: string[],
     destStopKeys: string[],
-    candidates: Array<{ stop_id: string; lat: number; lon: number }>,
+    candidates: CorridorCandidate[],
     maxTransfers: number,
     db: QueryableDb,
 ): Promise<SeedPathCorridorResult> {
     const tGraph0 = Date.now();
     const graph = await getCoarseGraph();
     const tGraph1 = Date.now();
-    const { paths, levelFrontiers, treeEdges: bfsTreeEdges } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
+    const {
+        paths,
+        levelFrontiers,
+        treeEdges: bfsTreeEdges
+    } = findSeedPaths(graph, originStopKeys, destStopKeys, maxTransfers);
     const tBfs1 = Date.now();
     console.log(`[corridorTagging] getCoarseGraph: ${tGraph1 - tGraph0}ms, BFS: ${tBfs1 - tGraph1}ms (${paths.length} paths)`);
 
     const walkRadiusStopIds = new Set<string>();
     for (const c of candidates) {
-        if (haversineMeters(origin, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(c.stop_id);
-        if (haversineMeters(destination, { lat: c.lat, lon: c.lon }) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(c.stop_id);
+        const key = makeKey(c.agency, c.stop_id);
+        if (haversineMeters(origin, {lat: c.lat, lon: c.lon}) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(key);
+        if (haversineMeters(destination, {
+            lat: c.lat,
+            lon: c.lon
+        }) <= ORIGIN_DEST_WALK_RADIUS_M) walkRadiusStopIds.add(key);
     }
 
     if (paths.length === 0) {
@@ -397,7 +454,7 @@ export async function computeSeedPathCorridor(
     const corridorBoundaries: CorridorBoundary[] = paths.map(stopKeyPath => {
         const polyline: LatLon[] = stopKeyPath.map(key => {
             const node = graph.nodesByKey.get(key);
-            return node ? { lat: node.stop_lat, lon: node.stop_lon } : { lat: origin.lat, lon: origin.lon };
+            return node ? {lat: node.stop_lat, lon: node.stop_lon} : {lat: origin.lat, lon: origin.lon};
         });
         return boundaryForPath(polyline, MIN_WIDTH_M, TAPER_K_M);
     });
@@ -426,20 +483,15 @@ export async function computeSeedPathCorridor(
     // direction-respecting (only i -> j for i < j in real stop_sequence
     // order), so BFS can no longer construct a wrong-direction jump in the
     // first place — no sweep needed here anymore.
-    const coreStopIds = new Set<string>();
+    const coreStopKeys = new Set<string>();
     for (const path of paths) {
-        for (const stopKey of path) coreStopIds.add(parseKey(stopKey).id);
+        for (const stopKey of path) coreStopKeys.add(stopKey);
     }
 
-    const patternKeys = new Set<string>();
-    if (coreStopIds.size > 0) {
-        const rows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
-            `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
-            [JSON.stringify([...coreStopIds])],
-        );
-        for (const r of rows) patternKeys.add(`${r.agency}:${r.pattern_id}`);
-    }
-    console.log(`[corridorTagging] seed-path-derived patterns: ${patternKeys.size} from ${coreStopIds.size} core stops (${paths.length} paths): ${Date.now() - tBfs1}ms`);
+    const patternKeys = coreStopKeys.size > 0
+        ? await getPatternKeysForStopKeys(db, coreStopKeys)
+        : new Set<string>();
+    console.log(`[corridorTagging] seed-path-derived patterns: ${patternKeys.size} from ${coreStopKeys.size} core stops (${paths.length} paths): ${Date.now() - tBfs1}ms`);
 
     return {
         patternKeys, walkRadiusStopIds, seedPathCount: paths.length,

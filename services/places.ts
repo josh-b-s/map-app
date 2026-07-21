@@ -16,14 +16,14 @@ export interface SearchOptions {
 }
 
 export async function searchPlaces(query: string, opts: SearchOptions): Promise<SearchPlace[]> {
-    const { apiKey, location, signal } = opts;
+    const {apiKey, location, signal} = opts;
     if (!apiKey) throw new Error("Missing API key");
     if (!query.trim()) return [];
 
-    const body: any = { textQuery: query, maxResultCount: 8 };
+    const body: any = {textQuery: query, maxResultCount: 8};
     if (location) {
         body.locationBias = {
-            circle: { center: { latitude: location.latitude, longitude: location.longitude }, radius: 50000 }
+            circle: {center: {latitude: location.latitude, longitude: location.longitude}, radius: 50000}
         };
     }
 

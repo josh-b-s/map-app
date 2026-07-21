@@ -7,7 +7,10 @@
  * removes the drift risk of three copies silently diverging.
  */
 
-export interface LatLon { lat: number; lon: number; }
+export interface LatLon {
+    lat: number;
+    lon: number;
+}
 
 export function haversineMeters(a: LatLon, b: LatLon): number {
     const R = 6_371_000;

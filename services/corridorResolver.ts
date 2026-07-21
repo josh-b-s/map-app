@@ -21,27 +21,37 @@
  * invalidateCorridorCache() below.
  */
 
-import type { LatLng } from './gtfsDb';
-import { makeKey, parseKey } from './gtfsKeyUtil';
-import { haversineMeters } from './geoUtil';
-import { chunkedQuery, placeholders, SQL_CHUNK_SIZE } from './sqlChunkUtil';
-import { computeCorridor, computeSeedPathCorridor, ORIGIN_DEST_WALK_RADIUS_M } from './corridorTagging';
-import type { CorridorBoundary } from './corridorTagging';
-import type { StopInfo } from './gtfsLoader';
-
-/** Minimal DB shape this module needs (same pattern as corridorTagging.ts's
- *  QueryableDb) — avoids a concrete dependency on gtfsDb's SQLiteDatabase
- *  class here. */
-interface QueryableDb {
-    getAllAsync<T>(sql: string, params?: any[]): Promise<T[]>;
-    execAsync(sql: string): Promise<void>;
-    runAsync(sql: string, params?: any[]): Promise<{ lastInsertRowId: number; changes: number }>;
-}
+import type {LatLng} from './gtfsDb';
+import {makeKey} from './gtfsKeyUtil';
+import {haversineMeters} from './geoUtil';
+import {type QueryableDb} from './sqlChunkUtil';
+import type {CorridorBoundary} from './corridorTagging';
+import {computeCorridor, computeSeedPathCorridor, ORIGIN_DEST_WALK_RADIUS_M} from './corridorTagging';
+import type {StopInfo} from './gtfsLoader';
+import {
+    getPatternKeysForStopKeys,
+    getPatternStopsForPatternKeys,
+    getRouteKeysForStopKeys,
+    type RepoPatternStop
+} from './gtfsRepo';
+import {MAX_SEED_STOPS, MAX_TRANSFERS, MIN_ACCEPTABLE_PATTERNS, MIN_SEED_STOPS, SEED_RADIUS_M} from './routingSettings';
 
 export interface ResolvedCorridor {
     patternKeys: Set<string>;
-    /** Unqualified stop_ids — matches gtfsLoader.ts's GtfsIndex.corridorStopIds shape. */
+    /** Agency-qualified stop KEYS (makeKey(agency,stop_id)), not bare
+     *  stop_id — matches gtfsLoader.ts's GtfsIndex.corridorStopIds shape,
+     *  which was tightened the same way (see gtfsRouter.ts's corridor
+     *  filters, updated alongside this). Qualifying by agency here is what
+     *  lets every pattern/stop lookup downstream be an exact match instead
+     *  of "any agency with this id text" — matters more as multiple feeds
+     *  become simultaneously active, not just as a tidiness thing. */
     allowedStopIds: Set<string>;
+    /** Raw pattern_stops rows for patternKeys, already fetched during
+     *  corridor resolution's coverage check — see resolveCorridor's doc
+     *  comment on why. Empty on the bbox-fallback path (which never needs
+     *  pattern_stops for its own purposes); gtfsLoader.ts falls back to
+     *  its own query when this is empty. */
+    patternStopRows: RepoPatternStop[];
     widened: boolean;
     seedPathCount: number;
     debugSeedPaths: string[][];
@@ -50,21 +60,13 @@ export interface ResolvedCorridor {
     debugCorridorBoundary: CorridorBoundary[];
 }
 
-/** How many of the nearest stops (at each end) to seed the corridor BFS
- *  from. Wider than "just the single nearest stop" so the corridor can find
- *  a route that boards from, say, the 3rd-closest stop if that's the one
- *  that's actually on a useful pattern. */
-const NEAREST_FOR_CORRIDOR_SEED = 6;
-
-/** Journey-planning transfer budget. Since coarseGraph.ts now models a BFS
- *  hop as "ride one line," this is a real transfer count, not a stop-count
- *  proxy — see seedRouteBfs.ts. 5 comfortably covers any plausible Melbourne
- *  metro trip (worst case is usually 2-3 transfers) with margin to spare. */
-const MAX_TRANSFERS = 5;
-
-/** Below this many seed-path-derived patterns, treat the result as
- *  suspiciously thin and fall back to the bbox corridor instead. */
-const MIN_ACCEPTABLE_PATTERNS = 3;
+// SEED_RADIUS_M / MIN_SEED_STOPS / MAX_SEED_STOPS / MAX_TRANSFERS /
+// MIN_ACCEPTABLE_PATTERNS now live in routingSettings.ts — see that file's
+// header comment for how these interact with WALK_EDGE_THRESHOLD_M and
+// ORIGIN_DEST_WALK_RADIUS_M in the other routing files. All are still
+// plain constants; centralizing them here is prep for a future
+// user-facing walk-distance/wait-time settings screen, not a settings
+// screen itself.
 
 // ── Cache ───────────────────────────────────────────────────────────────────
 // Keyed on rounded origin/destination coords (~11m precision — absorbs GPS
@@ -73,6 +75,16 @@ const MIN_ACCEPTABLE_PATTERNS = 3;
 // grow this unboundedly; a simple insertion-order eviction (Map preserves
 // insertion order) is enough here — this is a small speed cache, not a
 // correctness-critical store.
+//
+// NOTE ON SIZE: each cached ResolvedCorridor now also carries
+// patternStopRows (thousands of small objects on a typical trip — see its
+// doc comment for why). That's a deliberate memory-for-avoided-round-trip
+// trade, made once per unique (origin,destination) rather than on every
+// search against it (a cache hit skips corridor resolution — and this data
+// — entirely; only a COLD corridor resolution pays to fetch and store it).
+// 30 entries of a few thousand small objects each is still a modest
+// absolute footprint, but worth knowing about if this cache's cap or
+// lifetime ever changes.
 const MAX_CACHE_ENTRIES = 30;
 const corridorCache = new Map<string, ResolvedCorridor>();
 
@@ -93,12 +105,86 @@ export function invalidateCorridorCache(): void {
     corridorCache.clear();
 }
 
-function nearestForSeed(allStops: StopInfo[], center: LatLng, limit: number): string[] {
-    return allStops
-        .map(s => ({ s, d: haversineMeters({ lat: center.latitude, lon: center.longitude }, { lat: s.stop_lat, lon: s.stop_lon }) }))
-        .sort((a, b) => a.d - b.d)
-        .slice(0, limit)
-        .map(x => makeKey(x.s.agency, x.s.stop_id));
+/**
+ * Selects BFS seed stops within SEED_RADIUS_M of `center`, but skips a stop
+ * if every route serving it is already covered by a closer seed already
+ * picked — so the fixed-ish seed budget goes toward genuinely DIFFERENT
+ * lines instead of being consumed by, say, both directional poles of the
+ * same tram route at one intersection. Falls back to the MIN_SEED_STOPS
+ * nearest stops (dedup still applied) if the radius alone doesn't reach
+ * that floor.
+ */
+async function nearestForSeed(
+    allStops: StopInfo[],
+    center: LatLng,
+    db: QueryableDb,
+    debugLabel?: string,
+): Promise<string[]> {
+    const ranked = allStops
+        .map(s => ({
+            s,
+            d: haversineMeters({lat: center.latitude, lon: center.longitude}, {lat: s.stop_lat, lon: s.stop_lon})
+        }))
+        .sort((a, b) => a.d - b.d);
+
+    let withinRadius = ranked.filter(x => x.d <= SEED_RADIUS_M);
+    if (withinRadius.length < MIN_SEED_STOPS) withinRadius = ranked.slice(0, MIN_SEED_STOPS);
+
+    // Cap the RAW candidate list (pre-dedup) so a pathologically dense area
+    // can't blow up the route-lookup query below — generous relative to
+    // MAX_SEED_STOPS since dedup only ever shrinks from here.
+    const rawCandidates = withinRadius.slice(0, MAX_SEED_STOPS * 3);
+    const candidateKeys = rawCandidates.map(x => makeKey(x.s.agency, x.s.stop_id));
+
+    const routesByStopKey = await getRouteKeysForStopKeys(db, candidateKeys);
+
+    const coveredRoutes = new Set<string>();
+    const selected: typeof rawCandidates = [];
+    for (const c of rawCandidates) {
+        if (selected.length >= MAX_SEED_STOPS) break;
+        const key = makeKey(c.s.agency, c.s.stop_id);
+        const routes = routesByStopKey.get(key);
+        // No route data at all (shouldn't normally happen for a real stop) —
+        // err toward including it rather than silently dropping a stop we
+        // can't evaluate.
+        if (!routes || routes.size === 0) {
+            selected.push(c);
+            continue;
+        }
+        let addsNewRoute = false;
+        for (const r of routes) {
+            if (!coveredRoutes.has(r)) {
+                addsNewRoute = true;
+                break;
+            }
+        }
+        if (!addsNewRoute) continue; // every route here already has a closer seed — skip, free the slot
+        for (const r of routes) coveredRoutes.add(r);
+        selected.push(c);
+    }
+    // Floor guarantee applies AFTER dedup too — if aggressive deduping ever
+    // left us under MIN_SEED_STOPS (only plausible with very sparse/odd
+    // route data), top back up from the closest remaining candidates rather
+    // than under-seed BFS.
+    if (selected.length < MIN_SEED_STOPS) {
+        const selectedKeys = new Set(selected.map(c => makeKey(c.s.agency, c.s.stop_id)));
+        for (const c of rawCandidates) {
+            if (selected.length >= MIN_SEED_STOPS) break;
+            const key = makeKey(c.s.agency, c.s.stop_id);
+            if (!selectedKeys.has(key)) {
+                selected.push(c);
+                selectedKeys.add(key);
+            }
+        }
+    }
+
+    if (debugLabel) {
+        console.log(`[corridorResolver] seed stops for ${debugLabel} (${selected.length} kept, ` +
+            `${rawCandidates.length} within radius, ${coveredRoutes.size} distinct routes): ` +
+            selected.map(x => `"${x.s.stop_name}" (${Math.round(x.d)}m)`).join(', '));
+    }
+
+    return selected.map(x => makeKey(x.s.agency, x.s.stop_id));
 }
 
 /**
@@ -124,12 +210,19 @@ export async function resolveCorridor(
         return cached;
     }
 
-    const candidateAll = allStops.map(s => ({ stop_id: s.stop_id, lat: s.stop_lat, lon: s.stop_lon, agency: s.agency }));
-    const originSeedKeys = nearestForSeed(allStops, origin, NEAREST_FOR_CORRIDOR_SEED);
-    const destSeedKeys = nearestForSeed(allStops, destination, NEAREST_FOR_CORRIDOR_SEED);
+    const candidateAll = allStops.map(s => ({stop_id: s.stop_id, lat: s.stop_lat, lon: s.stop_lon, agency: s.agency}));
+    // NOTE: origin/destination seed selection are logically independent and
+    // tempting to Promise.all — deliberately NOT done here. gtfsDb.ts's own
+    // doc comment documents a strict "exactly one shared connection used
+    // serially" invariant for this op-sqlite wrapper; firing concurrent
+    // queries against that one connection isn't confirmed safe (op-sqlite's
+    // docs don't commit to internally queuing concurrent execute() calls),
+    // so this stays sequential until that's verified.
+    const originSeedKeys = await nearestForSeed(allStops, origin, db, 'origin');
+    const destSeedKeys = await nearestForSeed(allStops, destination, db, 'destination');
 
-    const originLatLon = { lat: origin.latitude, lon: origin.longitude };
-    const destLatLon = { lat: destination.latitude, lon: destination.longitude };
+    const originLatLon = {lat: origin.latitude, lon: origin.longitude};
+    const destLatLon = {lat: destination.latitude, lon: destination.longitude};
 
     // ── Normal path: derive candidate patterns DIRECTLY from BFS seed paths ──
     // Previously this ran an expensive bbox-tag-every-candidate-stop pass
@@ -153,17 +246,18 @@ export async function resolveCorridor(
     // Which stops the kept patterns actually visit — computed up front (not
     // just inside the accept branch) because we need it BOTH to build
     // allowedStopIds AND to check the origin/destination coverage below.
-    let patternDerivedStopIds = new Set<string>();
+    // Fetched as raw rows (not just the derived stop-key Set) because
+    // gtfsLoader.ts needs this SAME pattern_stops data again later, scoped
+    // to whichever of these patterns actually run today — which is always
+    // a SUBSET of seedCorridor.patternKeys. Threading the rows through
+    // ResolvedCorridor.patternStopRows lets gtfsLoader.ts filter this
+    // already-fetched set instead of re-querying pattern_stops for
+    // overlapping patterns a second time (see gtfsLoader.ts's step 6).
+    let patternStopRows: RepoPatternStop[] = [];
     if (seedCorridor.patternKeys.size > 0) {
-        const patternIdList = [...seedCorridor.patternKeys].map(k => parseKey(k).id);
-        const patternStopIdRows = await chunkedQuery(patternIdList, SQL_CHUNK_SIZE, chunk =>
-            db.getAllAsync<{ stop_id: string }>(
-                `SELECT DISTINCT stop_id FROM pattern_stops WHERE pattern_id IN (${placeholders(chunk.length)})`,
-                chunk,
-            ),
-        );
-        patternDerivedStopIds = new Set(patternStopIdRows.map(r => r.stop_id));
+        patternStopRows = await getPatternStopsForPatternKeys(db, seedCorridor.patternKeys);
     }
+    const patternDerivedStopIds = new Set(patternStopRows.map(r => r.stopKey));
 
     // Coverage check: "enough patterns" alone isn't sufficient — the
     // Mornington -> Clayton case had 66 patterns yet RAPTOR stalled just
@@ -172,11 +266,11 @@ export async function resolveCorridor(
     // around the origin/middle of the trip and leave the destination end
     // essentially unreachable by any of them — pattern COUNT doesn't catch
     // that, only checking whether the kept patterns actually touch a stop
-    // near each endpoint does.
-    const originStopIdsPlain = new Set(originSeedKeys.map(k => parseKey(k).id));
-    const destStopIdsPlain = new Set(destSeedKeys.map(k => parseKey(k).id));
-    const originCovered = [...originStopIdsPlain].some(id => patternDerivedStopIds.has(id));
-    const destCovered = [...destStopIdsPlain].some(id => patternDerivedStopIds.has(id));
+    // near each endpoint does. originSeedKeys/destSeedKeys are already
+    // agency-qualified (see nearestForSeed), so this compares directly —
+    // no more stripping down to bare ids first.
+    const originCovered = originSeedKeys.some(k => patternDerivedStopIds.has(k));
+    const destCovered = destSeedKeys.some(k => patternDerivedStopIds.has(k));
 
     if (seedCorridor.patternKeys.size >= MIN_ACCEPTABLE_PATTERNS && originCovered && destCovered) {
         t = lap(
@@ -195,16 +289,19 @@ export async function resolveCorridor(
         //     where neither stop shares a pattern with the other, by
         //     definition — source 1 alone would silently drop that transfer
         //     stop if it isn't also on one of the kept patterns' footprints).
+        // All three sources are already agency-qualified keys now, so this
+        // is a plain union — no more stripping to bare stop_id.
         const allowedStopIds = new Set(patternDerivedStopIds);
         for (const s of seedCorridor.walkRadiusStopIds) allowedStopIds.add(s);
         for (const path of seedCorridor.seedPaths) {
-            for (const stopKey of path) allowedStopIds.add(parseKey(stopKey).id);
+            for (const stopKey of path) allowedStopIds.add(stopKey);
         }
         t = lap(`corridor stops derived from kept patterns + walk radius + seed path stops (${allowedStopIds.size} stops)`, t);
 
         result = {
             patternKeys: seedCorridor.patternKeys,
             allowedStopIds,
+            patternStopRows,
             widened: false,
             seedPathCount: seedCorridor.seedPathCount,
             debugSeedPaths: seedCorridor.seedPaths,
@@ -229,7 +326,7 @@ export async function resolveCorridor(
             allowedStopIds = corridor.stopIds;
         } else {
             console.log('[corridorResolver] corridor came back empty even after widening — falling back to full network');
-            allowedStopIds = new Set(allStops.map(s => s.stop_id));
+            allowedStopIds = new Set(allStops.map(s => makeKey(s.agency, s.stop_id)));
         }
         t = lap(
             `corridor filter, bbox fallback (${allowedStopIds.size}/${allStops.length} stops kept, ` +
@@ -237,16 +334,13 @@ export async function resolveCorridor(
             t,
         );
 
-        const candidatePatternRows = await db.getAllAsync<{ pattern_id: string; agency: number }>(
-            `SELECT DISTINCT pattern_id, agency FROM pattern_stops WHERE stop_id IN (SELECT value FROM json_each(?))`,
-            [JSON.stringify([...allowedStopIds])],
-        );
-        const patternKeys = new Set<string>(candidatePatternRows.map(r => makeKey(r.agency, r.pattern_id)));
+        const patternKeys = await getPatternKeysForStopKeys(db, allowedStopIds);
         t = lap(`candidate patterns discovery, bbox fallback (${patternKeys.size} patterns)`, t);
 
         result = {
             patternKeys,
             allowedStopIds,
+            patternStopRows: [],
             widened: corridor.widened,
             seedPathCount: corridor.seedPathCount,
             debugSeedPaths: corridor.seedPaths,
@@ -265,4 +359,4 @@ export async function resolveCorridor(
     return result;
 }
 
-export { ORIGIN_DEST_WALK_RADIUS_M };
+export {ORIGIN_DEST_WALK_RADIUS_M};

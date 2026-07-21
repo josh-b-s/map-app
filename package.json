@@ -7,11 +7,16 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "preprocess-gtfs": "ts-node --project tsconfig.scripts.json scripts/preprocess-gtfs.ts"
+    "preprocess-gtfs": "ts-node --project tsconfig.scripts.json scripts/preprocess-gtfs.ts",
+    "postinstall": "patch-package",
+    "prebuild": "npx expo prebuild",
+    "build:rust": "cd modules/gtfs-importer/rust && npx ubrn build android --and-generate",
+    "rebuild:android": "npm run build:rust && npx expo run:android"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
     "@gorhom/bottom-sheet": "^5.2.8",
+    "@mapapp/gtfs-importer": "file:modules/gtfs-importer",
     "@mapbox/polyline": "^1.2.1",
     "@op-engineering/op-sqlite": "^17.1.2",
     "@react-navigation/native": "^7.1.8",
@@ -34,11 +39,13 @@
     "react-native": "0.81.5",
     "react-native-gesture-handler": "^2.29.1",
     "react-native-maps": "1.20.1",
+    "react-native-quick-base64": "^3.0.1",
     "react-native-reanimated": "~4.1.1",
     "react-native-safe-area-context": "~5.6.0",
     "react-native-screens": "~4.16.0",
     "react-native-web": "~0.21.0",
     "react-native-worklets": "0.5.1",
+    "react-native-zip-archive": "^9.0.0",
     "react-redux": "^9.2.0",
     "tailwindcss": "^3.4.19"
   },
@@ -50,9 +57,11 @@
     "@types/react-native": "^0.72.8",
     "adm-zip": "^0.5.17",
     "better-sqlite3": "^12.9.0",
+    "patch-package": "^8.0.1",
     "react-test-renderer": "19.1.0",
     "ts-node": "^10.9.2",
-    "typescript": "~5.9.2"
+    "typescript": "~5.9.2",
+    "uniffi-bindgen-react-native": "^0.31.0-3"
   },
   "private": true
 }

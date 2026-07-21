@@ -1,0 +1,24 @@
+# ── Rust ──────────────────────────────────────────────
+rust/target/
+rust/src/generated/
+
+# ── UniFFI / ubrn generated bindings (C++, TS glue) ─────
+cpp/generated/
+src/generated/
+
+# ── Android build output ────────────────────────────────
+android/build/
+android/.cxx/
+android/src/main/jniLibs/**/*.a
+android/src/main/jniLibs/**/*.so
+
+# ── iOS build output (if Xcode ever builds in-place here) ─
+ios/build/
+ios/DerivedData/
+
+# ── Node ──────────────────────────────────────────────
+node_modules/
+
+# ── misc ──────────────────────────────────────────────
+*.log
+.DS_Store

@@ -5,11 +5,21 @@ import { setDebugData } from './debug.slice';
 
 export const computeRoute = createAsyncThunk<
     GtfsRouteResult,
-    { origin: LatLng; destination: LatLng; debugMode?: boolean },
+    {
+        origin: LatLng;
+        destination: LatLng;
+        debugMode?: boolean;
+        /** Undefined -> computeGtfsRoute's own default (`new Date()` at call
+         *  time, i.e. "leave now"). Passed through as-is, not defaulted here,
+         *  so "now" is always the actual moment of search. */
+        departureTime?: Date;
+        /** Undefined -> computeGtfsRoute's own default (WALK_SPEED_MPS.NORMAL). */
+        walkingSpeedMps?: number;
+    },
     { rejectValue: string }
->('route/compute', async ({ origin, destination, debugMode = false }, { rejectWithValue, dispatch }) => {
+>('route/compute', async ({ origin, destination, debugMode = false, departureTime, walkingSpeedMps }, { rejectWithValue, dispatch }) => {
     try {
-        const result = await computeGtfsRoute(origin, destination, undefined, undefined, debugMode);
+        const result = await computeGtfsRoute(origin, destination, departureTime, walkingSpeedMps, debugMode);
         // Dispatched here (inside the thunk) rather than via route.slice's own
         // extraReducers, since debug data belongs in debug.slice, not route
         // state — this keeps "what journey is displayed" and "what did the

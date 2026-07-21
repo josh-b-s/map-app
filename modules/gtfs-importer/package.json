@@ -1,0 +1,35 @@
+{
+  "name": "@mapapp/gtfs-importer",
+  "version": "0.0.0",
+  "description": "gtfs importer",
+  "main": "src/index",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourname/map-app"
+  },
+  "codegenConfig": {
+    "name": "GtfsImporterSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.mapapp.gtfsimporter"
+    }
+  },
+  "author": " <> ()",
+  "license": "UNLICENSED",
+  "homepage": "#readme",
+  "create-react-native-library": {
+    "type": "turbo-module",
+    "languages": "kotlin-objc",
+    "tools": [
+      "eslint",
+      "jest",
+      "lefthook",
+      "release-it"
+    ],
+    "version": "0.63.0"
+  },
+  "dependencies": {
+    "@ubjs/core": "^0.31.0-3"
+  }
+}

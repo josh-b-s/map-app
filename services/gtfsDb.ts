@@ -1,12 +1,12 @@
-import { open, type DB as OPSQLiteDB, type Transaction as OPSQLiteTx } from '@op-engineering/op-sqlite';
+import {type DB as OPSQLiteDB, open, type Transaction as OPSQLiteTx} from '@op-engineering/op-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'gtfs.db';
-const DB_DIR  = `${FileSystem.documentDirectory}SQLite/`;
+const DB_DIR = `${FileSystem.documentDirectory}SQLite/`;
 const DB_PATH = `${DB_DIR}${DB_NAME}`;
 
 export async function isDbReady(): Promise<boolean> {
-    const { exists } = await FileSystem.getInfoAsync(DB_PATH);
+    const {exists} = await FileSystem.getInfoAsync(DB_PATH);
     return exists;
 }
 
@@ -47,12 +47,8 @@ export class SQLiteDatabase {
         this.raw = raw;
     }
 
-    private target(): OPSQLiteDB | OPSQLiteTx {
-        return this.currentTx ?? this.raw;
-    }
-
     async getAllAsync<T>(sql: string, params: any[] = []): Promise<T[]> {
-        const { rows } = await this.target().execute(sql, params);
+        const {rows} = await this.target().execute(sql, params);
         return (rows ?? []) as unknown as T[];
     }
 
@@ -65,7 +61,7 @@ export class SQLiteDatabase {
 
     async runAsync(sql: string, params: any[] = []): Promise<{ lastInsertRowId: number; changes: number }> {
         const res = await this.target().execute(sql, params);
-        return { lastInsertRowId: res.insertId ?? 0, changes: res.rowsAffected ?? 0 };
+        return {lastInsertRowId: res.insertId ?? 0, changes: res.rowsAffected ?? 0};
     }
 
     async withTransactionAsync(fn: () => Promise<void>): Promise<void> {
@@ -77,6 +73,10 @@ export class SQLiteDatabase {
                 this.currentTx = null;
             }
         });
+    }
+
+    private target(): OPSQLiteDB | OPSQLiteTx {
+        return this.currentTx ?? this.raw;
     }
 }
 
@@ -90,6 +90,38 @@ export async function getDb(): Promise<SQLiteDatabase> {
         throw new Error('GTFS database not found. Download it first.');
     }
 
+    return openAndCache();
+}
+
+/**
+ * Dev/debug-only counterpart to getDb() — creates the SQLite/ folder and
+ * an empty gtfs.db file if neither exists yet, then opens it, instead of
+ * throwing. Exists specifically for DebugControls.tsx's import/benchmark
+ * tools: those need to run on a fresh device BEFORE the normal
+ * download-a-prebuilt-db flow has ever happened (that's the whole point of
+ * on-device building), so they can't go through getDb()'s "must already be
+ * downloaded" check the rest of the app relies on.
+ *
+ * Deliberately NOT used by any normal app code path — a real user's app
+ * should still fail loudly via getDb() if its expected db is missing,
+ * rather than silently opening an empty one that then produces confusing
+ * "no routes found" behavior instead of a clear "please download" error.
+ */
+export async function getOrCreateDbForImport(): Promise<SQLiteDatabase> {
+    if (_db) return _db;
+
+    const ready = await isDbReady();
+    if (!ready) {
+        await FileSystem.makeDirectoryAsync(DB_DIR, {intermediates: true}).catch(() => {});
+        // Opening a non-existent file with op-sqlite creates it — no
+        // explicit "create empty file" step needed beyond ensuring the
+        // parent directory exists first.
+    }
+
+    return openAndCache();
+}
+
+async function openAndCache(): Promise<SQLiteDatabase> {
     // op-sqlite's `location` option: verify this against op-sqlite's docs
     // for your installed version before relying on it — the docs snippet
     // available at migration time showed `location` used for attach() with
@@ -98,7 +130,7 @@ export async function getDb(): Promise<SQLiteDatabase> {
     // like the one this app already uses via expo-file-system. If this
     // doesn't resolve to DB_PATH as expected, check op-sqlite's "Gotchas"
     // page for the current location/path resolution behavior.
-    const raw = open({ name: DB_NAME, location: DB_DIR });
+    const raw = open({name: DB_NAME, location: DB_DIR});
 
     const db = new SQLiteDatabase(raw);
 
@@ -120,57 +152,12 @@ export function resetDb() {
     _db = null;  // call this after a fresh DB is copied in
 }
 
+// LatLng type kept here (used by this file's own DB-facing signatures);
+// Places/Google API code (SearchPlace, SearchOptions, searchPlaces,
+// TravelMode) lives ONLY in places.ts now — this was previously a
+// byte-for-byte copy-paste of that module, which is exactly the kind of
+// drift risk geoUtil.ts's own header comment warns about for haversineMeters.
+// gtfsDb.ts should own DB connection concerns only, per its module doc above.
 export type LatLng = { latitude: number; longitude: number };
-export type TravelMode = "DRIVE" | "TRANSIT" | "WALK" | "BICYCLE";
-
-export interface SearchPlace {
-    place_id:  string;
-    name:      string;
-    address:   string;
-    latitude:  number;
-    longitude: number;
-}
-
-export interface SearchOptions {
-    apiKey:    string;
-    location?: LatLng;
-    signal?:   AbortSignal;
-}
-
-export async function searchPlaces(query: string, opts: SearchOptions): Promise<SearchPlace[]> {
-    const { apiKey, location, signal } = opts;
-    if (!apiKey) throw new Error("Missing API key");
-    if (!query.trim()) return [];
-
-    const body: any = { textQuery: query, maxResultCount: 8 };
-    if (location) {
-        body.locationBias = {
-            circle: {
-                center: { latitude: location.latitude, longitude: location.longitude },
-                radius: 50000,
-            },
-        };
-    }
-
-    const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
-        method: "POST",
-        headers: {
-            "Content-Type":    "application/json",
-            "X-Goog-Api-Key":  apiKey,
-            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location",
-        },
-        body:   JSON.stringify(body),
-        signal,
-    });
-
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-    const data = await resp.json();
-    return (data.places ?? []).map((p: any) => ({
-        place_id:  p.id,
-        name:      p.displayName?.text    ?? "Unknown",
-        address:   p.formattedAddress     ?? "",
-        latitude:  p.location?.latitude   ?? 0,
-        longitude: p.location?.longitude  ?? 0,
-    }));
-}
+export type {TravelMode, SearchPlace, SearchOptions} from './places';
+export {searchPlaces} from './places';

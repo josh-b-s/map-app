@@ -28,8 +28,8 @@
 // now this app's own compatibility wrapper, not expo-sqlite's type — it
 // preserves the same getAllAsync/execAsync/runAsync/withTransactionAsync
 // method shapes, so nothing else in this file needed to change.
-import type { SQLiteDatabase } from './gtfsDb';
-import type { CoarseEdge } from './coarseGraph';
+import type {SQLiteDatabase} from './gtfsDb';
+import type {CoarseEdge} from './coarseGraph';
 
 const EDGE_SEP = '\x1f';       // unit separator — won't collide with real stop_ids
 const KIND_TRANSIT = 't';
@@ -52,9 +52,9 @@ export interface GraphSignature {
 }
 
 export async function computeGraphSignature(db: SQLiteDatabase): Promise<GraphSignature> {
-    const [{ c: stopCount }] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM stops`);
-    const [{ c: patternStopCount }] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM pattern_stops`);
-    return { stopCount, patternStopCount };
+    const [{c: stopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM stops`);
+    const [{c: patternStopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM pattern_stops`);
+    return {stopCount, patternStopCount};
 }
 
 function signatureKey(sig: GraphSignature): string {
@@ -93,7 +93,7 @@ function decodeEdges(packed: string): CoarseEdge[] {
         const kindChar = core[core.length - 1];
         const to = core.slice(0, -1); // always our appended marker char, never part of the key
         const kind: CoarseEdge['kind'] = kindChar === KIND_TRANSIT ? 'transit' : 'walk';
-        return { to, kind, cost: kind === 'transit' ? 1 : 0.5, viaPatternKey: viaPatternKey || undefined };
+        return {to, kind, cost: kind === 'transit' ? 1 : 0.5, viaPatternKey: viaPatternKey || undefined};
     });
 }
 
@@ -136,7 +136,7 @@ export async function savePersistedGraph(
 ): Promise<void> {
     await ensureTables(db);
 
-    const rows = [...adjacency.entries()].map(([stopKey, edges]) => ({ stopKey, packed: encodeEdges(edges) }));
+    const rows = [...adjacency.entries()].map(([stopKey, edges]) => ({stopKey, packed: encodeEdges(edges)}));
 
     await db.withTransactionAsync(async () => {
         await db.execAsync(`DELETE FROM coarse_graph_adjacency; DELETE FROM coarse_graph_meta;`);

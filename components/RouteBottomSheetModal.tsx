@@ -55,8 +55,9 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                 handleIndicatorStyle={{ backgroundColor: theme.color }}
                 style={[SHADOW, { borderTopLeftRadius: 40, borderTopRightRadius: 40 }]}
                 topInset={TOP_SAFE(useSafeAreaInsets())}
-                snapPoints={['40%', '100%']}
+                snapPoints={['10%', '40%', '100%']}
                 enableOverDrag={false}
+                enablePanDownToClose={false}
             >
                 <BottomSheetView style={{ flex: 1, paddingTop: 16 }}>
                     {error ? (

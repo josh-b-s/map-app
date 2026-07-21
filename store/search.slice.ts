@@ -26,7 +26,17 @@ type State = {
     loading: boolean;
     error?: string | null;
     showResults: boolean;
+    /** Epoch ms for the planned departure. null = "leave now" — computeRoute
+     *  passes `undefined` through to computeGtfsRoute in that case, which
+     *  falls back to `new Date()` at call time, so "now" always reflects
+     *  the actual moment of search rather than whenever this was picked. */
+    departureTime: number | null;
+    /** Meters/sec. Mirrors WALK_SPEED_MPS.NORMAL from gtfsRouter.ts as the
+     *  default so an untouched picker matches computeGtfsRoute's own default. */
+    walkingSpeedMps: number;
 };
+
+const DEFAULT_WALKING_SPEED_MPS = 1.4; // WALK_SPEED_MPS.NORMAL
 
 const initialState: State = {
     query: '',
@@ -35,6 +45,8 @@ const initialState: State = {
     loading: false,
     error: null,
     showResults: false,
+    departureTime: null,
+    walkingSpeedMps: DEFAULT_WALKING_SPEED_MPS,
 };
 
 const slice = createSlice({
@@ -51,6 +63,12 @@ const slice = createSlice({
         clearResults(state) {
             state.results = [];
             state.showResults = false;
+        },
+        setDepartureTime(state, action: PayloadAction<number | null>) {
+            state.departureTime = action.payload;
+        },
+        setWalkingSpeed(state, action: PayloadAction<number>) {
+            state.walkingSpeedMps = action.payload;
         },
     },
     extraReducers: (builder) => {
@@ -70,5 +88,5 @@ const slice = createSlice({
     },
 });
 
-export const { setQuery, selectPlace, clearResults } = slice.actions;
+export const { setQuery, selectPlace, clearResults, setDepartureTime, setWalkingSpeed } = slice.actions;
 export default slice.reducer;

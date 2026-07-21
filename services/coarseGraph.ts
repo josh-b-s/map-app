@@ -18,10 +18,12 @@
  * schedule concern, this is a topology concern, per the spec.
  */
 
-import { getDb } from './gtfsDb';
-import { makeKey, parseKey } from './gtfsKeyUtil';
-import { computeGraphSignature, loadPersistedGraph, savePersistedGraph } from './coarseGraphStore';
-import { haversineMeters } from './geoUtil';
+import {getDb} from './gtfsDb';
+import {makeKey} from './gtfsKeyUtil';
+import {computeGraphSignature, loadPersistedGraph, savePersistedGraph} from './coarseGraphStore';
+import {haversineMeters} from './geoUtil';
+import {getAllPatternStopsOrdered, getAllStopsCached, type RepoPatternStop} from './gtfsRepo';
+import {WALK_EDGE_THRESHOLD_M} from './routingSettings';
 
 export interface CoarseNode {
     stop_id: string;
@@ -53,15 +55,19 @@ export interface CoarseGraph {
     builtAt: number;
 }
 
-// Walking-edge threshold — stops closer than this are considered directly
-// walkable for corridor-finding purposes only (separate from the router's
-// actual transfer-walk radius).
-const WALK_EDGE_THRESHOLD_M = 450;
+// Walking-edge threshold now lives in routingSettings.ts (imported above) —
+// stops closer than this are considered directly walkable for
+// corridor-finding purposes only (separate from the router's actual
+// transfer-walk radius, MAX_TRANSFER_WALK_SEC, also in routingSettings.ts).
 
 // Grid bucket size for walking-edge dedup. Must be >= WALK_EDGE_THRESHOLD_M
 // so a stop only ever needs to check its own cell + 8 neighbors, never a
 // wider ring. This is what keeps walking-edge construction from being O(n^2)
-// across ~30K stops.
+// across ~30K stops. NOTE: this is hardcoded for Melbourne's latitude and
+// NOT wired to WALK_EDGE_THRESHOLD_M — if that ever becomes a user-facing
+// setting, this needs to scale (or get recomputed) alongside it, or a
+// larger user-chosen threshold could silently exceed this cell size and
+// break the "only check 8 neighbors" invariant.
 const GRID_CELL_DEG = 0.006; // ~650m at Melbourne's latitude, comfortably > threshold
 
 let cache: CoarseGraph | null = null;
@@ -98,7 +104,7 @@ export function invalidateCoarseGraphCache(): void {
  */
 function buildAdjacencyFromScratch(
     stopRows: CoarseNode[],
-    psRows: Array<{ pattern_id: string; agency: number; stop_id: string; stop_sequence: number }>,
+    psRows: RepoPatternStop[],
 ): Map<string, CoarseEdge[]> {
     const adjacency = new Map<string, CoarseEdge[]>();
 
@@ -112,7 +118,10 @@ function buildAdjacencyFromScratch(
     function addEdge(from: string, edge: CoarseEdge) {
         if (from === edge.to) return; // never a self-loop (loop routes can revisit a stop_id)
         let keys = edgeKeySets.get(from);
-        if (!keys) { keys = new Set(); edgeKeySets.set(from, keys); }
+        if (!keys) {
+            keys = new Set();
+            edgeKeySets.set(from, keys);
+        }
         const dedupKey = `${edge.kind}:${edge.to}`;
         if (keys.has(dedupKey)) return;
         keys.add(dedupKey);
@@ -172,7 +181,12 @@ function buildAdjacencyFromScratch(
         if (n <= FULL_CLIQUE_MAX_STOPS) {
             for (let i = 0; i < n; i++) {
                 for (let j = i + 1; j < n; j++) {
-                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
+                    addEdge(patternStopKeys[i], {
+                        to: patternStopKeys[j],
+                        cost: 1,
+                        kind: 'transit',
+                        viaPatternKey: patternKey ?? undefined
+                    });
                 }
             }
         } else {
@@ -183,21 +197,24 @@ function buildAdjacencyFromScratch(
             for (let i = 0; i < n; i++) {
                 for (const j of samples) {
                     if (j <= i) continue; // direction-respecting — see note above
-                    addEdge(patternStopKeys[i], { to: patternStopKeys[j], cost: 1, kind: 'transit', viaPatternKey: patternKey ?? undefined });
+                    addEdge(patternStopKeys[i], {
+                        to: patternStopKeys[j],
+                        cost: 1,
+                        kind: 'transit',
+                        viaPatternKey: patternKey ?? undefined
+                    });
                 }
             }
         }
     };
 
     for (const row of psRows) {
-        const rowPatternKey = makeKey(row.agency, row.pattern_id);
-        const stopKey = makeKey(row.agency, row.stop_id);
-        if (rowPatternKey !== patternKey) {
+        if (row.patternKey !== patternKey) {
             flushPattern();
-            patternKey = rowPatternKey;
+            patternKey = row.patternKey;
             patternStopKeys = [];
         }
-        patternStopKeys.push(stopKey);
+        patternStopKeys.push(row.stopKey);
     }
     flushPattern(); // last pattern in the sorted rows
 
@@ -223,10 +240,13 @@ function buildAdjacencyFromScratch(
                     const oKey = makeKey(other.agency, other.stop_id);
                     // Only compute the pair once (canonical ordering by key string).
                     if (oKey <= sKey) continue;
-                    const d = haversineMeters({ lat: s.stop_lat, lon: s.stop_lon }, { lat: other.stop_lat, lon: other.stop_lon });
+                    const d = haversineMeters({lat: s.stop_lat, lon: s.stop_lon}, {
+                        lat: other.stop_lat,
+                        lon: other.stop_lon
+                    });
                     if (d <= WALK_EDGE_THRESHOLD_M) {
-                        addEdge(sKey, { to: oKey, cost: 0.5, kind: 'walk' });
-                        addEdge(oKey, { to: sKey, cost: 0.5, kind: 'walk' });
+                        addEdge(sKey, {to: oKey, cost: 0.5, kind: 'walk'});
+                        addEdge(oKey, {to: sKey, cost: 0.5, kind: 'walk'});
                     }
                 }
             }
@@ -245,11 +265,14 @@ export async function getCoarseGraph(): Promise<CoarseGraph> {
         const db = await getDb();
 
         // ── Nodes ────────────────────────────────────────────────────────────
-        // Always rebuilt fresh from `stops` — cheap (~1s for ~30K rows) and
-        // there's no reason to persist these separately from the source table.
-        const stopRows = await db.getAllAsync<CoarseNode>(
-            `SELECT stop_id, stop_lat, stop_lon, agency FROM stops`,
-        );
+        // Shares gtfsRepo's stops cache (same one gtfsLoader.ts's
+        // getAllStopsCached uses) rather than running its own copy of this
+        // query — was previously a second, independent, un-cached-against-
+        // the-other `SELECT ... FROM stops`, AND (separately) was reading
+        // stop_lat/stop_lon as raw values when preprocess-gtfs.ts actually
+        // packs them as integers*COORD_SCALE — see gtfsRepo.ts's
+        // getAllStopsCached doc comment.
+        const stopRows: CoarseNode[] = await getAllStopsCached(db);
         const nodesByKey = new Map<string, CoarseNode>();
         for (const s of stopRows) nodesByKey.set(makeKey(s.agency, s.stop_id), s);
 
@@ -260,22 +283,20 @@ export async function getCoarseGraph(): Promise<CoarseGraph> {
             console.log(`[coarseGraph] loaded from persisted store in ${Date.now() - t0}ms: ` +
                 `${nodesByKey.size} nodes, ${[...persisted.values()].reduce((a, l) => a + l.length, 0)} directed edges`);
             logHeapUsage('loading persisted graph');
-            cache = { nodesByKey, adjacency: persisted, builtAt: Date.now() };
+            cache = {nodesByKey, adjacency: persisted, builtAt: Date.now()};
             return cache;
         }
 
         // ── No valid persisted graph (first run, or feed changed) — build fresh ──
         console.log('[coarseGraph] no valid persisted graph for this feed — building fresh');
-        const psRows = await db.getAllAsync<{ pattern_id: string; agency: number; stop_id: string; stop_sequence: number }>(
-            `SELECT pattern_id, agency, stop_id, stop_sequence FROM pattern_stops ORDER BY agency, pattern_id, stop_sequence`,
-        );
+        const psRows = await getAllPatternStopsOrdered(db);
         const adjacency = buildAdjacencyFromScratch(stopRows, psRows);
 
         console.log(`[coarseGraph] built in ${Date.now() - t0}ms: ${nodesByKey.size} nodes, ` +
             `${[...adjacency.values()].reduce((a, l) => a + l.length, 0)} directed edges`);
         logHeapUsage('fresh build');
 
-        cache = { nodesByKey, adjacency, builtAt: Date.now() };
+        cache = {nodesByKey, adjacency, builtAt: Date.now()};
 
         // Persist for next cold start. Deliberately not awaited before
         // returning — the in-memory graph is already usable, no reason to
