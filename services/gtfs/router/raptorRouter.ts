@@ -1,5 +1,5 @@
 /**
- * gtfsRouter.ts — In-memory McRAPTOR (multi-criteria RAPTOR) transit router.
+ * raptorRouter.ts — In-memory McRAPTOR (multi-criteria RAPTOR) transit router.
  *
  * Two changes from the previous version:
  *
@@ -23,12 +23,12 @@
  * how it's derived.
  */
 
-import type {LatLng} from './gtfsDb';
-import {type GtfsIndex, loadGtfsIndexForTrip, loadShapesForShapeIds, type StopTimeEntry} from './gtfsLoader';
-import {fallbackRouteColor} from './routeTypeUtil';
-import {makeKey, parseKey} from './gtfsKeyUtil';
-import {haversineMeters as haversineMetersShared} from './geoUtil';
-import {MAX_TRANSFER_WALK_SEC, NEARBY_STOPS} from './routingSettings';
+import type {LatLng} from '../../db/sqliteDb';
+import {type GtfsIndex, loadGtfsIndexForTrip, loadShapesForShapeIds, type StopTimeEntry} from '../loader/gtfsLoader';
+import {fallbackRouteColor} from '@/services/gtfs/config/routeTypeUtil';
+import {makeKey, parseKey} from '../core/gtfsKeyUtil';
+import {haversineMeters as haversineMetersShared} from '../../geo/geoUtil';
+import {MAX_TRANSFER_WALK_SEC, NEARBY_STOPS} from '@/services/gtfs/config/routingSettings';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Walking speed presets (m/s)
@@ -50,7 +50,7 @@ export const WALK_SPEED_MPS = {
 const MAX_ROUNDS = 5;
 // MAX_TRANSFER_WALK_SEC / NEARBY_STOPS now live in routingSettings.ts —
 // imported below. See that file's header comment for how these relate to
-// coarseGraph.ts's WALK_EDGE_THRESHOLD_M and corridorResolver.ts's
+// topologyGraph.ts's WALK_EDGE_THRESHOLD_M and corridorResolver.ts's
 // SEED_RADIUS_M (three separate "how far would someone walk" radii serving
 // three different purposes: topology-graph transfers, BFS seeding, and
 // mid-journey RAPTOR transfers respectively).
@@ -62,7 +62,7 @@ const INF = Number.MAX_SAFE_INTEGER;
 // Geometry helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Thin adapter over geoUtil.ts's shared haversineMeters (single source of
+// Thin adapter over geoUtil.ts's config haversineMeters (single source of
 // truth for the formula — see geoUtil.ts's header for why this used to be
 // copy-pasted across files and the drift risk that caused). Kept as a local
 // wrapper, rather than updating every call site in this file, purely so
@@ -200,12 +200,11 @@ export interface GtfsRouteResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function nearestStops(index: GtfsIndex, center: LatLng, limit: number, allowedIds: Set<string> | null) {
-    const withDist = index.allStops
+    return index.allStops
         .filter(s => !allowedIds || allowedIds.has(makeKey(s.agency, s.stop_id)))
         .map(s => ({s, d: haversineMeters(center, {lat: s.stop_lat, lon: s.stop_lon})}))
         .sort((a, b) => a.d - b.d)
         .slice(0, limit);
-    return withDist;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,11 +302,11 @@ export async function runSearchOnIndex(
     // Footpath relaxation below used to scan ALL of corridorStops for every
     // newly-marked stop, every round — O(newlyMarked × corridorStops.length),
     // unconditionally. Bucketing stops into a grid (same approach as
-    // coarseGraph.ts's walking-edge construction) lets each stop check only
+    // topologyGraph.ts's walking-edge construction) lets each stop check only
     // its own cell + 8 neighbors once, instead of a flat scan per
     // newly-marked stop per round. Cell size must stay >= xferRadius or the
     // 3x3-neighbor-cell scan can miss real neighbors just outside a smaller
-    // fixed cell — unlike coarseGraph.ts's fixed 450m WALK_EDGE_THRESHOLD_M,
+    // fixed cell — unlike topologyGraph.ts's fixed 450m WALK_EDGE_THRESHOLD_M,
     // xferRadius here scales with the rider's walking speed (e.g. ~1680m at
     // NORMAL/20min), so cell size is derived from it rather than hardcoded.
     const FOOTPATH_GRID_CELL_DEG = Math.max(0.006, (xferRadius / 111_000) * 1.1);

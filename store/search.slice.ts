@@ -1,6 +1,6 @@
 import { createAsyncThunk, createSlice, PayloadAction } from '@reduxjs/toolkit';
-import type { LatLng, SearchPlace } from '@/services/places';
-import { searchPlaces as searchPlacesService } from '@/services/places';
+import type { LatLng, SearchPlace } from '@/services/places/places';
+import { searchPlaces as searchPlacesService } from '@/services/places/places';
 
 export type { SearchPlace };
 
@@ -31,7 +31,7 @@ type State = {
      *  falls back to `new Date()` at call time, so "now" always reflects
      *  the actual moment of search rather than whenever this was picked. */
     departureTime: number | null;
-    /** Meters/sec. Mirrors WALK_SPEED_MPS.NORMAL from gtfsRouter.ts as the
+    /** Meters/sec. Mirrors WALK_SPEED_MPS.NORMAL from raptorRouter.ts as the
      *  default so an untouched picker matches computeGtfsRoute's own default. */
     walkingSpeedMps: number;
 };

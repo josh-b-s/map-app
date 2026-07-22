@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import type { LatLng } from '@/services/places';
+import type { LatLng } from '@/services/places/places';
 
 type State = { userLocation: LatLng | null };
 

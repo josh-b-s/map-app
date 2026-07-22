@@ -3,8 +3,8 @@
  * walk" or "how long would a rider wait," in one place.
  *
  * WHY THIS FILE EXISTS: these values were previously scattered as local
- * consts across coarseGraph.ts, corridorTagging.ts, corridorResolver.ts,
- * gtfsRouter.ts, and gtfsLoader.ts. That was fine while they were fixed,
+ * consts across topologyGraph.ts, corridorTagging.ts, corridorResolver.ts,
+ * raptorRouter.ts, and gtfsLoader.ts. That was fine while they were fixed,
  * developer-tuned numbers — but they're the natural candidates for a future
  * user-facing settings screen ("I don't mind walking further," "I'd rather
  * wait less"), and a setting that's supposed to change one rider-facing
@@ -53,7 +53,7 @@ export const MIN_SEED_STOPS = 4;
  *  candidate list well below this before it would ever bind. */
 export const MAX_SEED_STOPS = 40;
 
-// ── Coarse topology graph (coarseGraph.ts) ───────────────────────────────────
+// ── Coarse topology graph (topologyGraph.ts) ───────────────────────────────────
 /** Walking-edge threshold for the coarse graph BFS runs over — stops closer
  *  than this are treated as directly walkable for corridor-finding
  *  purposes only (separate from TRANSFER_WALK_RADIUS_SEC below, which is
@@ -80,7 +80,7 @@ export const CORRIDOR_WIDEN_TAPER_K_M = 1600;
 export const CORRIDOR_MIN_ACCEPTABLE_STOPS = 8;
 
 // ── Journey-planning transfer budget (corridorResolver.ts, seedRouteBfs.ts) ──
-/** Since coarseGraph.ts models a BFS hop as "ride one line," this is a real
+/** Since topologyGraph.ts models a BFS hop as "ride one line," this is a real
  *  transfer count, not a stop-count proxy. 5 comfortably covers any
  *  plausible Melbourne metro trip (worst case is usually 2-3 transfers)
  *  with margin to spare. */
@@ -91,11 +91,11 @@ export const MAX_TRANSFERS = 5;
  *  corridor instead. */
 export const MIN_ACCEPTABLE_PATTERNS = 3;
 
-// ── Mid-journey transfer walking (gtfsRouter.ts) ─────────────────────────────
+// ── Mid-journey transfer walking (raptorRouter.ts) ─────────────────────────────
 /** How long a rider will walk between two transit legs mid-journey — NOT
  *  the same radius as WALK_EDGE_THRESHOLD_M above (that one's for corridor
  *  topology only). Actual distance is speed-dependent — see
- *  transferRadiusM() in gtfsRouter.ts, which multiplies this by the
+ *  transferRadiusM() in raptorRouter.ts, which multiplies this by the
  *  rider's walking speed. 20 minutes was raised from an earlier 7-minute
  *  value (~588m at normal walking speed) that was too tight for real
  *  transfer geometry. */

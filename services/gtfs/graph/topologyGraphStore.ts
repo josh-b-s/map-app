@@ -1,7 +1,7 @@
 /**
- * coarseGraphStore.ts — SQLite persistence for the coarse graph adjacency.
+ * topologyGraphStore.ts — SQLite persistence for the coarse graph adjacency.
  *
- * The graph itself (coarseGraph.ts) is expensive to build (~12-14s: O(k^2)
+ * The graph itself (topologyGraph.ts) is expensive to build (~12-14s: O(k^2)
  * per-pattern cliques over ~2M edges) but is schedule-agnostic and only
  * changes when the GTFS feed itself changes. Rebuilding it every cold start
  * wastes that entire cost for no reason. This module persists the built
@@ -28,8 +28,8 @@
 // now this app's own compatibility wrapper, not expo-sqlite's type — it
 // preserves the same getAllAsync/execAsync/runAsync/withTransactionAsync
 // method shapes, so nothing else in this file needed to change.
-import type {SQLiteDatabase} from './gtfsDb';
-import type {CoarseEdge} from './coarseGraph';
+import type {SQLiteDatabase} from '../../db/sqliteDb';
+import type {CoarseEdge} from './topologyGraph';
 
 const EDGE_SEP = '\x1f';       // unit separator — won't collide with real stop_ids
 const KIND_TRANSIT = 't';
@@ -44,7 +44,7 @@ const INSERT_CHUNK = 200;      // rows per multi-value INSERT, comfortably under
 // is identical before and after, so without this version bump every existing
 // install would keep loading its old, now-incorrect bidirectional-clique
 // graph from disk forever, never rebuilding.
-const GRAPH_ALGO_VERSION = 2; // v2: transit clique edges are direction-respecting (i->j only, i<j in real stop_sequence order) — see coarseGraph.ts's flushPattern()
+const GRAPH_ALGO_VERSION = 2; // v2: transit clique edges are direction-respecting (i->j only, i<j in real stop_sequence order) — see topologyGraph.ts's flushPattern()
 
 export interface GraphSignature {
     stopCount: number;
@@ -52,8 +52,10 @@ export interface GraphSignature {
 }
 
 export async function computeGraphSignature(db: SQLiteDatabase): Promise<GraphSignature> {
-    const [{c: stopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM stops`);
-    const [{c: patternStopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c FROM pattern_stops`);
+    const [{c: stopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c
+                                                                  FROM stops`);
+    const [{c: patternStopCount}] = await db.getAllAsync<{ c: number }>(`SELECT COUNT(*) as c
+                                                                         FROM pattern_stops`);
     return {stopCount, patternStopCount};
 }
 
@@ -63,14 +65,32 @@ function signatureKey(sig: GraphSignature): string {
 
 async function ensureTables(db: SQLiteDatabase): Promise<void> {
     await db.execAsync(`
-        CREATE TABLE IF NOT EXISTS coarse_graph_meta (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS coarse_graph_adjacency (stop_key TEXT PRIMARY KEY, edges TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS coarse_graph_meta
+        (
+            key
+            TEXT
+            PRIMARY
+            KEY,
+            value
+            TEXT
+        );
+        CREATE TABLE IF NOT EXISTS coarse_graph_adjacency
+        (
+            stop_key
+            TEXT
+            PRIMARY
+            KEY,
+            edges
+            TEXT
+            NOT
+            NULL
+        );
     `);
 }
 
 const FIELD_SEP = '\x1e';     // record separator — splits "to+kind" from the optional viaPatternKey
 
-// cost is fully determined by kind (transit=1, walk=0.5 — see coarseGraph.ts),
+// cost is fully determined by kind (transit=1, walk=0.5 — see topologyGraph.ts),
 // so we only ever need to persist the kind (and now, optionally, which
 // pattern produced a transit edge — see CoarseEdge.viaPatternKey), not cost.
 function encodeEdges(edges: CoarseEdge[]): string {
@@ -109,12 +129,15 @@ export async function loadPersistedGraph(
     await ensureTables(db);
 
     const metaRows = await db.getAllAsync<{ value: string }>(
-        `SELECT value FROM coarse_graph_meta WHERE key = 'signature'`,
+        `SELECT value
+         FROM coarse_graph_meta
+         WHERE key = 'signature'`,
     );
     if (metaRows.length === 0 || metaRows[0].value !== signatureKey(signature)) return null;
 
     const rows = await db.getAllAsync<{ stop_key: string; edges: string }>(
-        `SELECT stop_key, edges FROM coarse_graph_adjacency`,
+        `SELECT stop_key, edges
+         FROM coarse_graph_adjacency`,
     );
     if (rows.length === 0) return null; // stale/half-written — treat as a miss, rebuild
 
@@ -139,20 +162,25 @@ export async function savePersistedGraph(
     const rows = [...adjacency.entries()].map(([stopKey, edges]) => ({stopKey, packed: encodeEdges(edges)}));
 
     await db.withTransactionAsync(async () => {
-        await db.execAsync(`DELETE FROM coarse_graph_adjacency; DELETE FROM coarse_graph_meta;`);
+        await db.execAsync(`DELETE
+                            FROM coarse_graph_adjacency;
+        DELETE
+        FROM coarse_graph_meta;`);
 
         for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
             const chunk = rows.slice(i, i + INSERT_CHUNK);
             const placeholders = chunk.map(() => '(?, ?)').join(', ');
             const params = chunk.flatMap(r => [r.stopKey, r.packed]);
             await db.runAsync(
-                `INSERT INTO coarse_graph_adjacency (stop_key, edges) VALUES ${placeholders}`,
+                `INSERT INTO coarse_graph_adjacency (stop_key, edges)
+                 VALUES ${placeholders}`,
                 params,
             );
         }
 
         await db.runAsync(
-            `INSERT INTO coarse_graph_meta (key, value) VALUES ('signature', ?)`,
+            `INSERT INTO coarse_graph_meta (key, value)
+             VALUES ('signature', ?)`,
             [signatureKey(signature)],
         );
     });

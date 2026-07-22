@@ -2,8 +2,8 @@
  * rustGtfsImporter.ts — thin bridge from the app to the native Rust
  * import_gtfs() (see modules/gtfs-importer/rust/src/lib.rs and import.rs).
  *
- * Replaces gtfsImporter.ts's importLatestZip() as the thing DebugControls.tsx
- * calls. gtfsImporter.ts itself is left untouched for now as a reference/
+ * Replaces gtfsImporterLegacy.ts's importLatestZip() as the thing DebugControls.tsx
+ * calls. gtfsImporterLegacy.ts itself is left untouched for now as a reference/
  * fallback until the Rust output has been verified against a real feed —
  * see the note in import.rs's process_agency() doc comment.
  *
@@ -15,18 +15,18 @@
 
 import * as FileSystem from 'expo-file-system/legacy';
 import {importGtfs, type ProgressCallback} from '@mapapp/gtfs-importer';
-import {INCOMING_DIR, ensureImportFolders} from './gtfsImporter';
+import {ensureImportFolders, INCOMING_DIR} from './gtfsImporterLegacy';
 
-export type ImportProgressEvent = {table: string; inserted: number; total: number};
+export type ImportProgressEvent = { table: string; inserted: number; total: number };
 
-// Same file:// stripping gtfsImporter.ts already does before handing paths
+// Same file:// stripping gtfsImporterLegacy.ts already does before handing paths
 // to native code — expo-file-system always includes the file:// scheme,
 // but std::fs::read on the Rust side wants a bare filesystem path.
 function stripFileScheme(p: string): string {
     return p.startsWith('file://') ? p.slice('file://'.length) : p;
 }
 
-/** Finds the first .zip sitting in incoming/ — mirrors gtfsImporter.ts's
+/** Finds the first .zip sitting in incoming/ — mirrors gtfsImporterLegacy.ts's
  *  findIncomingZip(), duplicated here rather than imported since that one
  *  isn't exported. */
 async function findIncomingZip(): Promise<string | null> {
@@ -71,7 +71,8 @@ export async function runRustImport(
     // will NOT create missing parent directories, only the db file itself.
     await FileSystem.makeDirectoryAsync(`${FileSystem.documentDirectory}SQLite/`, {
         intermediates: true,
-    }).catch((_e: unknown) => {});
+    }).catch((_e: unknown) => {
+    });
 
     const dbPath = gtfsDbPath();
     console.log(`[rustGtfsImporter] db path: ${dbPath}`);

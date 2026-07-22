@@ -35,8 +35,8 @@
  * file, which is the point of having it.
  */
 
-import type {QueryableDb} from './sqlChunkUtil';
-import {chunkedQuery, placeholders, SQL_CHUNK_SIZE} from './sqlChunkUtil';
+import type {QueryableDb} from '../../db/sqlChunkUtil';
+import {chunkedQuery, placeholders, SQL_CHUNK_SIZE} from '../../db/sqlChunkUtil';
 import {makeKey, parseKey} from './gtfsKeyUtil';
 
 /**
@@ -79,7 +79,7 @@ let patternPkToRouteKey: Map<number, string> | null = null;
 /**
  * Canonical, coordinate-unpacked stops cache — the ONE place in the app
  * that queries the `stops` table. Previously gtfsLoader.ts and
- * coarseGraph.ts each ran their own independent (uncached-against-each-
+ * topologyGraph.ts each ran their own independent (uncached-against-each-
  * other, and un-unpacked) copy of this same query; folding it here means
  * every caller shares one cache AND gets correctly unpacked lat/lon.
  * Populates the pk<->key maps below as a side effect of the same query —
@@ -203,22 +203,6 @@ export async function getStopKeysForPks(db: QueryableDb, stopPks: Iterable<numbe
     return out;
 }
 
-/** Every stop_pk (across all agencies) sharing the given unqualified
- *  stop_id text — same "no agency filter" breadth the app's original,
- *  pre-surrogate-key queries had (see getPatternKeysForUnqualifiedStopIds'
- *  doc comment; this is the same tradeoff, just factored out for reuse).
- *  Prefer getStopPksForStopKeys when the caller has real (agency,id) keys —
- *  this one only exists for callers stuck with bare ids. */
-export async function getStopPksForUnqualifiedStopIds(db: QueryableDb, stopIds: Iterable<string>): Promise<number[]> {
-    await ensureStopMaps(db);
-    const out: number[] = [];
-    for (const id of stopIds) {
-        const pks = stopIdToPks!.get(id);
-        if (pks) out.push(...pks);
-    }
-    return out;
-}
-
 /** Exact stop_pk lookup for agency-qualified stop keys — no cross-agency
  *  ambiguity, unlike getStopPksForUnqualifiedStopIds above. Use this
  *  whenever the caller already has real keys (which, after corridorTagging/
@@ -229,21 +213,6 @@ export async function getStopPksForStopKeys(db: QueryableDb, stopKeys: Iterable<
     for (const key of stopKeys) {
         const pk = stopKeyToPk!.get(key);
         if (pk !== undefined) out.push(pk);
-    }
-    return out;
-}
-
-/** Bulk pattern_pk -> patternKey. Currently unused internally — gtfsLoader.ts
- *  used to call this to resolve stop_times.pattern_pk in bulk, but that
- *  column was removed from stop_times (fully derivable via trip_pk instead;
- *  see preprocess-gtfs.ts). Kept as a generic utility for any future caller
- *  that has raw pattern_pks and needs real keys. */
-export async function getPatternKeysForPks(db: QueryableDb, patternPks: Iterable<number>): Promise<Map<number, string>> {
-    await ensurePatternAgencyMap(db);
-    const out = new Map<number, string>();
-    for (const pk of patternPks) {
-        const agency = patternPkToAgency!.get(pk);
-        if (agency !== undefined) out.set(pk, patternKeyFor(pk, agency));
     }
     return out;
 }
@@ -379,7 +348,7 @@ export async function getPatternStopsForPatternKeys(
 }
 
 /** Every pattern_stops row in the whole DB, ordered by pattern then
- *  sequence — used by coarseGraph.ts's from-scratch build, which needs
+ *  sequence — used by topologyGraph.ts's from-scratch build, which needs
  *  every pattern's complete stop sequence, not a filtered subset. */
 export async function getAllPatternStopsOrdered(db: QueryableDb): Promise<RepoPatternStop[]> {
     await ensureStopMaps(db);
@@ -394,26 +363,6 @@ export async function getAllPatternStopsOrdered(db: QueryableDb): Promise<RepoPa
         stopKey: stopPkToKey!.get(r.stop_pk)!,
         stop_sequence: r.stop_sequence,
     }));
-}
-
-/** Which stops (as agency-qualified keys) the given patterns actually
- *  visit — matches corridorResolver.ts's old `SELECT DISTINCT stop_id FROM
- *  pattern_stops WHERE pattern_id IN (...)` shape, minus the column that
- *  never existed, and qualified by agency so cross-agency stop_id
- *  collisions can't merge two different physical stops.
- *
- *  Currently unused internally — corridorResolver.ts now calls
- *  getPatternStopsForPatternKeys directly instead, so it can hang onto the
- *  raw rows (threaded through ResolvedCorridor.patternStopRows) for
- *  gtfsLoader.ts to reuse, rather than discarding them the way this helper
- *  does. Kept as a convenience for any caller that only wants the stop-key
- *  set and doesn't care about the rows themselves. */
-export async function getStopKeysForPatternKeys(
-    db: QueryableDb,
-    patternKeys: Iterable<string>,
-): Promise<Set<string>> {
-    const rows = await getPatternStopsForPatternKeys(db, patternKeys);
-    return new Set(rows.map(r => r.stopKey));
 }
 
 /** Which patterns (as keys) touch ANY stop whose (agency,id) matches one of
@@ -438,41 +387,3 @@ export async function getPatternKeysForStopKeys(
     return new Set(rows.map(r => patternKeyFor(r.pattern_pk, patternPkToAgency!.get(r.pattern_pk)!)));
 }
 
-/**
- * Same as getPatternKeysForStopKeys, but for callers that only have plain
- * (unqualified, no-agency) stop_ids on hand. Matches EVERY agency's stop
- * sharing that id text — a stop_id colliding across two different agencies
- * pulls in both agencies' patterns.
- *
- * As of this pass, nothing in the app actually calls this anymore —
- * corridorResolver.ts's bbox fallback and corridorTagging.ts's seed-path
- * pattern lookup (the two former callers) were both tightened to carry
- * agency-qualified keys end-to-end and use getPatternKeysForStopKeys
- * instead, exactly to close the cross-agency collision risk this function
- * describes. Kept exported as a fallback utility for any future caller that
- * genuinely only has bare ids (e.g. ingesting an external id list with no
- * agency attached) — but if you're calling this on a set you built
- * yourself, prefer carrying the agency through instead of stripping it and
- * calling this.
- */
-export async function getPatternKeysForUnqualifiedStopIds(
-    db: QueryableDb,
-    stopIds: Iterable<string>,
-): Promise<Set<string>> {
-    await ensureStopMaps(db);
-    const stopPks: number[] = [];
-    for (const id of stopIds) {
-        const pks = stopIdToPks!.get(id);
-        if (pks) stopPks.push(...pks);
-    }
-    await ensurePatternAgencyMap(db);
-    const rows = await chunkedQuery(stopPks, SQL_CHUNK_SIZE, chunk =>
-        db.getAllAsync<{ pattern_pk: number }>(
-            `SELECT DISTINCT pattern_pk
-             FROM pattern_stops
-             WHERE stop_pk IN (${placeholders(chunk.length)})`,
-            chunk,
-        ),
-    );
-    return new Set(rows.map(r => patternKeyFor(r.pattern_pk, patternPkToAgency!.get(r.pattern_pk)!)));
-}

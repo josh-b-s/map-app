@@ -7,7 +7,7 @@ import { Stack } from 'expo-router';
 import { Provider } from 'react-redux';
 import { store } from '@/store/store';
 import '@/global.css';
-import { warmUpGtfsEngine } from '@/services/gtfsWarmup';
+import { warmUpGtfsEngine } from '@/services/gtfs/warmup/gtfsWarmup';
 
 useEffect(() => {
     warmUpGtfsEngine(); // deliberately not awaited — shouldn't block first paint

@@ -26,7 +26,7 @@ export async function isDbReady(): Promise<boolean> {
  *    callback (`db.transaction(async (tx) => { tx.execute(...) })`) —
  *    there's no implicit "just keep calling db.execute() inside the
  *    callback and it magically joins the transaction" behavior the way
- *    expo-sqlite's withTransactionAsync had. coarseGraphStore.ts's
+ *    expo-sqlite's withTransactionAsync had. topologyGraphStore.ts's
  *    savePersistedGraph() calls db.execAsync/db.runAsync DIRECTLY inside
  *    its withTransactionAsync callback (not a passed tx) — a naive wrapper
  *    would silently lose the atomicity that fix depended on (each
@@ -35,7 +35,7 @@ export async function isDbReady(): Promise<boolean> {
  *    for the duration of the callback, and every other method routes
  *    through it when set. This mirrors expo-sqlite's implicit-context
  *    behavior explicitly. Safe under this codebase's existing invariant of
- *    exactly one shared connection used serially (see getDb()'s _db
+ *    exactly one config connection used serially (see getDb()'s _db
  *    singleton) — op-sqlite's own docs make the same recommendation
  *    ("DO NOT OPEN MORE THAN ONE CONNECTION PER DATABASE").
  */
@@ -112,7 +112,8 @@ export async function getOrCreateDbForImport(): Promise<SQLiteDatabase> {
 
     const ready = await isDbReady();
     if (!ready) {
-        await FileSystem.makeDirectoryAsync(DB_DIR, {intermediates: true}).catch(() => {});
+        await FileSystem.makeDirectoryAsync(DB_DIR, {intermediates: true}).catch(() => {
+        });
         // Opening a non-existent file with op-sqlite creates it — no
         // explicit "create empty file" step needed beyond ensuring the
         // parent directory exists first.
@@ -148,16 +149,10 @@ async function openAndCache(): Promise<SQLiteDatabase> {
     return _db;
 }
 
-export function resetDb() {
-    _db = null;  // call this after a fresh DB is copied in
-}
-
-// LatLng type kept here (used by this file's own DB-facing signatures);
+// LatLng type kept here (used by this file's own DB-facing signatures).
 // Places/Google API code (SearchPlace, SearchOptions, searchPlaces,
-// TravelMode) lives ONLY in places.ts now — this was previously a
-// byte-for-byte copy-paste of that module, which is exactly the kind of
-// drift risk geoUtil.ts's own header comment warns about for haversineMeters.
-// gtfsDb.ts should own DB connection concerns only, per its module doc above.
+// TravelMode) lives ONLY in places/places.ts — import from there directly.
+// The previous re-export shim here has been removed now that this file
+// lives in db/ alongside other DB-connection-only modules; sqliteDb.ts
+// should own DB connection concerns only, per its module doc above.
 export type LatLng = { latitude: number; longitude: number };
-export type {TravelMode, SearchPlace, SearchOptions} from './places';
-export {searchPlaces} from './places';

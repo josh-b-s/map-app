@@ -79,7 +79,7 @@ function packCoord(v: string): number | null {
 }
 
 function createSchema(db: Database.Database) {
-    // DDL now lives in gtfsSchema.ts, shared with gtfsImporter.ts (the
+    // DDL now lives in gtfsSchema.ts, config with gtfsImporterLegacy.ts (the
     // on-device build) — see that file's module doc for why.
     db.exec(GTFS_SCHEMA_SQL);
 }

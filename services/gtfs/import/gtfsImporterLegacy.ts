@@ -1,5 +1,5 @@
 /**
- * gtfsImporter.ts — on-device counterpart to scripts/preprocess-gtfs.ts.
+ * gtfsImporterLegacy.ts — on-device counterpart to scripts/preprocess-gtfs.ts.
  *
  * Same eventual job (parse GTFS CSVs -> populate gtfs.db) but a different
  * environment: op-sqlite instead of better-sqlite3 (see gtfsDb.ts's module

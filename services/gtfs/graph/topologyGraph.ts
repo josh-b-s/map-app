@@ -1,5 +1,5 @@
 /**
- * coarseGraph.ts — schedule-agnostic stop topology graph.
+ * topologyGraph.ts — schedule-agnostic stop topology graph.
  *
  * This is deliberately NOT the McRAPTOR search graph. It answers a much
  * cheaper question: "does any trip, on any day, ever go directly from stop A
@@ -9,7 +9,7 @@
  *
  * Cached in-memory for the process lifetime (fastest path — same app
  * session, no I/O at all), and persisted to SQLite across process lifetimes
- * via coarseGraphStore.ts (still requires a signature match — that module
+ * via topologyGraphStore.ts (still requires a signature match — that module
  * owns invalidation, this one just calls it). Building this graph is the
  * expensive part (~12-14s: O(k^2) per-pattern cliques); building it fresh is
  * only ever necessary on the very first run after install, or after a GTFS
@@ -18,12 +18,12 @@
  * schedule concern, this is a topology concern, per the spec.
  */
 
-import {getDb} from './gtfsDb';
-import {makeKey} from './gtfsKeyUtil';
-import {computeGraphSignature, loadPersistedGraph, savePersistedGraph} from './coarseGraphStore';
-import {haversineMeters} from './geoUtil';
-import {getAllPatternStopsOrdered, getAllStopsCached, type RepoPatternStop} from './gtfsRepo';
-import {WALK_EDGE_THRESHOLD_M} from './routingSettings';
+import {getDb} from '../../db/sqliteDb';
+import {makeKey} from '../core/gtfsKeyUtil';
+import {computeGraphSignature, loadPersistedGraph, savePersistedGraph} from './topologyGraphStore';
+import {haversineMeters} from '../../geo/geoUtil';
+import {getAllPatternStopsOrdered, getAllStopsCached, type RepoPatternStop} from '../core/gtfsRepo';
+import {WALK_EDGE_THRESHOLD_M} from '@/services/gtfs/config/routingSettings';
 
 export interface CoarseNode {
     stop_id: string;
@@ -49,7 +49,7 @@ export interface CoarseEdge {
     viaPatternKey?: string;
 }
 
-export interface CoarseGraph {
+export interface TopologyGraph {
     nodesByKey: Map<string, CoarseNode>;
     adjacency: Map<string, CoarseEdge[]>;
     builtAt: number;
@@ -70,8 +70,8 @@ export interface CoarseGraph {
 // break the "only check 8 neighbors" invariant.
 const GRID_CELL_DEG = 0.006; // ~650m at Melbourne's latitude, comfortably > threshold
 
-let cache: CoarseGraph | null = null;
-let buildPromise: Promise<CoarseGraph> | null = null;
+let cache: TopologyGraph | null = null;
+let buildPromise: Promise<TopologyGraph> | null = null;
 
 /**
  * Logs Hermes' own heap stats, if available. This is the actual JS heap
@@ -90,11 +90,6 @@ function logHeapUsage(label: string): void {
     const usedMB = (stats.js_heapSize / (1024 * 1024)).toFixed(1);
     const allocatedMB = (stats.js_allocatedBytes / (1024 * 1024)).toFixed(1);
     console.log(`[coarseGraph] heap after ${label}: ${usedMB}MB used / ${allocatedMB}MB allocated`);
-}
-
-export function invalidateCoarseGraphCache(): void {
-    cache = null;
-    buildPromise = null;
 }
 
 /**
@@ -256,7 +251,7 @@ function buildAdjacencyFromScratch(
     return adjacency;
 }
 
-export async function getCoarseGraph(): Promise<CoarseGraph> {
+export async function getCoarseGraph(): Promise<TopologyGraph> {
     if (cache) return cache;
     if (buildPromise) return buildPromise;
 

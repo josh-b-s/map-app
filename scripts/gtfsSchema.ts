@@ -1,8 +1,8 @@
 /**
- * gtfsSchema.ts — the gtfs.db schema, shared between scripts/preprocess-gtfs.ts
- * (desktop build, better-sqlite3) and gtfsImporter.ts (on-device build,
+ * gtfsSchema.ts — the gtfs.db schema, config between scripts/preprocess-gtfs.ts
+ * (desktop build, better-sqlite3) and gtfsImporterLegacy.ts (on-device build,
  * op-sqlite). One copy of the DDL so the two build paths can't silently
- * diverge on a column — see gtfsImporter.ts's module doc for why that
+ * diverge on a column — see gtfsImporterLegacy.ts's module doc for why that
  * divergence risk existed in the first place.
  *
  * Exported as a plain string rather than a function that takes a db,

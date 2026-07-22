@@ -7,7 +7,7 @@ import { RootState, AppDispatch } from '@/store/store';
 import { SHADOW, TOP_SAFE, useThemeStyle } from '@/constants/themes';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { selectJourney } from '@/store/route.slice';
-import { classifyRouteType } from '@/services/routeTypeUtil';
+import {classifyRouteType} from "@/services/gtfs/config/routeTypeUtil";
 
 type Props = {
     animatedPosition: SharedValue<number>;

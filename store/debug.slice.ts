@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import type { GtfsDebugInfo } from '@/services/gtfsRouter';
+import {GtfsDebugInfo} from "@/services/gtfs/router/raptorRouter";
+
 
 export type DebugPhase = 'bfs' | 'seed' | 'corridor' | 'raptor';
 const PHASE_ORDER: DebugPhase[] = ['bfs', 'seed', 'corridor', 'raptor'];
@@ -23,7 +24,7 @@ export const BFS_REVEAL_STEPS = 40;
 // per render. NOT a visual preference: mergeEdgesIntoChains reduces the
 // NUMBER of native Polyline objects only as far as the graph's actual
 // branching allows, and this app's coarse graph deliberately builds
-// per-pattern CLIQUE edges (coarseGraph.ts: "a busy interchange stop can
+// per-pattern CLIQUE edges (topologyGraph.ts: "a busy interchange stop can
 // pick up hundreds of edges") plus seedRouteBfs.ts's multi-parent tracking
 // (every sibling route reaching a stop at the same level is kept) — so a
 // big corridor's BFS tree can be large AND densely branched, which is

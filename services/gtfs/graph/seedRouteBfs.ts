@@ -35,8 +35,8 @@
  * discovered two levels "too late" to even be considered.
  */
 
-import type {CoarseGraph} from './coarseGraph';
-import {MAX_TRANSFERS as DEFAULT_MAX_TRANSFERS} from './routingSettings';
+import type {TopologyGraph} from './topologyGraph';
+import {MAX_TRANSFERS as DEFAULT_MAX_TRANSFERS} from '@/services/gtfs/config/routingSettings';
 
 export interface SeedPathResult {
     paths: string[][];   // each is a list of stopKeys, origin -> destination
@@ -61,14 +61,14 @@ const SAFETY_MARGIN_LEVELS = 1; // expand one extra full level past first hit
 // A level is now genuinely one transit boarding (see module doc above), so a
 // level cap of maxTransfers + 1 is a real transfer-count budget, not an
 // arbitrary stop-count guess. This is only correct because transit edges are
-// per-line cliques (see coarseGraph.ts); if that ever regresses back to
+// per-line cliques (see topologyGraph.ts); if that ever regresses back to
 // per-stop edges, this cap needs to grow back to a stop-count-scaled number.
 function levelCapFor(maxTransfers: number): number {
     return Math.max(1, maxTransfers) + 1;
 }
 
 export function findSeedPaths(
-    graph: CoarseGraph,
+    graph: TopologyGraph,
     originKeys: string[],
     destKeys: string[],
     maxTransfers: number = DEFAULT_MAX_TRANSFERS,
@@ -77,7 +77,7 @@ export function findSeedPaths(
     const destSet = new Set(destKeys);
 
     // Multi-parent BFS: track ALL predecessors that reach a node at its
-    // earliest level, so multiple sibling paths through a shared stop are
+    // earliest level, so multiple sibling paths through a config stop are
     // preserved instead of collapsed to one. A node's parent can now be
     // either a transit-hop predecessor (parent at level-1) OR a
     // walk-closure predecessor (parent at the SAME level) — backtrack()

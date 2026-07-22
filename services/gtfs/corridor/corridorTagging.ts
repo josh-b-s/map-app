@@ -12,12 +12,12 @@
  * world" stop that's close as the crow flies but topologically unrelated).
  */
 
-import {getCoarseGraph} from './coarseGraph';
-import {findSeedPaths} from './seedRouteBfs';
-import {makeKey} from './gtfsKeyUtil';
-import {haversineMeters, type LatLon} from './geoUtil';
-import type {QueryableDb} from './sqlChunkUtil';
-import {getPatternKeysForStopKeys} from './gtfsRepo';
+import {getCoarseGraph} from '../graph/topologyGraph';
+import {findSeedPaths} from '../graph/seedRouteBfs';
+import {makeKey} from '../core/gtfsKeyUtil';
+import {haversineMeters, type LatLon} from '../../geo/geoUtil';
+import type {QueryableDb} from '../../db/sqlChunkUtil';
+import {getPatternKeysForStopKeys} from '../core/gtfsRepo';
 import {
     CORRIDOR_MIN_ACCEPTABLE_STOPS as MIN_ACCEPTABLE_STOPS,
     CORRIDOR_MIN_WIDTH_M as MIN_WIDTH_M,
@@ -26,7 +26,7 @@ import {
     CORRIDOR_WIDEN_TAPER_K_M as WIDEN_TAPER_K_M,
     MAX_TRANSFERS as DEFAULT_MAX_TRANSFERS,
     ORIGIN_DEST_WALK_RADIUS_M,
-} from './routingSettings';
+} from '@/services/gtfs/config/routingSettings';
 
 export type {LatLon};
 
@@ -34,7 +34,7 @@ export type {LatLon};
  *  produce agency-qualified stop KEYS, not bare stop_id text. Bare ids can
  *  collide across agencies/feeds (two different GTFS feeds both using
  *  "1001" for a stop, say); qualifying by agency here is what lets every
- *  downstream consumer (corridorResolver.ts, gtfsLoader.ts, gtfsRouter.ts)
+ *  downstream consumer (corridorResolver.ts, gtfsLoader.ts, raptorRouter.ts)
  *  do EXACT stop/pattern lookups instead of "matches this id text in any
  *  agency" ones — this matters more as multiple feeds become simultaneously
  *  active, not just as a multi-feed nicety. */
@@ -93,7 +93,7 @@ export {ORIGIN_DEST_WALK_RADIUS_M};
 // routingSettings.ts (imported above, aliased to keep this file's existing
 // shorter names) — see that file's header comment for how
 // ORIGIN_DEST_WALK_RADIUS_M relates to corridorResolver.ts's
-// SEED_RADIUS_M and coarseGraph.ts's WALK_EDGE_THRESHOLD_M.
+// SEED_RADIUS_M and topologyGraph.ts's WALK_EDGE_THRESHOLD_M.
 
 // How far someone will plausibly walk to/from a stop, independent of the
 // path-taper width. These used to be the same number (minWidthM, 350m on
@@ -479,7 +479,7 @@ export async function computeSeedPathCorridor(
     // case or ballooned corridor size/search cost on unrelated long-haul
     // trips (regional rail routinely has genuine multi-km adjacent-stop
     // hops, indistinguishable from a clique-jump by distance alone). The
-    // actual fix is upstream in coarseGraph.ts: transit clique edges are now
+    // actual fix is upstream in topologyGraph.ts: transit clique edges are now
     // direction-respecting (only i -> j for i < j in real stop_sequence
     // order), so BFS can no longer construct a wrong-direction jump in the
     // first place — no sweep needed here anymore.

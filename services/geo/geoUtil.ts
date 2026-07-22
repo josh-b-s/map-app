@@ -1,8 +1,8 @@
 /**
- * geoUtil.ts — shared geo-math primitives.
+ * geoUtil.ts — config geo-math primitives.
  *
  * Previously an identical haversineMeters implementation was copy-pasted
- * into coarseGraph.ts, corridorTagging.ts, and gtfsLoader.ts. One
+ * into topologyGraph.ts, corridorTagging.ts, and gtfsLoader.ts. One
  * implementation here, imported everywhere — no functional change, just
  * removes the drift risk of three copies silently diverging.
  */

@@ -29,8 +29,8 @@
  *      actual feed's row count from your own preprocess-gtfs.ts log).
  */
 
-import type {SQLiteDatabase} from './gtfsDb';
-import {batchInsert} from './batchInsertUtil';
+import type {SQLiteDatabase} from '../../db/sqliteDb';
+import {batchInsert} from '../../db/batchInsertUtil';
 
 interface BenchStage {
     rowCount: number;
@@ -84,11 +84,15 @@ export async function runInsertBenchmark(
     stageSizes: number[] = [10_000, 100_000, 500_000, 1_000_000],
     onLog?: (line: string) => void,
 ): Promise<BenchmarkResult> {
-    const log = (line: string) => { console.log(`[gtfsInsertBenchmark] ${line}`); onLog?.(line); };
+    const log = (line: string) => {
+        console.log(`[gtfsInsertBenchmark] ${line}`);
+        onLog?.(line);
+    };
 
     await db.execAsync(`DROP TABLE IF EXISTS bench_stop_times_scratch;`);
     await db.execAsync(`
-        CREATE TABLE bench_stop_times_scratch (
+        CREATE TABLE bench_stop_times_scratch
+        (
             trip_pk       INTEGER NOT NULL,
             stop_sequence INTEGER NOT NULL,
             stop_pk       INTEGER NOT NULL,
@@ -107,7 +111,8 @@ export async function runInsertBenchmark(
 
             // Fresh table each stage so earlier stages' rows don't inflate
             // later ones' PRIMARY KEY conflict-checking cost.
-            await db.execAsync(`DELETE FROM bench_stop_times_scratch;`);
+            await db.execAsync(`DELETE
+                                FROM bench_stop_times_scratch;`);
 
             const t0 = Date.now();
             await batchInsert(

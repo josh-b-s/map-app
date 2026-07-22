@@ -12,7 +12,7 @@ import DepartureTimeModal from '@/components/DepartureTimeModal';
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_API_KEY ?? '';
 
 // Cycle order for the walking-speed pill — tapping steps through these in
-// order and wraps back to SLOW. Mirrors gtfsRouter.ts's WALK_SPEED_MPS
+// order and wraps back to SLOW. Mirrors raptorRouter.ts's WALK_SPEED_MPS
 // (only the three pedestrian-realistic tiers are exposed here; JOG/RUN/
 // SPRINT aren't meaningful walking-speed options for a transit planner).
 const WALK_SPEED_CYCLE: { label: string; mps: number }[] = [

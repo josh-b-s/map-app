@@ -7,7 +7,7 @@
  * fine there because better-sqlite3 is synchronous/in-process) means one
  * bridge round trip per row. At stop_times scale (~11.8M rows across a
  * typical multi-agency feed) that's the same per-row marshaling problem
- * coarseGraphStore.ts's header comment already documents for a mere 30K
+ * topologyGraphStore.ts's header comment already documents for a mere 30K
  * rows — just ~400x worse. The fix is the same one already used there:
  * pack many rows into one multi-value INSERT, and batch those inside a
  * single transaction so SQLite doesn't fsync/commit per chunk either.
@@ -20,7 +20,7 @@
  * number tuned for one specific table and silently wrong for another.
  */
 
-import type {SQLiteDatabase} from './gtfsDb';
+import type {SQLiteDatabase} from './sqliteDb';
 
 const MAX_BOUND_PARAMS = 900; // stay under SQLite's 999 cap with margin
 
@@ -41,7 +41,7 @@ export async function batchInsert<T>(
     columns: string[],
     rows: T[],
     toParams: (row: T) => any[],
-    opts: {wrapInTransaction?: boolean; onProgress?: (inserted: number, total: number) => void} = {},
+    opts: { wrapInTransaction?: boolean; onProgress?: (inserted: number, total: number) => void } = {},
 ): Promise<void> {
     if (rows.length === 0) return;
 
@@ -57,7 +57,8 @@ export async function batchInsert<T>(
             const placeholders = chunk.map(() => rowPlaceholder).join(', ');
             const params = chunk.flatMap(toParams);
             await db.runAsync(
-                `INSERT INTO ${table} (${columnList}) VALUES ${placeholders}`,
+                `INSERT INTO ${table} (${columnList})
+                 VALUES ${placeholders}`,
                 params,
             );
             inserted += chunk.length;

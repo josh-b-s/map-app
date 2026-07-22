@@ -5,7 +5,7 @@
  * WHY THIS IS ITS OWN FILE: gtfsLoader.ts's job is loading a SCOPED,
  * date/time-filtered GTFS index. Corridor resolution (BFS seed paths ->
  * candidate patterns -> candidate stops) has no dependency on date/time at
- * all — same schedule-agnostic reasoning coarseGraph.ts already documents
+ * all — same schedule-agnostic reasoning topologyGraph.ts already documents
  * about itself. Mixing the two in one file made gtfsLoader.ts responsible
  * for both "what shape is this trip" (a one-time-per-origin/destination
  * question) and "what's running today" (a per-search question), which is
@@ -21,26 +21,26 @@
  * invalidateCorridorCache() below.
  */
 
-import type {LatLng} from './gtfsDb';
-import {makeKey} from './gtfsKeyUtil';
-import {haversineMeters} from './geoUtil';
-import {type QueryableDb} from './sqlChunkUtil';
+import type {LatLng} from '../../db/sqliteDb';
+import {makeKey} from '../core/gtfsKeyUtil';
+import {haversineMeters} from '../../geo/geoUtil';
+import {type QueryableDb} from '../../db/sqlChunkUtil';
 import type {CorridorBoundary} from './corridorTagging';
 import {computeCorridor, computeSeedPathCorridor, ORIGIN_DEST_WALK_RADIUS_M} from './corridorTagging';
-import type {StopInfo} from './gtfsLoader';
+import type {StopInfo} from '../loader/gtfsLoader';
 import {
     getPatternKeysForStopKeys,
     getPatternStopsForPatternKeys,
     getRouteKeysForStopKeys,
     type RepoPatternStop
-} from './gtfsRepo';
-import {MAX_SEED_STOPS, MAX_TRANSFERS, MIN_ACCEPTABLE_PATTERNS, MIN_SEED_STOPS, SEED_RADIUS_M} from './routingSettings';
+} from '../core/gtfsRepo';
+import {MAX_SEED_STOPS, MAX_TRANSFERS, MIN_ACCEPTABLE_PATTERNS, MIN_SEED_STOPS, SEED_RADIUS_M} from '@/services/gtfs/config/routingSettings';
 
 export interface ResolvedCorridor {
     patternKeys: Set<string>;
     /** Agency-qualified stop KEYS (makeKey(agency,stop_id)), not bare
      *  stop_id — matches gtfsLoader.ts's GtfsIndex.corridorStopIds shape,
-     *  which was tightened the same way (see gtfsRouter.ts's corridor
+     *  which was tightened the same way (see raptorRouter.ts's corridor
      *  filters, updated alongside this). Qualifying by agency here is what
      *  lets every pattern/stop lookup downstream be an exact match instead
      *  of "any agency with this id text" — matters more as multiple feeds
@@ -96,13 +96,6 @@ function cacheKeyFor(origin: LatLng, destination: LatLng, maxTransfers: number):
     return `${roundCoord(origin.latitude)},${roundCoord(origin.longitude)}` +
         `|${roundCoord(destination.latitude)},${roundCoord(destination.longitude)}` +
         `|${maxTransfers}`;
-}
-
-/** Call after loading a new/updated GTFS feed, alongside
- *  invalidateCoarseGraphCache() / invalidateStopsCache() — a feed update can
- *  change which patterns/stops a given origin/destination resolves to. */
-export function invalidateCorridorCache(): void {
-    corridorCache.clear();
 }
 
 /**
@@ -206,14 +199,14 @@ export async function resolveCorridor(
     const cacheKey = cacheKeyFor(origin, destination, MAX_TRANSFERS);
     const cached = corridorCache.get(cacheKey);
     if (cached) {
-        t = lap(`corridor resolution (cache hit, ${cached.patternKeys.size} patterns, ${cached.allowedStopIds.size} stops)`, t);
+        lap(`corridor resolution (cache hit, ${cached.patternKeys.size} patterns, ${cached.allowedStopIds.size} stops)`, t);
         return cached;
     }
 
     const candidateAll = allStops.map(s => ({stop_id: s.stop_id, lat: s.stop_lat, lon: s.stop_lon, agency: s.agency}));
     // NOTE: origin/destination seed selection are logically independent and
     // tempting to Promise.all — deliberately NOT done here. gtfsDb.ts's own
-    // doc comment documents a strict "exactly one shared connection used
+    // doc comment documents a strict "exactly one config connection used
     // serially" invariant for this op-sqlite wrapper; firing concurrent
     // queries against that one connection isn't confirmed safe (op-sqlite's
     // docs don't commit to internally queuing concurrent execute() calls),
@@ -296,7 +289,7 @@ export async function resolveCorridor(
         for (const path of seedCorridor.seedPaths) {
             for (const stopKey of path) allowedStopIds.add(stopKey);
         }
-        t = lap(`corridor stops derived from kept patterns + walk radius + seed path stops (${allowedStopIds.size} stops)`, t);
+        lap(`corridor stops derived from kept patterns + walk radius + seed path stops (${allowedStopIds.size} stops)`, t);
 
         result = {
             patternKeys: seedCorridor.patternKeys,
@@ -335,7 +328,7 @@ export async function resolveCorridor(
         );
 
         const patternKeys = await getPatternKeysForStopKeys(db, allowedStopIds);
-        t = lap(`candidate patterns discovery, bbox fallback (${patternKeys.size} patterns)`, t);
+        lap(`candidate patterns discovery, bbox fallback (${patternKeys.size} patterns)`, t);
 
         result = {
             patternKeys,

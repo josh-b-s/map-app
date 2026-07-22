@@ -19,7 +19,7 @@
  * (defeating the point of pruning) or clipped real branching routes when a
  * valid path loops away from the straight line — geographically close isn't
  * the same as topologically related ("small world" problem). Instead, we now
- * run a coarse schedule-agnostic BFS (coarseGraph.ts / seedRouteBfs.ts) to
+ * run a coarse schedule-agnostic BFS (topologyGraph.ts / seedRouteBfs.ts) to
  * find the actual shape of plausible routes, then build a tapered buffer
  * around those seed paths (corridorTagging.ts) and use that as the loading
  * boundary. Same principle as before — the corridor is a DATA LOADING
@@ -35,20 +35,20 @@
  * The one exception is the `stops` table itself: it's read in FULL on every
  * single search (needed just to compute the corridor/nearest-stop seeds
  * before we even know which patterns are relevant), and it doesn't change
- * mid-session — same profile as coarseGraph.ts's cached graph. Measured at
+ * mid-session — same profile as topologyGraph.ts's cached graph. Measured at
  * ~700-1000ms per search regardless of trip length or corridor size, so
  * it's pure fixed overhead worth caching in-memory the same way. Call
  * invalidateStopsCache() (alongside invalidateCoarseGraphCache()) after a
  * GTFS feed update.
  */
 
-import type {LatLng} from './gtfsDb';
-import {getDb} from './gtfsDb';
-import {makeKey, parseKey} from './gtfsKeyUtil';
-import {haversineMeters} from './geoUtil';
-import {chunkedQuery, placeholders, SQL_CHUNK_SIZE} from './sqlChunkUtil';
-import {ORIGIN_DEST_WALK_RADIUS_M, resolveCorridor} from './corridorResolver';
-import type {CorridorBoundary} from './corridorTagging';
+import type {LatLng} from '../../db/sqliteDb';
+import {getDb} from '../../db/sqliteDb';
+import {makeKey, parseKey} from '../core/gtfsKeyUtil';
+import {haversineMeters} from '../../geo/geoUtil';
+import {chunkedQuery, placeholders, SQL_CHUNK_SIZE} from '../../db/sqlChunkUtil';
+import {ORIGIN_DEST_WALK_RADIUS_M, resolveCorridor} from '../corridor/corridorResolver';
+import type {CorridorBoundary} from '../corridor/corridorTagging';
 import {
     INITIAL_WINDOW_MAX_SEC,
     INITIAL_WINDOW_MIN_SEC,
@@ -56,10 +56,10 @@ import {
     WINDOW_DISTANCE_BUFFER_SEC,
     WINDOW_DISTANCE_SCALE_SEC_PER_KM,
     WINDOW_WIDENING_STAGES_SEC,
-} from './routingSettings';
+} from '@/services/gtfs/config/routingSettings';
 import {
     getAllPatternKeys,
-    getAllStopsCached as repoGetAllStopsCached,
+    getAllStopsCached,
     getPatternStopsForPatternKeys,
     getShapePointsForShapeIds,
     getStopKeysForPks,
@@ -69,15 +69,17 @@ import {
     patternKeyFor,
     patternPkFromKey,
     type RepoPatternStop,
-} from './gtfsRepo';
+} from '../core/gtfsRepo';
 
-/** Re-exported for backward compatibility — the actual cache now lives in
- *  gtfsRepo.ts (shared with coarseGraph.ts, which used to run its own
- *  separate, un-cached copy of the same stops query). */
-export async function getAllStopsCached(db: Awaited<ReturnType<typeof getDb>>): Promise<StopInfo[]> {
-    return repoGetAllStopsCached(db);
-}
-
+// getAllStopsCached now comes straight from gtfs/core/gtfsRepo.ts (config
+// with topologyGraph.ts, which used to run its own separate, un-cached copy
+// of the same stops query) — new call sites should import it from
+// gtfsRepo.ts directly, not through gtfsLoader.ts.
+//
+// invalidateStopsCache is kept as a re-export here purely for existing
+// external callers (e.g. a feed-update/download screen elsewhere in the
+// app) that still import it via gtfsLoader.ts — point any NEW callers at
+// gtfsRepo.ts's invalidateGtfsRepoCaches directly instead.
 export {invalidateGtfsRepoCaches as invalidateStopsCache};
 
 export interface StopInfo {
@@ -120,9 +122,9 @@ export interface GtfsIndex {
      *  alongside corridorResolver.ts/corridorTagging.ts to close a
      *  cross-agency stop_id collision risk; see ResolvedCorridor's doc
      *  comment in corridorResolver.ts). Computed once here by gtfsLoader.ts
-     *  and shared with gtfsRouter.ts so the two stages agree on a single
+     *  and config with raptorRouter.ts so the two stages agree on a single
      *  corridor shape instead of each computing (and potentially
-     *  disagreeing on) their own filter. gtfsRouter.ts's stop filters must
+     *  disagreeing on) their own filter. raptorRouter.ts's stop filters must
      *  use makeKey(s.agency, s.stop_id) against this set, not s.stop_id
      *  alone. */
     corridorStopIds: Set<string>;
@@ -245,8 +247,7 @@ export async function loadGtfsIndexForTrip(
         // the real algorithm. Never set by a real search caller
         // (computeGtfsRoute never passes it); exists purely as a same-
         // codepath comparison baseline.
-        const allPatternKeys = await getAllPatternKeys(db);
-        candidatePatternKeys = allPatternKeys;
+        candidatePatternKeys = await getAllPatternKeys(db);
         allowedStopIds = new Set(allStops.map(s => makeKey(s.agency, s.stop_id)));
         t = lap(`corridor scoping SKIPPED (benchmark mode) — using full network ` +
             `(${candidatePatternKeys.size} patterns, ${allowedStopIds.size} stops)`, t);
@@ -538,7 +539,7 @@ export async function loadGtfsIndexForTrip(
     // filtered), so joining against it directly (rather than the broader
     // candidatePatternKeys) prunes as much as possible before any row ever
     // reaches JS. Repopulated fresh each search (temp tables persist on the
-    // shared db connection across calls, so must be cleared, not just
+    // config db connection across calls, so must be cleared, not just
     // created) — cheap relative to what it saves, and the table itself
     // never needs to survive past this one loadGtfsIndexForTrip() call.
     // A single INTEGER trip_pk column now — no more (trip_id,agency) pair
@@ -583,7 +584,7 @@ export async function loadGtfsIndexForTrip(
     // though service exists). 150s/km (not straight-line speed) plus a flat
     // 45min buffer is a deliberately generous estimate that bakes in
     // transfer wait time, not just in-vehicle travel time. Even so, this is
-    // an estimate — computeGtfsRoute in gtfsRouter.ts retries with
+    // an estimate — computeGtfsRoute in raptorRouter.ts retries with
     // forceWindowSec if RAPTOR fails to reach the destination despite
     // trips existing, which is the real safety net.
     // See routingSettings.ts for WINDOW_DISTANCE_SCALE_SEC_PER_KM /
@@ -715,7 +716,7 @@ export async function loadGtfsIndexForTrip(
         stopTimesByStopAndTrip.get(stopKey)!.set(tripInfo.trip_id, entry);
     }
     for (const arr of stopTimesByStop.values()) arr.sort((a, b) => a.departure_sec - b.departure_sec);
-    t = lap('stop_times filter + sort + trip-index build', t);
+    lap('stop_times filter + sort + trip-index build', t);
 
     // ── 9. Shapes — deferred, NOT loaded here ──────────────────────────────
     // Shape polylines are a pure rendering concern: RAPTOR itself never reads
@@ -740,7 +741,7 @@ export async function loadGtfsIndexForTrip(
 
 /**
  * Loads shape polylines for a specific, small set of shape_ids — the
- * counterpart to the deferred step 9 above. Callers (gtfsRouter.ts) should
+ * counterpart to the deferred step 9 above. Callers (raptorRouter.ts) should
  * collect the shape_ids actually used by the journeys they're keeping
  * (typically a handful, after Pareto filtering) and call this once, rather
  * than gtfsLoader eagerly loading shapes for every candidate pattern.

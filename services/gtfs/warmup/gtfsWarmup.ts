@@ -15,7 +15,7 @@
  * Covers everything that's reasonably prefetchable without knowing the
  * user's actual origin/destination yet:
  *   - stops table (29K rows) -> gtfsLoader's stopsCache
- *   - coarse graph (2M edges) -> coarseGraph.ts's in-memory `cache`
+ *   - coarse graph (2M edges) -> topologyGraph.ts's in-memory `cache`
  * Deliberately does NOT try to prefetch anything origin/destination-scoped
  * (corridor, candidate patterns, stop_times) — those depend on where the
  * user is actually going and can't be usefully guessed at app launch.
@@ -28,9 +28,9 @@
  * just awaits the same in-flight promise instead of triggering a second load.
  */
 
-import {getDb, isDbReady} from './gtfsDb';
-import {getAllStopsCached} from './gtfsLoader';
-import {getCoarseGraph} from './coarseGraph';
+import {getDb, isDbReady} from '../../db/sqliteDb';
+import {getAllStopsCached} from '../core/gtfsRepo';
+import {getCoarseGraph} from '../graph/topologyGraph';
 
 let warmedUp = false;
 

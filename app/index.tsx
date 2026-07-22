@@ -1,26 +1,26 @@
 import React, { useEffect, useRef } from 'react';
-import MapView, { Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
-import { ActivityIndicator, Keyboard, StyleSheet, View } from 'react-native';
+import MapView, { LatLng, Polyline, PROVIDER_GOOGLE} from 'react-native-maps';
+import {ActivityIndicator, Keyboard, StyleSheet, View} from 'react-native';
 import * as Location from 'expo-location';
-import { useSelector } from 'react-redux';
-import { RootState } from '@/store/store';
-import { BottomSheetModal } from '@gorhom/bottom-sheet';
-import { useSharedValue } from 'react-native-reanimated';
-import { useColorScheme } from 'nativewind';
+import {useSelector} from 'react-redux';
+import {RootState} from '@/store/store';
+import {BottomSheetModal} from '@gorhom/bottom-sheet';
+import {useSharedValue} from 'react-native-reanimated';
+import {useColorScheme} from 'nativewind';
 
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 import DebugMapOverlay from '@/components/DebugMapOverlay';
 import DebugControls from '@/components/DebugControls';
-import { MAP_STYLE_DARK } from '@/constants/themes';
-import { useGoToUserLocation } from '../hooks/goToUserLocation';
+import {MAP_STYLE_DARK} from '@/constants/themes';
+import {useGoToUserLocation} from '../hooks/goToUserLocation';
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
     const modalRef = useRef<BottomSheetModal>(null);
     const bottomSheetPosition = useSharedValue(1000);
-    const { colorScheme } = useColorScheme();
+    const {colorScheme} = useColorScheme();
 
     const userLocation = useSelector((s: RootState) => s.location.userLocation);
     const routeCoords = useSelector((s: RootState) => s.route.coords);
@@ -46,7 +46,7 @@ export default function Index() {
 
         if (routeCoords.length > 1) {
             mapRef.current?.fitToCoordinates(routeCoords, {
-                edgePadding: { top: 80, right: 60, bottom: 300, left: 60 },
+                edgePadding: {top: 80, right: 60, bottom: 300, left: 60},
                 animated: true,
             });
         } else {
@@ -64,8 +64,8 @@ export default function Index() {
     }, [routeCoords]);
 
     return (
-        <View style={{ flex: 1 }}>
-            <Search />
+        <View style={{flex: 1}}>
+            <Search/>
 
             <MapView
                 ref={mapRef}

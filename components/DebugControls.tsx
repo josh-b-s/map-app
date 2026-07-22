@@ -6,10 +6,11 @@ import { AppDispatch, RootState } from '@/store/store';
 import { advanceStep, BFS_REVEAL_STEPS, CORRIDOR_CHUNK_COUNT, DebugPhase, retreatStep, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 import * as FileSystem from 'expo-file-system/legacy';
-import { getOrCreateDbForImport } from '@/services/gtfsDb';
-import { ensureImportFolders, INCOMING_DIR } from '@/services/gtfsImporter';
-import { runRustImport } from '@/services/rustGtfsImporter';
-import { runInsertBenchmark } from '@/services/gtfsInsertBenchmark';
+import {ensureImportFolders, INCOMING_DIR} from "@/services/gtfs/import/gtfsImporterLegacy";
+import {getOrCreateDbForImport} from "@/services/db/sqliteDb";
+import {runInsertBenchmark} from "@/services/gtfs/import/gtfsInsertBenchmark";
+import {runRustImport} from "@/services/gtfs/import/rustGtfsImporter";
+
 
 const PHASE_LABELS: Record<DebugPhase, string> = {
     bfs:      'BFS exploring',

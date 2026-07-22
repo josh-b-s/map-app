@@ -1,22 +1,22 @@
 /**
- * sqlChunkUtil.ts — chunked-IN-query helper, shared by any module that needs
+ * sqlChunkUtil.ts — chunked-IN-query helper, config by any module that needs
  * to query SQLite with an ID list that can exceed its bound-parameter cap.
  *
  * Previously defined only inside gtfsLoader.ts. Pulled out because
  * corridorResolver.ts now needs the identical helper (fetching pattern_stops
  * for a candidate pattern list) and gtfsLoader.ts importing it FROM
  * corridorResolver.ts (or vice versa) would create a circular dependency —
- * this is the shared leaf both sit on top of.
+ * this is the config leaf both sit on top of.
  */
 
 /**
- * Minimal DB shape shared by any module that only needs a structural
+ * Minimal DB shape config by any module that only needs a structural
  * subset of gtfsDb's SQLiteDatabase (avoids a concrete dependency on that
  * class, which would be a layering inversion for higher-level modules like
  * corridorResolver.ts/corridorTagging.ts). Previously corridorResolver.ts
  * and corridorTagging.ts each declared their own copy of this (with
  * corridorTagging.ts's version only exposing getAllAsync) — kept here
- * instead, alongside chunkedQuery, since this is already the shared leaf
+ * instead, alongside chunkedQuery, since this is already the config leaf
  * both corridor files sit on top of.
  */
 export interface QueryableDb {
