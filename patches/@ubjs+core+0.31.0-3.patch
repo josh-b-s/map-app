@@ -1,0 +1,17 @@
+diff --git a/node_modules/@ubjs/core/dist/esm/objects.js b/node_modules/@ubjs/core/dist/esm/objects.js
+index bf316c6..b957dcf 100644
+--- a/node_modules/@ubjs/core/dist/esm/objects.js
++++ b/node_modules/@ubjs/core/dist/esm/objects.js
+@@ -74,6 +74,12 @@ export class FfiConverterObjectWithCallbacks extends FfiConverterObject {
+         }
+         return this.handleMap.insert(value);
+     }
++    write(value, into) {
++        const handle = this.factory.isConcreteType(value)
++            ? this.factory.clonePointer(value)
++            : this.handleMap.insert(value);
++        pointerConverter.write(handle, into);
++    }
+     lift(value) {
+         if (this.handleMap.has(value)) {
+             return this.handleMap.get(value);

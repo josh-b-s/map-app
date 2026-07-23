@@ -28,5 +28,8 @@
       "release-it"
     ],
     "version": "0.63.0"
+  },
+  "dependencies": {
+    "@ubjs/core": "^0.31.0-3"
   }
 }

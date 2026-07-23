@@ -19,7 +19,7 @@ import type {
     RouteSegment,
     WALK_SPEED_MPS,
 } from './raptorRouter'; // reuse your existing TS types so both paths are interchangeable
-import { DebugSinkCollector } from './debugSinkCollector';
+import { createDebugSinkCollector } from './debugSinkCollector';
 import { DB_PATH } from '@/services/db/sqliteDb';
 
 const { GtfsRouterEngine } = gtfsRouterRust.gtfs_router;
@@ -150,7 +150,7 @@ export async function computeGtfsRouteNative(
     const departSecOfDay =
         today.getHours() * 3600 + today.getMinutes() * 60 + today.getSeconds();
 
-    const collector = debugMode ? new DebugSinkCollector() : null;
+    const collector = debugMode ? createDebugSinkCollector() : null;
 
     try {
         const result: RouteResult = eng.computeRoute(
@@ -162,7 +162,7 @@ export async function computeGtfsRouteNative(
             toGtfsDateString(tomorrow),
             tomorrow.getDay(),
             walkingSpeedMps,
-            collector ?? undefined, // confirmed from the generated binding: FfiConverterOptional checks `=== undefined` for the None case; null instead throws "Cannot convert null value to object" trying to lower it as a real object
+            collector?.sink ?? undefined, // pass the plain-object `sink`, not the collector wrapper — see debugSinkCollector.ts's header note on classes vs plain-object callback interfaces. undefined (not null) confirmed correct for the None case from the generated binding's FfiConverterOptional.
         );
 
         // Diagnostic — mirrors gtfsLoader.ts's own per-stage console.log
@@ -177,7 +177,7 @@ export async function computeGtfsRouteNative(
 
         return {
             journeys: result.journeys.map(toJourney),
-            debug: collector?.toDebugInfo(),
+            debug: collector?.toDebugInfo(),  // unchanged — toDebugInfo lives on the wrapper, not the sink
         };
     } catch (err) {
         // RouterError variants come through here (e.g. NoServiceFound) — map to

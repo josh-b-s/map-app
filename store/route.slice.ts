@@ -36,6 +36,8 @@ export const computeRoute = createAsyncThunk<
         dispatch(setDebugData(debugMode ? (result.debug ?? null) : null));
         return result;
     } catch (err) {
+        console.error('[route.slice] computeRoute failed:', err);
+        if (err instanceof Error) console.error(err.stack);
         return rejectWithValue(String(err));
     }
 });
