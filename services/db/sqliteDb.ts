@@ -3,7 +3,10 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'gtfs.db';
 const DB_DIR = `${FileSystem.documentDirectory}SQLite/`;
-const DB_PATH = `${DB_DIR}${DB_NAME}`;
+// Exported so callers outside this file (gtfsRouterNative.ts's warm_up, which
+// opens its own independent rusqlite::Connection rather than sharing
+// op-sqlite's handle) can point the Rust engine at the exact same file.
+export const DB_PATH = `${DB_DIR}${DB_NAME}`;
 
 export async function isDbReady(): Promise<boolean> {
     const {exists} = await FileSystem.getInfoAsync(DB_PATH);

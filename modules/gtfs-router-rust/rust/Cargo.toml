@@ -1,0 +1,19 @@
+[package]
+name = "gtfs-router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+uniffi = { version = "0.30", features = ["cli"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "2"
+
+[build-dependencies]
+uniffi = { version = "0.30", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"

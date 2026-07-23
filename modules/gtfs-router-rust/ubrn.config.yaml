@@ -1,0 +1,7 @@
+name: gtfs-router-rust
+rust:
+  directory: rust
+android:
+  directory: android
+ios:
+  directory: ios

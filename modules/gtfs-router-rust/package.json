@@ -1,18 +1,18 @@
 {
-  "name": "@mapapp/gtfs-importer",
+  "name": "@mapapp/gtfs-router-rust",
   "version": "0.0.0",
-  "description": "gtfs importer",
-  "main": "src/index",
   "repository": {
     "type": "git",
     "url": "https://github.com/josh-b-s/map-app"
   },
+  "description": "raptor router",
+  "main": "src/index",
   "codegenConfig": {
-    "name": "GtfsImporterSpec",
+    "name": "GtfsRouterRustSpec",
     "type": "modules",
     "jsSrcsDir": "src",
     "android": {
-      "javaPackageName": "com.mapapp.gtfsimporter"
+      "javaPackageName": "com.mapapp.gtfsrouterrust"
     }
   },
   "author": " <> ()",
@@ -28,8 +28,5 @@
       "release-it"
     ],
     "version": "0.63.0"
-  },
-  "dependencies": {
-    "@ubjs/core": "^0.31.0-3"
   }
 }

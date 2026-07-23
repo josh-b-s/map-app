@@ -2,6 +2,10 @@
   "name": "mapapp",
   "main": "expo-router/entry",
   "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/josh-b-s/map-app"
+  },
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
@@ -10,8 +14,10 @@
     "preprocess-gtfs": "ts-node --project tsconfig.scripts.json scripts/preprocess-gtfs.ts",
     "postinstall": "patch-package",
     "prebuild": "npx expo prebuild",
-    "build:rust": "cd modules/gtfs-importer/rust && npx ubrn build android --and-generate",
-    "rebuild:android": "npm run build:rust && npx expo run:android"
+    "build:gtfs-importer": "cd modules/gtfs-importer/rust && npx ubrn build android --and-generate",
+    "build:gtfs-router-rust": "cd modules/gtfs-router-rust/rust && npx ubrn build android --and-generate",
+    "//": "run as npm run new-rust-module --name=my-module",
+    "new-rust-module": "npx create-react-native-library@latest modules/%npm_config_name% && rmdir /s /q modules\\%npm_config_name%\\.git"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -47,7 +53,8 @@
     "react-native-worklets": "0.5.1",
     "react-native-zip-archive": "^9.0.0",
     "react-redux": "^9.2.0",
-    "tailwindcss": "^3.4.19"
+    "tailwindcss": "^3.4.19",
+    "@mapapp/gtfs-router-rust": "file:modules/gtfs-router-rust"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",

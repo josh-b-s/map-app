@@ -1,7 +1,14 @@
 import { createAsyncThunk, createSlice, PayloadAction } from '@reduxjs/toolkit';
 import type { LatLng } from '@/services/places/places';
 import { computeGtfsRoute, GtfsRouteResult, GtfsJourney } from '@/services/gtfs/router/raptorRouter';
+import { computeGtfsRouteNative } from '@/services/gtfs/router/gtfsRouterNative';
 import { setDebugData } from './debug.slice';
+
+// Flip to compare the Rust engine against the existing TS/op-sqlite path —
+// both are called with the exact same args and return the exact same
+// GtfsRouteResult/GtfsJourney shape, so nothing downstream needs to change
+// either way.
+const USE_NATIVE_ROUTER = true;
 
 export const computeRoute = createAsyncThunk<
     GtfsRouteResult,
@@ -19,7 +26,9 @@ export const computeRoute = createAsyncThunk<
     { rejectValue: string }
 >('route/compute', async ({ origin, destination, debugMode = false, departureTime, walkingSpeedMps }, { rejectWithValue, dispatch }) => {
     try {
-        const result = await computeGtfsRoute(origin, destination, departureTime, walkingSpeedMps, debugMode);
+        const result = USE_NATIVE_ROUTER
+            ? await computeGtfsRouteNative(origin, destination, departureTime, walkingSpeedMps, debugMode)
+            : await computeGtfsRoute(origin, destination, departureTime, walkingSpeedMps, debugMode);
         // Dispatched here (inside the thunk) rather than via route.slice's own
         // extraReducers, since debug data belongs in debug.slice, not route
         // state — this keeps "what journey is displayed" and "what did the

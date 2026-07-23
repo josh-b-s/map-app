@@ -10,6 +10,15 @@ import {ensureImportFolders, INCOMING_DIR} from "@/services/gtfs/import/gtfsImpo
 import {getOrCreateDbForImport} from "@/services/db/sqliteDb";
 import {runInsertBenchmark} from "@/services/gtfs/import/gtfsInsertBenchmark";
 import {runRustImport} from "@/services/gtfs/import/rustGtfsImporter";
+import {compareRouters} from "@/services/gtfs/router/routeCompare";
+
+// TEMPORARY hardcoded test pair for the "Compare routers" button below —
+// Flinders St Station -> Melbourne Central. Swap for whatever
+// location.slice/search.slice actually stores once you point me at it;
+// this is just so you can A/B test right now without wiring real search
+// state into the debug panel.
+const TEST_ORIGIN = {latitude: -37.8183, longitude: 144.9671};
+const TEST_DESTINATION = {latitude: -37.8103, longitude: 144.9628};
 
 
 const PHASE_LABELS: Record<DebugPhase, string> = {
@@ -109,6 +118,24 @@ export default function DebugControls() {
             setImportStatus(`Done. Estimated real import: ~${secs}s. Check console for per-stage detail.`);
         } catch (err) {
             setImportStatus(`Benchmark failed: ${String(err)}`);
+        } finally {
+            setImportBusy('idle');
+        }
+    }
+
+    async function handleCompareRouters() {
+        setImportBusy('benchmarking'); // reuses the same busy-state gating as the other buttons
+        setImportStatus('Comparing TS vs Rust routers…');
+        try {
+            const {tsMs, rustMs, tsResult, rustResult} = await compareRouters(TEST_ORIGIN, TEST_DESTINATION);
+            const speedup = (tsMs / rustMs).toFixed(2);
+            setImportStatus(
+                `TS: ${tsMs.toFixed(0)}ms (${tsResult.journeys.length}j) | ` +
+                `Rust: ${rustMs.toFixed(0)}ms (${rustResult.journeys.length}j) | ` +
+                `${speedup}x. Full detail in console.`
+            );
+        } catch (err) {
+            setImportStatus(`Compare failed: ${String(err)}`);
         } finally {
             setImportBusy('idle');
         }
@@ -228,6 +255,13 @@ export default function DebugControls() {
                             onPress={handleRunImport}
                         >
                             <Ionicons name="download-outline" size={18} color={theme.color} />
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                            className="p-1.5"
+                            disabled={importBusy !== 'idle'}
+                            onPress={handleCompareRouters}
+                        >
+                            <Ionicons name="git-compare-outline" size={18} color={theme.color} />
                         </TouchableOpacity>
                         {importBusy !== 'idle' && (
                             <Text style={{ color: theme.color, fontSize: 11 }}>{importBusy}…</Text>

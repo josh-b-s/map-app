@@ -16,6 +16,13 @@
  * user's actual origin/destination yet:
  *   - stops table (29K rows) -> gtfsLoader's stopsCache
  *   - coarse graph (2M edges) -> topologyGraph.ts's in-memory `cache`
+ *   - Rust engine's own warm_up() (persisted coarse graph + caches on its
+ *     side) -> gtfsRouterNative.ts's engine singleton, IF the native path
+ *     is enabled (see USE_NATIVE_ROUTER below). Runs alongside the TS
+ *     warmup rather than instead of it, so route.slice.ts's
+ *     USE_NATIVE_ROUTER flag can flip between paths without also needing
+ *     this file changed — whichever path a search actually uses will
+ *     already be warm.
  * Deliberately does NOT try to prefetch anything origin/destination-scoped
  * (corridor, candidate patterns, stop_times) — those depend on where the
  * user is actually going and can't be usefully guessed at app launch.
@@ -28,9 +35,10 @@
  * just awaits the same in-flight promise instead of triggering a second load.
  */
 
-import {getDb, isDbReady} from '../../db/sqliteDb';
+import {getDb, isDbReady, DB_PATH} from '../../db/sqliteDb';
 import {getAllStopsCached} from '../core/gtfsRepo';
 import {getCoarseGraph} from '../graph/topologyGraph';
+import {getNativeEngine} from '../router/gtfsRouterNative'; // TODO: verify this path — I'm guessing it lives next to raptorRouter.ts based on the README's file map, adjust to wherever you actually put it
 
 let warmedUp = false;
 
@@ -65,6 +73,27 @@ export async function warmUpGtfsEngine(): Promise<void> {
         // for every subsequent call this session, same as stopsCache above.
         await getCoarseGraph();
         console.log(`[gtfsWarmup] coarseGraph warmed: ${Date.now() - t0}ms total`);
+
+        // Rust engine's own warm_up(): opens ITS OWN rusqlite::Connection
+        // against the same on-disk file (DB_PATH) — this is not sharing
+        // op-sqlite's handle above, it's a second, independent connection,
+        // per op-sqlite's own "one connection per db" caution being about
+        // op-sqlite specifically, not the file itself. warm_up() persists/
+        // loads the coarse graph into its own new tables
+        // (rust_coarse_graph_meta/adjacency — see the rust crate's
+        // graph/store.rs) and keeps everything alive for the engine's
+        // lifetime, mirroring what getCoarseGraph() above does for the TS
+        // path. Runs unconditionally (not gated on a native/TS flag) since
+        // it's cheap to skip if unused and keeps this file oblivious to
+        // which path route.slice.ts is currently set to.
+        try {
+            getNativeEngine(DB_PATH); // warms up + records warmedUpPath so the first real search's own getEngine(DB_PATH) call is a no-op
+            console.log(`[gtfsWarmup] native engine warmed: ${Date.now() - t0}ms total`);
+        } catch (nativeErr) {
+            // Non-fatal on its own — if the native path isn't in use this
+            // session, this failing shouldn't affect the TS path at all.
+            console.warn('[gtfsWarmup] native engine warmup failed (non-fatal):', nativeErr);
+        }
 
         // NOTE: an earlier version of this warmup also ran COUNT(*) against
         // trips/patterns/pattern_stops/stop_times to pre-fault their disk
