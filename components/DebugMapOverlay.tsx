@@ -2,9 +2,14 @@ import React, { useMemo } from 'react';
 import { Polygon, Polyline, Circle, LatLng as MapLatLng } from 'react-native-maps';
 import { useSelector } from 'react-redux';
 import { RootState } from '@/store/store';
-import { CORRIDOR_CHUNK_COUNT, BFS_REVEAL_STEPS, MAX_BFS_DEBUG_EDGES } from '@/store/debug.slice';
+import { CORRIDOR_CHUNK_COUNT, MAX_BFS_DEBUG_POINTS } from '@/store/debug.slice';
+import { getBfsDiscoveryPoints, keyOfPt } from '@/services/gtfs/debug/debugBfsPoints';
 
 const BFS_FRONTIER_COLOR = '#3b82f6';
+// Amber — deliberately far from BFS_FRONTIER_COLOR's blue and RAPTOR_COLOR's
+// red, so a "found route" pop reads instantly against whichever phase it
+// appears in. Thicker stroke (see usage below) does the rest of the work.
+const BFS_CANDIDATE_COLOR = '#f59e0b';
 const CORRIDOR_COLOR = 'rgba(148, 163, 184, 0.5)';
 const CORRIDOR_STROKE = 'rgba(148, 163, 184, 0.9)';
 const RAPTOR_COLOR = '#ef4444';
@@ -12,72 +17,9 @@ const RAPTOR_COLOR = '#ef4444';
 type Pt = { latitude: number; longitude: number };
 
 /**
- * Merges a set of tree edges (parent -> child pairs) into the SMALLEST
- * number of continuous polylines that still draw every edge exactly once.
- * This is the "web" alternative to both the original per-stop Circles and
- * the convex-hull Polygon: instead of approximating the frontier's shape,
- * it draws the actual connections BFS discovered — but merged along
- * branches so a deep, mostly-linear exploration (a long single branch with
- * occasional forks) still costs only a handful of native Polyline objects,
- * not one per edge.
- *
- * How it works: build an adjacency map from the edge list, then repeatedly
- * walk from any not-yet-visited node along its unvisited outgoing edges,
- * extending the current chain until every reachable unused edge from the
- * current node is exhausted, then start a new chain from the next
- * unvisited edge. A tree with B "leaf branches" produces at most B chains
- * — far fewer than the total edge count for a typical BFS tree shape (a
- * handful of deep branches, not one edge fanning out independently).
- */
-function mergeEdgesIntoChains(edges: { from: Pt; to: Pt }[]): Pt[][] {
-    if (edges.length === 0) return [];
-
-    const keyOf = (p: Pt) => `${p.latitude.toFixed(6)},${p.longitude.toFixed(6)}`;
-
-    const adjacency = new Map<string, { point: Pt; neighbor: string; edgeId: number }[]>();
-    const pointByKey = new Map<string, Pt>();
-    edges.forEach((e, i) => {
-        const fromKey = keyOf(e.from);
-        const toKey = keyOf(e.to);
-        pointByKey.set(fromKey, e.from);
-        pointByKey.set(toKey, e.to);
-        if (!adjacency.has(fromKey)) adjacency.set(fromKey, []);
-        if (!adjacency.has(toKey)) adjacency.set(toKey, []);
-        adjacency.get(fromKey)!.push({ point: e.to, neighbor: toKey, edgeId: i });
-        adjacency.get(toKey)!.push({ point: e.from, neighbor: fromKey, edgeId: i });
-    });
-
-    const usedEdges = new Set<number>();
-    const chains: Pt[][] = [];
-
-    for (const [startKey, startPoint] of pointByKey) {
-        let current = startKey;
-        let currentPoint = startPoint;
-        const chain: Pt[] = [];
-        let extended = false;
-
-        while (true) {
-            const options = (adjacency.get(current) ?? []).filter(o => !usedEdges.has(o.edgeId));
-            if (options.length === 0) break;
-            const next = options[0];
-            usedEdges.add(next.edgeId);
-            if (chain.length === 0) chain.push(currentPoint);
-            chain.push(next.point);
-            current = next.neighbor;
-            currentPoint = next.point;
-            extended = true;
-        }
-
-        if (extended) chains.push(chain);
-    }
-
-    return chains;
-}
-
-/**
  * Minimal convex hull (monotone chain / Andrew's algorithm) over a small
- * set of lat/lon points. Used to render a BFS/RAPTOR frontier as ONE
- * polygon instead of one Circle per stop.
+ * set of lat/lon points. Used to render a RAPTOR frontier as ONE polygon
+ * instead of one Circle per stop.
  *
  * Why this replaces the old per-stop Circle rendering: react-native-maps
  * backs every <Circle> with a real native Google Maps object, so N stops
@@ -131,8 +73,12 @@ function convexHull(points: Pt[]): Pt[] {
 /**
  * Renders the CURRENT active unit of the last debug-mode search — not a
  * cumulative replay. Each phase shows only what's happening right now:
- *  - bfs: hull outline of the current level's frontier (the "active leg"
- *    being explored)
+ *  - bfs: a single continuous polyline through discovery order (see
+ *    debugBfsPoints.ts), revealed one real point at a time at
+ *    BFS_STEP_INTERVAL_MS (~30fps by default) — reads as "watch it explore
+ *    in the order it actually happened." Any seed path whose destination
+ *    stop has already been reached gets drawn on top, thicker and in
+ *    amber, as an emphasized "candidate route found" overlay.
  *  - seed: the settled seed paths (single-shot, these ARE the result)
  *  - corridor: the tapered-buffer shape assembling in chunks, one more
  *    seed path's boundary revealed per step
@@ -144,43 +90,46 @@ function convexHull(points: Pt[]): Pt[] {
 export default function DebugMapOverlay() {
     const { enabled, data, phase, stepIndex } = useSelector((s: RootState) => s.debug);
 
-    // Hulls only need recomputing when the underlying data or step changes,
-    // not on every unrelated re-render (e.g. map pan/zoom triggering a
-    // parent re-render) — cheap to compute (frontier sets are small), but
-    // no reason to redo it needlessly.
-    // BFS "web" — reveals bfsTreeEdges (already in true discovery order —
-    // see seedRouteBfs.ts) progressively in small batches, instead of
-    // jumping a whole level at a time. This is what makes the playback
-    // read as "watch it explore in the order it actually happened" rather
-    // than "frontier teleports outward in big jumps."
+    // Recomputed only when the underlying data or step changes, not on every
+    // unrelated re-render (e.g. map pan/zoom triggering a parent re-render).
     //
-    // CRASH NOTE: a prior version of this used ALL of a level's edges
-    // unconditionally, which — combined with this app's per-pattern CLIQUE
-    // coarse-graph edges and multi-parent BFS tracking — could produce a
-    // large, densely-branched edge set that mergeEdgesIntoChains can't
-    // collapse into few chains (a bushy tree merges into MANY short chains,
-    // not a few long ones). That produced enough native Polyline objects to
-    // OOM the native Google Maps GL rendering thread. MAX_BFS_DEBUG_EDGES
-    // below is a hard, evenly-sampled cap applied BEFORE merging, so the
-    // worst-case native object count is bounded regardless of how bushy any
-    // particular search's tree turns out to be.
-    const bfsChains = useMemo(() => {
+    // Single continuous polyline through BFS discovery order, instead of the
+    // old merged-chain-of-edges approach — a lot simpler, and since a
+    // Polyline is ONE native object regardless of point count, chain-merging
+    // was solving a problem (native object count) that a single polyline
+    // doesn't have in the first place. MAX_BFS_DEBUG_POINTS below is just a
+    // sane ceiling on coordinate-array/bridge payload size for a very large
+    // exploration, not a correctness requirement.
+    //
+    // candidates: any seedPath whose destination stop's key is already
+    // among the revealed BFS points — i.e. "BFS just reached the far end of
+    // a real route," rendered as an emphasized overlay so a found candidate
+    // visibly pops against the still-exploring line around it.
+    const bfsReveal = useMemo(() => {
         if (!data || phase !== 'bfs') return null;
-        const allEdges = data.bfsTreeEdges ?? [];
-        if (allEdges.length === 0) return [];
+        const allPoints = getBfsDiscoveryPoints(data);
+        if (allPoints.length === 0) return { points: [] as Pt[], candidates: [] as Pt[][] };
 
-        const chunkSize = Math.ceil(allEdges.length / BFS_REVEAL_STEPS) || 1;
-        const revealCount = Math.min(allEdges.length, (stepIndex + 1) * chunkSize);
-        let edgesToRender = allEdges.slice(0, revealCount);
+        const revealCount = Math.min(allPoints.length, stepIndex + 1);
+        let points = allPoints.slice(0, revealCount);
 
-        if (edgesToRender.length > MAX_BFS_DEBUG_EDGES) {
-            const stride = edgesToRender.length / MAX_BFS_DEBUG_EDGES;
-            const sampled: typeof edgesToRender = [];
-            for (let i = 0; i < MAX_BFS_DEBUG_EDGES; i++) sampled.push(edgesToRender[Math.floor(i * stride)]);
-            edgesToRender = sampled;
+        if (points.length > MAX_BFS_DEBUG_POINTS) {
+            const stride = points.length / MAX_BFS_DEBUG_POINTS;
+            const sampled: Pt[] = [];
+            for (let i = 0; i < MAX_BFS_DEBUG_POINTS; i++) sampled.push(points[Math.floor(i * stride)]);
+            // Keep the true leading edge exact — don't let sampling lag behind
+            // where discovery has actually reached.
+            sampled[sampled.length - 1] = points[points.length - 1];
+            points = sampled;
         }
 
-        return mergeEdgesIntoChains(edgesToRender);
+        const revealedKeys = new Set(allPoints.slice(0, revealCount).map(keyOfPt));
+        const candidates = (data.seedPaths ?? []).filter(path => {
+            const dest = path[path.length - 1];
+            return dest && path.length > 1 && revealedKeys.has(keyOfPt(dest));
+        });
+
+        return { points, candidates };
     }, [data, phase, stepIndex]);
 
     const raptorHull = useMemo(() => {
@@ -192,13 +141,24 @@ export default function DebugMapOverlay() {
 
     return (
         <>
-            {phase === 'bfs' && bfsChains && bfsChains.map((chain, i) => (
-                chain.length >= 2 && (
+            {phase === 'bfs' && bfsReveal && bfsReveal.points.length >= 2 && (
+                <Polyline
+                    coordinates={bfsReveal.points as MapLatLng[]}
+                    strokeWidth={2}
+                    strokeColor={BFS_FRONTIER_COLOR}
+                />
+            )}
+
+            {/* A candidate route "pops" the moment BFS reaches its destination
+                stop — drawn thicker and in amber so it visibly stands out from
+                the still-exploring blue line around it. */}
+            {phase === 'bfs' && bfsReveal?.candidates.map((path, i) => (
+                path.length >= 2 && (
                     <Polyline
-                        key={`bfs-${i}`}
-                        coordinates={chain as MapLatLng[]}
-                        strokeWidth={2}
-                        strokeColor={BFS_FRONTIER_COLOR}
+                        key={`bfs-candidate-${i}`}
+                        coordinates={path as MapLatLng[]}
+                        strokeWidth={4}
+                        strokeColor={BFS_CANDIDATE_COLOR}
                     />
                 )
             ))}

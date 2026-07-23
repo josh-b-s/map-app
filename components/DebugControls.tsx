@@ -3,7 +3,8 @@ import { Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
-import { advanceStep, BFS_REVEAL_STEPS, CORRIDOR_CHUNK_COUNT, DebugPhase, retreatStep, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
+import { advanceStep, BFS_STEP_INTERVAL_MS, CORRIDOR_CHUNK_COUNT, DebugPhase, retreatStep, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
+import { getBfsDiscoveryPoints } from '@/services/gtfs/debug/debugBfsPoints';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 import * as FileSystem from 'expo-file-system/legacy';
 import {ensureImportFolders, INCOMING_DIR} from "@/services/gtfs/import/gtfsImporterLegacy";
@@ -28,6 +29,10 @@ const PHASE_LABELS: Record<DebugPhase, string> = {
     raptor:   'RAPTOR',
 };
 
+// Step interval for phases OTHER than 'bfs' (seed/corridor/raptor are chunk
+// reveals, not a real animation, so a slower human-watchable pace reads
+// better than a fast blur there). 'bfs' uses BFS_STEP_INTERVAL_MS
+// (~30fps, from debug.slice.ts) instead — see the auto-advance effect below.
 const STEP_INTERVAL_MS = 300;
 
 // A rough guess is fine here — only used to label the benchmark's
@@ -168,18 +173,25 @@ export default function DebugControls() {
     // interval while playing=true. advanceStep itself sets playing=false
     // when it runs out of steps, which naturally clears this effect's
     // interval on the next render.
+    //
+    // BFS gets its own, much faster interval (BFS_STEP_INTERVAL_MS, ~30fps)
+    // since it now reveals one real discovered point per step rather than a
+    // fixed number of artificial chunks — at the old 300ms/step pace a large
+    // exploration would take far too long to play through. Other phases
+    // keep the slower, human-watchable STEP_INTERVAL_MS.
     useEffect(() => {
         if (!playing) return;
-        const id = setInterval(() => dispatch(advanceStep()), STEP_INTERVAL_MS);
+        const intervalMs = phase === 'bfs' ? BFS_STEP_INTERVAL_MS : STEP_INTERVAL_MS;
+        const id = setInterval(() => dispatch(advanceStep()), intervalMs);
         return () => clearInterval(id);
-    }, [playing, dispatch]);
+    }, [playing, dispatch, phase]);
 
     const hasData = !!data;
-    // "BFS exploring" no longer maps to a real level count — it's now a
-    // fixed number of reveal-chunks over bfsTreeEdges in true discovery
-    // order (see debug.slice.ts's BFS_REVEAL_STEPS), so the label shows
-    // reveal progress rather than a level number.
-    const stepLabel = phase === 'bfs' ? `Exploring ${stepIndex + 1}/${BFS_REVEAL_STEPS}`
+    // "BFS exploring" now reveals real discovered points (see
+    // debugBfsPoints.ts) rather than a fixed number of chunks, so the label
+    // shows progress against the true point count for this search.
+    const bfsTotal = data ? getBfsDiscoveryPoints(data).length : 0;
+    const stepLabel = phase === 'bfs' ? `Exploring ${stepIndex + 1}/${Math.max(1, bfsTotal)}`
         : phase === 'raptor' ? `Round ${stepIndex}/${Math.max(0, (data?.roundMarkedStops.length ?? 1) - 1)}`
             : phase === 'corridor' ? `Chunk ${stepIndex + 1}/${CORRIDOR_CHUNK_COUNT}`
                 : PHASE_LABELS[phase];

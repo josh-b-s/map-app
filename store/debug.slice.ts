@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 import {GtfsDebugInfo} from "@/services/gtfs/router/raptorRouter";
+import { getBfsDiscoveryPoints } from '@/services/gtfs/debug/debugBfsPoints';
 
 
 export type DebugPhase = 'bfs' | 'seed' | 'corridor' | 'raptor';
@@ -12,40 +13,28 @@ const PHASE_ORDER: DebugPhase[] = ['bfs', 'seed', 'corridor', 'raptor'];
 // one more chunk of corridor stops.
 export const CORRIDOR_CHUNK_COUNT = 10;
 
-// BFS used to reveal one whole LEVEL per step (all of a level's frontier
-// appearing at once) — jarring for a big level, and doesn't read as "watch
-// it explore in the order it actually happened," which is what a debug viz
-// is for. This instead reveals bfsTreeEdges (already in true discovery
-// order — see seedRouteBfs.ts) progressively, in small batches, the same
-// artificial-chunking idea CORRIDOR_CHUNK_COUNT already uses one line up.
-export const BFS_REVEAL_STEPS = 40;
+// Target playback rate for the BFS "exploring" reveal. 30fps reads as
+// smooth on a map (30-60 native-bridge frame pushes/sec is already a lot
+// for react-native-maps) without the jitter of much lower rates; bump to
+// 60 (BFS_TARGET_FPS = 60) if it still looks choppy on target devices.
+// Other phases (seed/corridor/raptor) keep the slower STEP_INTERVAL_MS in
+// DebugControls.tsx — they're chunk reveals, not a real animation, so a
+// human-watchable pace reads better than a fast blur there.
+export const BFS_TARGET_FPS = 30;
+export const BFS_STEP_INTERVAL_MS = Math.round(1000 / BFS_TARGET_FPS);
 
-// Hard cap on the number of edges fed into DebugMapOverlay's chain-merge
-// per render. NOT a visual preference: mergeEdgesIntoChains reduces the
-// NUMBER of native Polyline objects only as far as the graph's actual
-// branching allows, and this app's coarse graph deliberately builds
-// per-pattern CLIQUE edges (topologyGraph.ts: "a busy interchange stop can
-// pick up hundreds of edges") plus seedRouteBfs.ts's multi-parent tracking
-// (every sibling route reaching a stop at the same level is kept) — so a
-// big corridor's BFS tree can be large AND densely branched, which is
-// exactly the shape that does NOT collapse into a few long chains. This
-// cap is what actually bounds worst-case native object count regardless of
-// how well any one search's tree happens to merge; a still-images crash
-// log (java.lang.OutOfMemoryError, GL-Map thread, heap already at
-// 190-191MB/192MB before failing a 56-byte allocation) confirmed this gap
-// existed once the old per-stop Circle rendering (and its matching
-// MAX_DEBUG_MARKERS cap) was replaced with unbounded merged Polylines.
-export const MAX_BFS_DEBUG_EDGES = 600;
+// Hard cap on points fed into a single BFS Polyline per render. No longer
+// a hard OOM boundary the way the old MAX_BFS_DEBUG_EDGES was (one
+// Polyline is one native object regardless of point count) — this is just
+// a sane ceiling on coordinate-array size/bridge payload for a very large
+// exploration.
+export const MAX_BFS_DEBUG_POINTS = 2000;
 
-// Hard cap on individually-rendered map markers (Circle) per debug step.
-// Still used by the corridor phase's walk-radius circles (always exactly
-// 2, well under this) and kept as the general reference cap for anything
-// that renders one native object per data point rather than merging into
-// lines — react-native-maps backs each Circle with a real native Google
-// Maps object, and rendering hundreds-to-thousands of them in one frame is
-// what caused the ORIGINAL OOM crash (corridor stops alone hit 1359,
-// RAPTOR rounds hit 2000-3000 marked stops in testing).
-export const MAX_DEBUG_MARKERS = 120;
+// NOTE: BFS_REVEAL_STEPS and MAX_BFS_DEBUG_EDGES (fixed-chunk BFS reveal)
+// have been removed. BFS now reveals one real discovered point per step
+// (see phaseLength below) at BFS_STEP_INTERVAL_MS, instead of chunking a
+// fixed number of artificial steps — so there's no separate "how many
+// chunks" constant needed here anymore.
 
 type State = {
     /** Master toggle. When false, computeRoute doesn't even ask
@@ -56,10 +45,10 @@ type State = {
     data: GtfsDebugInfo | null;
     /** Which stage of the search is currently being shown. */
     phase: DebugPhase;
-    /** Meaning depends on phase: reveal-chunk index (0..BFS_REVEAL_STEPS-1)
-     *  into bfsTreeEdges for 'bfs', index into roundMarkedStops for
-     *  'raptor', chunk index (0..CORRIDOR_CHUNK_COUNT-1) for 'corridor'.
-     *  Unused (stays 0) for 'seed', a single-shot reveal. */
+    /** Meaning depends on phase: index into BFS discovery-order points
+     *  (0..N-1, see debugBfsPoints.ts) for 'bfs', index into
+     *  roundMarkedStops for 'raptor', chunk index (0..CORRIDOR_CHUNK_COUNT-1)
+     *  for 'corridor'. Unused (stays 0) for 'seed', a single-shot reveal. */
     stepIndex: number;
     /** Whether DebugControls' auto-advance timer is currently running. */
     playing: boolean;
@@ -78,7 +67,7 @@ const initialState: State = {
  *  duplicated between the two. */
 function phaseLength(phase: DebugPhase, data: GtfsDebugInfo): number {
     switch (phase) {
-        case 'bfs':      return BFS_REVEAL_STEPS;
+        case 'bfs':      return Math.max(1, getBfsDiscoveryPoints(data).length);
         case 'raptor':   return Math.max(1, data.roundMarkedStops.length);
         case 'corridor': return CORRIDOR_CHUNK_COUNT;
         case 'seed':     return 1;
