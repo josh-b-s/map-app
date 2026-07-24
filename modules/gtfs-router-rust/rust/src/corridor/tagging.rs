@@ -9,6 +9,7 @@
 //!     parity but this is the rarely-hit path.
 
 use std::collections::HashSet;
+use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
@@ -194,6 +195,14 @@ pub struct SeedPathCorridorResult {
     pub level_frontiers: Vec<Vec<i64>>,
     pub bfs_tree_edges: Vec<(i64, i64)>,
     pub corridor_boundaries: Vec<CorridorBoundary>,
+    /// (label, elapsed_ms) breakdown of this function's own 3 stages —
+    /// previously only the WHOLE function was timed (as one lump,
+    /// "seed_path_bfs_and_tagging", by the caller), which couldn't say
+    /// whether the BFS itself, the debug-only boundary geometry, or the DB
+    /// pattern lookup was the actual cost driver. See resolve_corridor's
+    /// use of this — it now merges these into its own sub_timings instead
+    /// of (or alongside) the old single combined entry.
+    pub sub_timings: Vec<(String, i64)>,
 }
 
 pub fn compute_seed_path_corridor(
@@ -207,25 +216,42 @@ pub fn compute_seed_path_corridor(
     candidates: &[CorridorCandidate],
     max_transfers: u32,
 ) -> rusqlite::Result<SeedPathCorridorResult> {
+    let mut sub_timings: Vec<(String, i64)> = Vec::new();
+
+    let t = Instant::now();
     let seed = find_seed_paths(graph, origin_stop_pks, dest_stop_pks, max_transfers);
     let walk_radius = walk_radius_stop_pks(candidates, origin, destination);
+    sub_timings.push(("bfs".to_string(), t.elapsed().as_millis() as i64));
 
     if seed.paths.is_empty() {
         return Ok(SeedPathCorridorResult {
             pattern_pks: HashSet::new(), walk_radius_stop_pks: walk_radius, seed_path_count: 0,
             seed_paths: Vec::new(), level_frontiers: seed.level_frontiers, bfs_tree_edges: seed.tree_edges,
-            corridor_boundaries: Vec::new(),
+            corridor_boundaries: Vec::new(), sub_timings,
         });
     }
 
+    // Debug-visualization-only geometry (see this struct's own doc comment
+    // and DebugMapOverlay.tsx — routing never reads corridor_boundaries).
+    // Still computed unconditionally today, not gated behind whether this
+    // particular call wants debug output, because the result is cached by
+    // (origin, destination) in resolve_corridor's CorridorCache — gating it
+    // would mean a cache entry built from a non-debug search silently has
+    // no boundary data for a LATER debug-mode search to the same route. Not
+    // gating it costs this ms figure once per unique route (cache miss
+    // only), not per search — see the sub_timings entry to judge whether
+    // that's worth revisiting.
+    let t = Instant::now();
     let corridor_boundaries: Vec<CorridorBoundary> = seed.paths.iter()
         .map(|p| boundary_for_path(&path_to_polyline(stops, p, origin), CORRIDOR_MIN_WIDTH_M, CORRIDOR_TAPER_K_M))
         .collect();
+    sub_timings.push(("boundary_geometry".to_string(), t.elapsed().as_millis() as i64));
 
     // Any pattern touching ANY stop the seed paths pass through — not just
     // exact consecutive-pair matches — so sibling pattern variants
     // (express/local, direction variants) at an interchange are kept, same
     // reasoning as the TS version's own long comment on this.
+    let t = Instant::now();
     let mut core_stop_pks: HashSet<i64> = HashSet::new();
     for path in &seed.paths {
         core_stop_pks.extend(path.iter().copied());
@@ -236,11 +262,12 @@ pub fn compute_seed_path_corridor(
         let pks: Vec<i64> = core_stop_pks.into_iter().collect();
         get_pattern_pks_for_stops(conn, &pks)?
     };
+    sub_timings.push(("pattern_pks_query".to_string(), t.elapsed().as_millis() as i64));
 
     Ok(SeedPathCorridorResult {
         pattern_pks, walk_radius_stop_pks: walk_radius, seed_path_count: seed.paths.len(),
         seed_paths: seed.paths, level_frontiers: seed.level_frontiers, bfs_tree_edges: seed.tree_edges,
-        corridor_boundaries,
+        corridor_boundaries, sub_timings,
     })
 }
 

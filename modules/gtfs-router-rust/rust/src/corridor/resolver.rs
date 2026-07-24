@@ -165,7 +165,16 @@ pub fn resolve_corridor(
     let seed_corridor = compute_seed_path_corridor(
         conn, stops, graph, origin, destination, &origin_seed_pks, &dest_seed_pks, &candidates, MAX_TRANSFERS,
     )?;
-    sub_timings.push(("seed_path_bfs_and_tagging".to_string(), t.elapsed().as_millis() as i64));
+    let seed_corridor_wrapper_ms = t.elapsed().as_millis() as i64 - seed_corridor.sub_timings.iter().map(|(_, ms)| ms).sum::<i64>();
+    // Prefer the fine-grained breakdown (bfs / boundary_geometry /
+    // pattern_pks_query) over one lumped "seed_path_bfs_and_tagging" entry —
+    // that single number couldn't say whether the BFS itself, the
+    // debug-only boundary geometry, or the DB pattern lookup was the actual
+    // cost driver. `seed_corridor_wrapper_ms` (this function's own overhead
+    // around the call — should be ~0) is included too so the sum still
+    // reconciles with a wall-clock measurement if you want to sanity-check it.
+    sub_timings.extend(seed_corridor.sub_timings.clone());
+    sub_timings.push(("seed_path_bfs_and_tagging_wrapper".to_string(), seed_corridor_wrapper_ms));
 
     let t = Instant::now();
     let mut pattern_stop_rows: Vec<PatternStopRow> = Vec::new();
