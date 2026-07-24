@@ -315,7 +315,7 @@ pub fn get_shape_points(
     conn: &Connection,
     shapes_index: &ShapesIndex,
     shape_ids: &[(i64, String)], // (agency, shape_id)
-) -> rusqlite::Result<HashMap<i64, Vec<(f64, f64)>>> {
+) -> rusqlite::Result<HashMap<(i64, String), Vec<(f64, f64)>>> {
     let mut pk_to_key: HashMap<i64, (i64, String)> = HashMap::new();
     for key in shape_ids {
         if let Some(pk) = shapes_index.id_to_pk.get(key) {
@@ -332,17 +332,20 @@ pub fn get_shape_points(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
 
-    // Keyed by shape_pk here (caller re-keys by (agency,shape_id) if it
-    // needs to — loader.rs keys its output map by pattern_pk instead, so
-    // pk is the more useful key at this layer).
     let mut out: HashMap<i64, Vec<(f64, f64, i64)>> = HashMap::new();
     for (pk, lat, lon, seq) in rows {
         out.entry(pk).or_default().push((lat as f64 / COORD_SCALE, lon as f64 / COORD_SCALE, seq));
     }
+    // Keyed by (agency, shape_id) — every current/planned caller only ever
+    // has this key (from PatternMeta), never the internal shape_pk, so
+    // re-keying here (using pk_to_key, which we already built above) saves
+    // every caller from having to duplicate that lookup themselves.
     let mut result = HashMap::new();
     for (pk, mut pts) in out {
         pts.sort_by_key(|p| p.2);
-        result.insert(pk, pts.into_iter().map(|(lat, lon, _)| (lat, lon)).collect());
+        if let Some(key) = pk_to_key.get(&pk) {
+            result.insert(key.clone(), pts.into_iter().map(|(lat, lon, _)| (lat, lon)).collect());
+        }
     }
     Ok(result)
 }

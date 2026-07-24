@@ -40,6 +40,14 @@ pub struct RouteSegment {
     pub is_walk: bool,
     pub departure_time_sec: Option<i64>,
     pub arrival_time_sec: Option<i64>,
+    /// Which pattern this segment rode, if any (None for walk segments).
+    /// Not meaningful to callers outside this crate — it exists purely so
+    /// lib.rs can resolve the segment's real GTFS shape and swap `coords`
+    /// (currently just the stop-to-stop sequence above) for the actual
+    /// road/rail-following polyline, trimmed to board->alight, AFTER
+    /// run_search returns. Never exposed over the FFI boundary — see
+    /// lib.rs's segment_to_ffi, which doesn't carry this field forward.
+    pub pattern_pk: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +90,28 @@ enum ParentInfo {
 
 fn walk_time_sec(meters: f64, speed_mps: f64) -> f64 { meters / speed_mps }
 
+/// Walks `parent` backward from `cur` to the earliest stop reachable
+/// (an origin-adjacent stop with no parent entry, or a stop whose parent is
+/// an OriginWalk), returning the chain in forward (earliest -> cur) order.
+/// Used by the `on_route_check` debug callback to show a candidate route
+/// connected back through its own earlier transfers, not as an isolated
+/// single-round segment. Bounded by `max_rounds`-ish depth in practice
+/// (one hop per round at most), but capped defensively anyway since this
+/// walks live, still-mutating search state rather than the final
+/// backtrack over a completed search.
+fn backtrack_stop_chain(mut cur: StopPk, parent: &HashMap<StopPk, ParentInfo>) -> Vec<StopPk> {
+    let mut chain = vec![cur];
+    for _ in 0..64 {
+        match parent.get(&cur) {
+            Some(ParentInfo::Transit { board_stop, .. }) => { cur = *board_stop; chain.push(cur); }
+            Some(ParentInfo::Footpath { from, .. }) => { cur = *from; chain.push(cur); }
+            Some(ParentInfo::OriginWalk { .. }) | None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
 fn nearest_stops(stops: &StopsCache, allowed: &HashSet<StopPk>, center: LatLon, limit: usize) -> Vec<(StopPk, f64)> {
     let mut out: Vec<(StopPk, f64)> = allowed.iter()
         .filter_map(|&pk| stops.get(pk).map(|s| (pk, haversine_meters(center, LatLon { lat: s.stop_lat, lon: s.stop_lon }))))
@@ -113,6 +143,18 @@ impl Default for RaptorOptions {
 /// `on_round`, if given, is called with (round_number, marked_stop_pks) at
 /// the end of every round — the "currently evaluating" frontier a debug
 /// overlay would draw as it expands.
+///
+/// `on_route_check`, if given, is called once per pattern examined within a
+/// round, with (round_number, stop_pks_ridden_so_far, route_color,
+/// route_name) — the FULL journey-so-far chain (origin-side boarding
+/// history through earlier rounds, reconstructed via `parent`, plus this
+/// round's own ridden segment), not just this round's isolated segment, so
+/// a debug overlay can draw one connected candidate route rather than a
+/// disjoint hop. `route_color`/`route_name` are the pattern's GTFS route
+/// color ("#RRGGBB") and short/long name when the feed provides them.
+/// Meant to be displayed one-at-a-time (a debug overlay stepping through
+/// "which route is RAPTOR checking right now"), not accumulated — see
+/// debugSinkCollector.ts.
 pub fn run_search(
     index: &GtfsIndex,
     stops: &StopsCache,
@@ -121,6 +163,7 @@ pub fn run_search(
     depart_sec_of_day: i64,
     opts: &RaptorOptions,
     mut on_round: Option<&mut dyn FnMut(u32, &[StopPk])>,
+    mut on_route_check: Option<&mut dyn FnMut(u32, &[StopPk], Option<&str>, Option<&str>)>,
 ) -> Result<Vec<Journey>, String> {
     let xfer_radius = transfer_radius_m(opts.walking_speed_mps);
 
@@ -295,6 +338,17 @@ pub fn run_search(
             let Some(trip_pk) = best_trip else { continue };
             let Some(pattern_stop_seq) = index.pattern_stops.get(&pattern_pk) else { continue };
 
+            // Ridden stop sequence for this pattern this round — board stop
+            // first, then every stop scanned along it (whether or not it
+            // ended up strictly improving tau), so the debug view shows the
+            // whole segment RAPTOR looked at, not just the stops it beat.
+            // Only built when a debug sink is actually attached — this loop
+            // runs for every pattern in every round of every real search, so
+            // an unconditional Vec allocation + push per stop here would be
+            // pure overhead on the non-debug path for no benefit.
+            let debug_active = on_route_check.is_some();
+            let mut ridden: Vec<StopPk> = if debug_active { vec![best_board_stop] } else { Vec::new() };
+
             let mut scanning = false;
             for &(stop_pk, seq) in pattern_stop_seq {
                 if seq < best_board_seq { continue; }
@@ -304,6 +358,8 @@ pub fn run_search(
                 let Some(trip_map) = index.stop_times_by_stop_and_trip.get(&stop_pk) else { continue };
                 let Some(entry) = trip_map.get(&trip_pk) else { continue };
                 if entry.stop_sequence != seq { continue; }
+
+                if debug_active { ridden.push(stop_pk); }
 
                 let current_best = tau.get(&stop_pk).copied().unwrap_or(i64::MAX);
                 if entry.arrival_sec < current_best {
@@ -316,6 +372,24 @@ pub fn run_search(
                     let prev_walk = walk_so_far.get(&best_board_stop).copied().unwrap_or(0.0);
                     walk_so_far.insert(stop_pk, prev_walk);
                     newly_marked.insert(stop_pk);
+                }
+            }
+
+            if debug_active && ridden.len() > 1 {
+                if let Some(cb) = on_route_check.as_deref_mut() {
+                    // Prepend the journey-so-far up to the boarding stop —
+                    // `ridden[0]` IS `best_board_stop`, and the backtrack
+                    // chain already ends there too, so skip ridden's first
+                    // element to avoid a duplicate point at the join.
+                    let mut full_chain = backtrack_stop_chain(best_board_stop, &parent);
+                    full_chain.extend(ridden.iter().skip(1).copied());
+
+                    let pat_meta = index.patterns_by_pk.get(&pattern_pk);
+                    let route_color = pat_meta.and_then(|m| {
+                        if m.route_color.is_empty() { None } else { Some(format!("#{}", m.route_color.trim_start_matches('#').to_uppercase())) }
+                    });
+                    let route_name = pat_meta.map(|m| m.route_name.clone());
+                    cb(round, &full_chain, route_color.as_deref(), route_name.as_deref());
                 }
             }
         }
@@ -437,6 +511,7 @@ fn reconstruct_path(
             route_type: -1, route_color: Some("#666666".to_string()), route_text_color: Some("#FFFFFF".to_string()),
             origin_stop_name: from_name.to_string(), dest_stop_name: to_name.to_string(),
             is_walk: true, departure_time_sec: None, arrival_time_sec: None,
+            pattern_pk: None,
         }
     };
 
@@ -499,6 +574,7 @@ fn reconstruct_path(
                     route_text_color: route_text_color.clone(), origin_stop_name: board_stop.stop_name.clone(),
                     dest_stop_name: alight_stop.stop_name.clone(), is_walk: false,
                     departure_time_sec: depart_sec, arrival_time_sec: arrive_sec,
+                    pattern_pk: Some(*pattern_pk),
                 });
                 legs.push(Leg {
                     route_name, route_type, route_color, route_text_color,

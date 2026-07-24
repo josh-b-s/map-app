@@ -186,6 +186,13 @@ export interface GtfsDebugInfo {
      *  them explicitly the debug view understates the corridor's true
      *  extent at both ends. */
     walkRadiusCircles: { center: LatLng; radiusMeters: number }[];
+    /** RAPTOR route-check polylines, one list per round — every individual
+     *  candidate route examined during that round. Meant to be displayed
+     *  one at a time (see DebugMapOverlay.tsx's flattenRaptorSteps), not
+     *  accumulated. Populated by the native/Rust path only; the TS path
+     *  below doesn't emit per-pattern debug events, so it stays empty
+     *  there — that's fine, computeGtfsRouteNative is the primary path. */
+    routeChecks: LatLng[][][];
 }
 
 export interface GtfsRouteResult {
@@ -1062,6 +1069,7 @@ export async function runSearchOnIndex(
             bfsTreeEdges,
             roundMarkedStops: debugRoundMarkedStops,
             corridorBoundary,
+            routeChecks: [],
             walkRadiusCircles
         };
         lap(`debug payload assembled (${corridorStops.length} corridor stops, ${seedPaths.length} seed paths, ${bfsLevels.length} BFS levels, ${debugRoundMarkedStops.length} rounds, ${corridorBoundary.length} corridor boundaries)`);

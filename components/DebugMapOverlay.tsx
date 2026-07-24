@@ -1,25 +1,29 @@
 import React, { useMemo } from 'react';
-import { Polygon, Polyline, Circle, LatLng as MapLatLng } from 'react-native-maps';
+import { Polygon, Polyline, Marker, LatLng as MapLatLng } from 'react-native-maps';
+import { View, Text } from 'react-native';
 import { useSelector } from 'react-redux';
 import { RootState } from '@/store/store';
-import { CORRIDOR_CHUNK_COUNT, MAX_BFS_DEBUG_POINTS } from '@/store/debug.slice';
-import { getBfsDiscoveryPoints, keyOfPt } from '@/services/gtfs/debug/debugBfsPoints';
+import { keyOfPt, flattenRaptorSteps, flattenBfsCandidates } from '@/services/gtfs/debug/debugBfsPoints';
 
-const BFS_FRONTIER_COLOR = '#3b82f6';
-// Amber — deliberately far from BFS_FRONTIER_COLOR's blue and RAPTOR_COLOR's
+const BFS_HULL_COLOR = '#3b82f6';
+// Amber — deliberately far from BFS_HULL_COLOR's blue and RAPTOR_COLOR's
 // red, so a "found route" pop reads instantly against whichever phase it
 // appears in. Thicker stroke (see usage below) does the rest of the work.
 const BFS_CANDIDATE_COLOR = '#f59e0b';
-const CORRIDOR_COLOR = 'rgba(148, 163, 184, 0.5)';
-const CORRIDOR_STROKE = 'rgba(148, 163, 184, 0.9)';
-const RAPTOR_COLOR = '#ef4444';
+const RAPTOR_HULL_COLOR = '#ef4444';
+// Fallback only — the actual route-check polyline uses the pattern's real
+// GTFS route_color (see raptorView below) when the feed provides one; this
+// is just what shows for the rare pattern with no color set.
+const RAPTOR_ROUTE_COLOR_FALLBACK = '#ef4444';
 
 type Pt = { latitude: number; longitude: number };
 
 /**
  * Minimal convex hull (monotone chain / Andrew's algorithm) over a small
- * set of lat/lon points. Used to render a RAPTOR frontier as ONE polygon
- * instead of one Circle per stop.
+ * set of lat/lon points. Used for BOTH phases now: BFS's per-round
+ * frontier and RAPTOR's per-round marked-stop frontier — same shape of
+ * data (a round -> set-of-stops snapshot), same reason to hull it instead
+ * of drawing N Circles (see the original rationale below).
  *
  * Why this replaces the old per-stop Circle rendering: react-native-maps
  * backs every <Circle> with a real native Google Maps object, so N stops
@@ -27,11 +31,7 @@ type Pt = { latitude: number; longitude: number };
  * forced the old MAX_DEBUG_MARKERS sampling cap (corridor stops hit 1359,
  * RAPTOR rounds hit 2000-3000 marked stops, both OOM'd unsampled). A
  * Polygon/Polyline is ONE native object regardless of point count, so
- * there's no cap needed here at all — the whole frontier can be included
- * exactly, no sampling required. For a "watch the search happen" debug
- * viz, a hull outline reads as "the region currently being explored,"
- * which fits the goal at least as well as a scatter of dots did, at a
- * fraction of the render cost.
+ * there's no cap needed here at all.
  *
  * Falls back to returning the points as-is for <3 points (no polygon is
  * meaningful yet).
@@ -70,89 +70,137 @@ function convexHull(points: Pt[]): Pt[] {
     return [...lower, ...upper];
 }
 
+/** Middle point (by point count, not distance) of a polyline — good enough
+ *  for "roughly where to put a label," not meant to be the geometric
+ *  midpoint by length. */
+function midpoint(coords: Pt[]): Pt {
+    return coords[Math.floor(coords.length / 2)];
+}
+
+/**
+ * Shared route-name label — a small pill anchored at a route's midpoint.
+ * The ONE place both debug phases and (eventually) normal route rendering
+ * can pull this from, per the ask to keep the rendering approach
+ * consistent rather than each spot reinventing its own label. Currently
+ * only wired up for the raptor phase, since that's the one place a single
+ * pattern (and therefore a single unambiguous name) is guaranteed — see
+ * this file's header note on why bfs candidates don't use it yet.
+ */
+function RouteNameLabel({ coords, name, color }: { coords: Pt[]; name?: string; color: string }) {
+    if (!name || coords.length === 0) return null;
+    const at = midpoint(coords);
+    return (
+        <Marker coordinate={at as MapLatLng} anchor={{ x: 0.5, y: 0.5 }} tracksViewChanges={false}>
+            <View style={{ backgroundColor: color, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 }}>
+                <Text style={{ color: '#fff', fontSize: 10, fontWeight: '700' }}>{name}</Text>
+            </View>
+        </Marker>
+    );
+}
+
 /**
  * Renders the CURRENT active unit of the last debug-mode search — not a
- * cumulative replay. Each phase shows only what's happening right now:
- *  - bfs: a single continuous polyline through discovery order (see
- *    debugBfsPoints.ts), revealed one real point at a time at
- *    BFS_STEP_INTERVAL_MS (~30fps by default) — reads as "watch it explore
- *    in the order it actually happened." Any seed path whose destination
- *    stop has already been reached gets drawn on top, thicker and in
- *    amber, as an emphasized "candidate route found" overlay.
- *  - seed: the settled seed paths (single-shot, these ARE the result)
- *  - corridor: the tapered-buffer shape assembling in chunks, one more
- *    seed path's boundary revealed per step
- *  - raptor: hull outline of the current round's marked-stop frontier
+ * cumulative replay, except where noted (bfs's 'cumulative' candidate
+ * mode). Two phases:
+ *
+ *  - bfs: corridor-finding. Candidate display has two modes
+ *    (state.bfsCandidateMode, toggled in DebugControls.tsx):
+ *      - 'cumulative': stepIndex = round. Shows that round's frontier hull
+ *        (bfsLevels[stepIndex]) plus every seed-path candidate whose
+ *        destination has been reached by this round or earlier —
+ *        "everything found so far."
+ *      - 'single': stepIndex = candidate index (see flattenBfsCandidates).
+ *        Shows exactly ONE candidate as a single full polyline (no
+ *        per-leg/per-pattern coloring — kept simple), paired with the hull
+ *        for whichever round that candidate was first found in.
+ *    Either way, candidates are drawn with each pattern's real GTFS shape
+ *    (trimmed to the ridden portion) rather than a straight stop-to-stop
+ *    line where the Rust side could resolve one — see lib.rs's
+ *    shaped_edge_coords. No corridor-boundary polygon or walk-radius
+ *    circles anymore — both were debug-visualization-only (routing never
+ *    read them) and the app doesn't use geometric corridor filtering.
+ *
+ *  - raptor: stepped per individual candidate-route check (see RaptorStep),
+ *    NOT accumulated — only the current step's route polyline is drawn,
+ *    replaced each step, since RAPTOR here only walks the small
+ *    corridor-restricted candidate set. That polyline is the FULL
+ *    journey-so-far — connected back through earlier rounds' boarding
+ *    history, not just this round's isolated segment — colored by the
+ *    pattern's real GTFS route_color when the feed has one, with its name
+ *    shown via RouteNameLabel. The round's marked-stop hull is drawn
+ *    alongside it for context.
  *
  * Must be rendered as a child of <MapView>. Renders nothing when debug mode
  * is off or there's no data yet.
  */
 export default function DebugMapOverlay() {
-    const { enabled, data, phase, stepIndex } = useSelector((s: RootState) => s.debug);
+    const { enabled, data, phase, stepIndex, bfsCandidateMode } = useSelector((s: RootState) => s.debug);
 
-    // Recomputed only when the underlying data or step changes, not on every
-    // unrelated re-render (e.g. map pan/zoom triggering a parent re-render).
-    //
-    // Single continuous polyline through BFS discovery order, instead of the
-    // old merged-chain-of-edges approach — a lot simpler, and since a
-    // Polyline is ONE native object regardless of point count, chain-merging
-    // was solving a problem (native object count) that a single polyline
-    // doesn't have in the first place. MAX_BFS_DEBUG_POINTS below is just a
-    // sane ceiling on coordinate-array/bridge payload size for a very large
-    // exploration, not a correctness requirement.
-    //
-    // candidates: any seedPath whose destination stop's key is already
-    // among the revealed BFS points — i.e. "BFS just reached the far end of
-    // a real route," rendered as an emphasized overlay so a found candidate
-    // visibly pops against the still-exploring line around it.
-    const bfsReveal = useMemo(() => {
+    const bfsCandidateSteps = useMemo(() => {
+        if (!data) return [];
+        return flattenBfsCandidates(data.seedPaths, data.bfsLevels);
+    }, [data]);
+
+    const bfsView = useMemo(() => {
         if (!data || phase !== 'bfs') return null;
-        const allPoints = getBfsDiscoveryPoints(data);
-        if (allPoints.length === 0) return { points: [] as Pt[], candidates: [] as Pt[][] };
+        const levels = data.bfsLevels ?? [];
 
-        const revealCount = Math.min(allPoints.length, stepIndex + 1);
-        let points = allPoints.slice(0, revealCount);
-
-        if (points.length > MAX_BFS_DEBUG_POINTS) {
-            const stride = points.length / MAX_BFS_DEBUG_POINTS;
-            const sampled: Pt[] = [];
-            for (let i = 0; i < MAX_BFS_DEBUG_POINTS; i++) sampled.push(points[Math.floor(i * stride)]);
-            // Keep the true leading edge exact — don't let sampling lag behind
-            // where discovery has actually reached.
-            sampled[sampled.length - 1] = points[points.length - 1];
-            points = sampled;
+        if (bfsCandidateMode === 'single') {
+            if (bfsCandidateSteps.length === 0) return null;
+            const candidate = bfsCandidateSteps[Math.min(stepIndex, bfsCandidateSteps.length - 1)];
+            const hull = convexHull(levels[candidate.round] ?? []);
+            return { hull, candidates: candidate.path.length >= 2 ? [candidate.path] : [] };
         }
 
-        const revealedKeys = new Set(allPoints.slice(0, revealCount).map(keyOfPt));
+        // 'cumulative' — stepIndex is a round number here.
+        const round = Math.min(stepIndex, Math.max(0, levels.length - 1));
+        const hull = convexHull(levels[round] ?? []);
+
+        // Union of every round's stops up to and including the current one,
+        // so "candidates found so far" only grows as stepIndex advances —
+        // matches bfs's round-by-round exploration semantics instead of
+        // showing everything at once.
+        const revealedKeys = new Set<string>();
+        for (let r = 0; r <= round; r++) {
+            for (const p of levels[r] ?? []) revealedKeys.add(keyOfPt(p));
+        }
         const candidates = (data.seedPaths ?? []).filter(path => {
             const dest = path[path.length - 1];
             return dest && path.length > 1 && revealedKeys.has(keyOfPt(dest));
         });
 
-        return { points, candidates };
-    }, [data, phase, stepIndex]);
+        return { hull, candidates };
+    }, [data, phase, stepIndex, bfsCandidateMode, bfsCandidateSteps]);
 
-    const raptorHull = useMemo(() => {
-        if (!data || phase !== 'raptor') return null;
-        return convexHull(data.roundMarkedStops[stepIndex] ?? []);
-    }, [data, phase, stepIndex]);
+    const raptorSteps = useMemo(() => {
+        if (!data) return [];
+        return flattenRaptorSteps(data.routeChecks ?? []);
+    }, [data]);
+
+    const raptorView = useMemo(() => {
+        if (!data || phase !== 'raptor' || raptorSteps.length === 0) return null;
+        const step = raptorSteps[Math.min(stepIndex, raptorSteps.length - 1)];
+        const hull = convexHull(data.roundMarkedStops[step.round] ?? []);
+        return { route: step.coords, hull, routeColor: step.routeColor ?? RAPTOR_ROUTE_COLOR_FALLBACK, routeName: step.routeName };
+    }, [data, phase, stepIndex, raptorSteps]);
 
     if (!enabled || !data) return null;
 
     return (
         <>
-            {phase === 'bfs' && bfsReveal && bfsReveal.points.length >= 2 && (
-                <Polyline
-                    coordinates={bfsReveal.points as MapLatLng[]}
-                    strokeWidth={2}
-                    strokeColor={BFS_FRONTIER_COLOR}
+            {phase === 'bfs' && bfsView && bfsView.hull.length >= 3 && (
+                <Polygon
+                    coordinates={bfsView.hull as MapLatLng[]}
+                    strokeWidth={1.5}
+                    strokeColor={BFS_HULL_COLOR}
+                    fillColor={`${BFS_HULL_COLOR}22`}
                 />
             )}
 
-            {/* A candidate route "pops" the moment BFS reaches its destination
-                stop — drawn thicker and in amber so it visibly stands out from
-                the still-exploring blue line around it. */}
-            {phase === 'bfs' && bfsReveal?.candidates.map((path, i) => (
+            {/* A candidate route "pops" against the blue hull — thicker and
+                amber, whether it's the whole cumulative set or the single
+                one being stepped through right now. */}
+            {phase === 'bfs' && bfsView?.candidates.map((path, i) => (
                 path.length >= 2 && (
                     <Polyline
                         key={`bfs-candidate-${i}`}
@@ -163,69 +211,31 @@ export default function DebugMapOverlay() {
                 )
             ))}
 
-            {phase === 'seed' && data.seedPaths.map((path, i) => (
-                path.length > 1 && (
-                    <Polyline
-                        key={`seed-${i}`}
-                        coordinates={path as MapLatLng[]}
-                        strokeWidth={2.5}
-                        strokeColor="rgba(168, 85, 247, 0.85)"
-                        lineDashPattern={[6, 6]}
-                    />
-                )
-            ))}
-
-            {phase === 'corridor' && (() => {
-                // Reveal one more seed path's boundary per step, so the
-                // corridor visibly "assembles" the same way the old
-                // chunked-Circle version did — just as whole shapes now,
-                // one Polygon per seed path, instead of dots.
-                const boundaries = data.corridorBoundary ?? [];
-                const chunkSize = Math.ceil(boundaries.length / CORRIDOR_CHUNK_COUNT) || 1;
-                const visibleCount = Math.min(boundaries.length, (stepIndex + 1) * chunkSize);
-                return boundaries.slice(0, visibleCount).map((b, i) => {
-                    if (b.left.length < 2 || b.right.length < 2) return null;
-                    // Ring = left side forward + right side reversed, closing
-                    // the loop back to the start.
-                    const ring = [...b.left, ...[...b.right].reverse()];
-                    return (
-                        <Polygon
-                            key={`corridor-${i}`}
-                            coordinates={ring as MapLatLng[]}
-                            strokeWidth={1}
-                            strokeColor={CORRIDOR_STROKE}
-                            fillColor={CORRIDOR_COLOR}
-                        />
-                    );
-                });
-            })()}
-
-            {/* The tapered boundary above only shows the sin()-tapered shape,
-                which has a nonzero floor (MIN_WIDTH_M) at each end — but the
-                REAL corridor also unions in every stop within a fixed radius
-                of origin/destination regardless of the taper (see
-                corridorTagging.ts's ORIGIN_DEST_WALK_RADIUS_M). Without these
-                two circles, the debug view understates how far the actual
-                corridor extends at both ends. Only 2 native objects
-                regardless of corridor size, so no sampling/chunking needed. */}
-            {phase === 'corridor' && (data.walkRadiusCircles ?? []).map((c, i) => (
-                <Circle
-                    key={`walk-radius-${i}`}
-                    center={c.center as MapLatLng}
-                    radius={c.radiusMeters}
-                    strokeWidth={1}
-                    strokeColor={CORRIDOR_STROKE}
-                    fillColor="rgba(148, 163, 184, 0.15)"
-                />
-            ))}
-
-            {phase === 'raptor' && raptorHull && raptorHull.length >= 3 && (
+            {/* RAPTOR's marked-stop frontier for the round the current
+                route-check belongs to — context for "where in the search
+                this candidate sits," not the focus itself. */}
+            {phase === 'raptor' && raptorView && raptorView.hull.length >= 3 && (
                 <Polygon
-                    coordinates={raptorHull as MapLatLng[]}
+                    coordinates={raptorView.hull as MapLatLng[]}
                     strokeWidth={1.5}
-                    strokeColor={RAPTOR_COLOR}
-                    fillColor={`${RAPTOR_COLOR}33`}
+                    strokeColor={RAPTOR_HULL_COLOR}
+                    fillColor={`${RAPTOR_HULL_COLOR}22`}
                 />
+            )}
+
+            {/* The actual focus of the raptor phase: ONE candidate route,
+                replaced each step rather than accumulated. Colored by the
+                pattern's real GTFS route_color when the feed has one, with
+                its name/number labeled via the shared RouteNameLabel. */}
+            {phase === 'raptor' && raptorView && raptorView.route.length >= 2 && (
+                <>
+                    <Polyline
+                        coordinates={raptorView.route as MapLatLng[]}
+                        strokeWidth={4}
+                        strokeColor={raptorView.routeColor}
+                    />
+                    <RouteNameLabel coords={raptorView.route} name={raptorView.routeName} color={raptorView.routeColor} />
+                </>
             )}
         </>
     );
