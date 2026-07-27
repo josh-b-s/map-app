@@ -14,7 +14,7 @@ import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 import DebugMapOverlay from '@/components/DebugMapOverlay';
 import DebugControls from '@/components/DebugControls';
 import {MAP_STYLE_DARK} from '@/constants/themes';
-import {useGoToUserLocation} from '../hooks/goToUserLocation';
+import {useGoToUserLocation} from '../../hooks/goToUserLocation';
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
