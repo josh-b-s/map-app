@@ -56,6 +56,26 @@ impl StopsCache {
     }
 }
 
+/// Bbox query against stops_rtree (see schema.sql's comment on that
+/// table) — bounds must already be in the same scaled-integer units as
+/// stops.stop_lat/stop_lon (geo::bbox_scaled produces this directly).
+/// Returns candidate stop_pks whose point falls in the box; the caller
+/// still needs to refine with a real haversine check, since a bbox is a
+/// rectangle, not the circle the caller actually wants.
+pub fn nearest_stop_pks_in_bbox(
+    conn: &Connection,
+    min_lat: i64, max_lat: i64,
+    min_lon: i64, max_lon: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT stop_pk FROM stops_rtree \
+         WHERE min_lat >= ?1 AND max_lat <= ?2 \
+         AND min_lon >= ?3 AND max_lon <= ?4"
+    )?;
+    let rows = stmt.query_map([min_lat, max_lat, min_lon, max_lon], |r| r.get::<_, i64>(0))?;
+    rows.collect()
+}
+
 pub fn load_stops(conn: &Connection) -> rusqlite::Result<StopsCache> {
     let mut stmt = conn.prepare(
         "SELECT stop_pk, stop_id, stop_name, stop_lat, stop_lon, agency FROM stops",

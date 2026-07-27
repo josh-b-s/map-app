@@ -313,47 +313,84 @@ pub fn run_search(
         }
         if boardings_by_pattern.is_empty() { break; }
 
-        for (pattern_pk, mut boardings) in boardings_by_pattern {
-            // Ascending stop_sequence order — lowest usable board seq wins,
-            // so "ride forward" always has a real destination ahead of it.
-            boardings.sort_by_key(|b| b.1);
+        for (pattern_pk, boardings) in boardings_by_pattern {
+            // seq -> (stop_pk, tau_at_stop), for O(1) lookup while scanning
+            // the pattern's own canonical stop order below.
+            let marked_at_seq: HashMap<i64, (StopPk, i64)> = boardings.into_iter()
+                .map(|(stop_pk, seq, tau)| (seq, (stop_pk, tau)))
+                .collect();
 
-            let mut best_trip: Option<i64> = None;
-            let mut best_board_stop: StopPk = 0;
-            let mut best_board_seq: i64 = -1;
-
-            for (stop_pk, _seq, tau_at_stop) in &boardings {
-                let Some(entries) = index.stop_times_by_stop.get(stop_pk) else { continue };
-                let idx = earliest_departure_index(entries, *tau_at_stop);
-                for e in &entries[idx..] {
-                    if e.pattern_pk != pattern_pk { continue; }
-                    best_trip = Some(e.trip_pk);
-                    best_board_stop = *stop_pk;
-                    best_board_seq = e.stop_sequence;
-                    break; // first pattern match at/after idx is earliest for this stop
-                }
-                if best_trip.is_some() { break; } // lowest-sequence candidate with a valid trip wins
-            }
-
-            let Some(trip_pk) = best_trip else { continue };
             let Some(pattern_stop_seq) = index.pattern_stops.get(&pattern_pk) else { continue };
 
-            // Ridden stop sequence for this pattern this round — board stop
-            // first, then every stop scanned along it (whether or not it
-            // ended up strictly improving tau), so the debug view shows the
-            // whole segment RAPTOR looked at, not just the stops it beat.
-            // Only built when a debug sink is actually attached — this loop
-            // runs for every pattern in every round of every real search, so
-            // an unconditional Vec allocation + push per stop here would be
-            // pure overhead on the non-debug path for no benefit.
             let debug_active = on_route_check.is_some();
-            let mut ridden: Vec<StopPk> = if debug_active { vec![best_board_stop] } else { Vec::new() };
+            let mut ridden: Vec<StopPk> = Vec::new();
 
-            let mut scanning = false;
+            // Single forward pass along the route's own stop order —
+            // standard RAPTOR route-scanning: hold a trip once boarded,
+            // but re-board at ANY marked stop along the way whose own tau
+            // would catch a trip arriving here earlier than the one
+            // currently held. This fixes a real gap the old two-phase
+            // version had: it picked exactly one boarding point up front
+            // (the lowest-sequence marked stop with ANY catchable trip)
+            // and never reconsidered — so if a downstream marked stop had
+            // been reached earlier via a different, faster path (entirely
+            // plausible wherever two lines cross more than once), a
+            // strictly earlier trip sitting right there was simply never
+            // looked at. Confirmed with a constructed case where the old
+            // version reported an arrival over an hour later than the
+            // objectively better trip available in the very same round —
+            // silently, with no error, since it's still A valid journey,
+            // just not the best one.
+            let mut current_trip: Option<i64> = None;
+            let mut current_board_stop: StopPk = 0;
+            let mut current_board_seq: i64 = -1;
+
             for &(stop_pk, seq) in pattern_stop_seq {
-                if seq < best_board_seq { continue; }
-                if seq == best_board_seq { scanning = true; continue; }
-                if !scanning { continue; }
+                if let Some(&(_, tau_at_stop)) = marked_at_seq.get(&seq) {
+                    let should_try_board = match current_trip {
+                        None => true,
+                        Some(held) => {
+                            // Only worth searching if this stop's tau beats
+                            // what the held trip already offers here —
+                            // otherwise the held trip is at least as good
+                            // and re-searching could only find something
+                            // equal or worse (trips on a pattern don't
+                            // overtake each other).
+                            let held_arrival_here = index.stop_times_by_stop_and_trip
+                                .get(&stop_pk).and_then(|m| m.get(&held)).map(|e| e.arrival_sec);
+                            match held_arrival_here {
+                                Some(a) => tau_at_stop < a,
+                                None => false,
+                            }
+                        }
+                    };
+                    if should_try_board {
+                        if let Some(entries) = index.stop_times_by_stop.get(&stop_pk) {
+                            let idx = earliest_departure_index(entries, tau_at_stop);
+                            for e in &entries[idx..] {
+                                if e.pattern_pk != pattern_pk { continue; }
+                                // pickup_type 0 = regular/boardable. 1 = no
+                                // pickup; 2/3 (phone agency / coordinate
+                                // with driver) need advance human contact
+                                // and aren't something automatic trip
+                                // planning can promise a rider can just
+                                // walk up and board, so they're excluded
+                                // the same as "no service" is. Keep
+                                // scanning forward for a later, boardable
+                                // instance of this same pattern instead.
+                                if e.pickup_type != 0 { continue; }
+                                current_trip = Some(e.trip_pk);
+                                current_board_stop = stop_pk;
+                                current_board_seq = e.stop_sequence;
+                                if debug_active { ridden = vec![stop_pk]; }
+                                break; // first pattern match at/after tau is earliest catchable here
+                            }
+                        }
+                    }
+                }
+
+                let Some(trip_pk) = current_trip else { continue };
+                if seq <= current_board_seq { continue; } // at or before the current boarding point
 
                 let Some(trip_map) = index.stop_times_by_stop_and_trip.get(&stop_pk) else { continue };
                 let Some(entry) = trip_map.get(&trip_pk) else { continue };
@@ -361,15 +398,23 @@ pub fn run_search(
 
                 if debug_active { ridden.push(stop_pk); }
 
+                // The vehicle really does physically stop here (it has a
+                // stop_times row), so it's still shown as ridden-through
+                // above regardless — drop_off_type only gates whether a
+                // RIDER can actually get off here. If not, `current_trip`
+                // stays held and the loop just moves to the next stop,
+                // same as any other stop that doesn't improve tau.
+                if entry.drop_off_type != 0 { continue; }
+
                 let current_best = tau.get(&stop_pk).copied().unwrap_or(i64::MAX);
                 if entry.arrival_sec < current_best {
                     tau.insert(stop_pk, entry.arrival_sec);
                     parent.insert(stop_pk, ParentInfo::Transit {
-                        trip_pk, pattern_pk, board_stop: best_board_stop, board_seq: best_board_seq, alight_seq: seq,
+                        trip_pk, pattern_pk, board_stop: current_board_stop, board_seq: current_board_seq, alight_seq: seq,
                     });
-                    let prev_transfers = transfers_used.get(&best_board_stop).copied().unwrap_or(0);
+                    let prev_transfers = transfers_used.get(&current_board_stop).copied().unwrap_or(0);
                     transfers_used.insert(stop_pk, prev_transfers + 1);
-                    let prev_walk = walk_so_far.get(&best_board_stop).copied().unwrap_or(0.0);
+                    let prev_walk = walk_so_far.get(&current_board_stop).copied().unwrap_or(0.0);
                     walk_so_far.insert(stop_pk, prev_walk);
                     newly_marked.insert(stop_pk);
                 }
@@ -377,11 +422,11 @@ pub fn run_search(
 
             if debug_active && ridden.len() > 1 {
                 if let Some(cb) = on_route_check.as_deref_mut() {
-                    // Prepend the journey-so-far up to the boarding stop —
-                    // `ridden[0]` IS `best_board_stop`, and the backtrack
-                    // chain already ends there too, so skip ridden's first
-                    // element to avoid a duplicate point at the join.
-                    let mut full_chain = backtrack_stop_chain(best_board_stop, &parent);
+                    // Prepend the journey-so-far up to the (last) boarding
+                    // stop — ridden[0] IS current_board_stop, and the
+                    // backtrack chain already ends there too, so skip
+                    // ridden's first element to avoid a duplicate point.
+                    let mut full_chain = backtrack_stop_chain(current_board_stop, &parent);
                     full_chain.extend(ridden.iter().skip(1).copied());
 
                     let pat_meta = index.patterns_by_pk.get(&pattern_pk);

@@ -38,13 +38,20 @@
 //! queries) — the IN(SELECT) shape still needs one to be fast.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// (today_date, tomorrow_date, the computed set) — see the cache-check at
+/// the top of step 2 in `load_gtfs_index_for_trip`'s module doc below for
+/// why this is keyed by date rather than recomputed per search.
+pub type ActiveServicesCacheEntry = (String, String, Arc<HashSet<(i64, String)>>);
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
 use crate::repo::{PatternsCache, RoutesCache, StopsCache};
 use crate::corridor::resolver::{resolve_corridor, CorridorCache};
 use crate::corridor::tagging::CorridorBoundary;
+use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
     INITIAL_WINDOW_MAX_SEC, INITIAL_WINDOW_MIN_SEC, WINDOW_BOARD_BUFFER_SEC,
     WINDOW_DISTANCE_BUFFER_SEC, WINDOW_DISTANCE_SCALE_SEC_PER_KM, WINDOW_WIDENING_STAGES_SEC,
@@ -59,6 +66,16 @@ pub struct StopTimeEntry {
     pub stop_sequence: i64,
     pub arrival_sec: i64,
     pub departure_sec: i64,
+    /// GTFS pickup_type: 0 = regular (boardable), 1 = no pickup, 2 = must
+    /// phone agency, 3 = must coordinate with driver. Only 0 is treated as
+    /// boardable for automatic trip planning — see raptor.rs's boarding
+    /// search, which skips any entry where this isn't 0.
+    pub pickup_type: i64,
+    /// Same as pickup_type but for alighting — only 0 is treated as a
+    /// valid place to get off. See raptor.rs's ride-through loop, which
+    /// still rides PAST a non-0 stop (the vehicle keeps going), it just
+    /// won't record an arrival there.
+    pub drop_off_type: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +98,7 @@ pub struct GtfsIndex {
     pub stop_times_by_stop_and_trip: HashMap<i64, HashMap<i64, StopTimeEntry>>,
     pub no_service_found: bool,
     pub debug_seed_paths: Vec<Vec<i64>>,
-    pub debug_bfs_levels: Vec<Vec<i64>>,
+    pub debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>,
     pub debug_bfs_tree_edges: Vec<(i64, i64)>,
     pub debug_corridor_boundary: Vec<CorridorBoundary>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
@@ -90,7 +107,7 @@ pub struct GtfsIndex {
     pub timings: Vec<(String, i64)>,
 }
 
-fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, debug_bfs_levels: Vec<Vec<i64>>, debug_bfs_tree_edges: Vec<(i64, i64)>, debug_corridor_boundary: Vec<CorridorBoundary>, timings: Vec<(String, i64)>) -> GtfsIndex {
+fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>, debug_bfs_tree_edges: Vec<(i64, i64)>, debug_corridor_boundary: Vec<CorridorBoundary>, timings: Vec<(String, i64)>) -> GtfsIndex {
     GtfsIndex {
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
@@ -133,6 +150,7 @@ pub fn load_gtfs_index_for_trip(
     routes: &RoutesCache,
     graph: &CoarseGraph,
     corridor_cache: &mut CorridorCache,
+    active_services_cache: &Mutex<Option<ActiveServicesCacheEntry>>,
     origin: LatLon,
     destination: LatLon,
     depart_sec_of_day: i64,
@@ -172,36 +190,60 @@ pub fn load_gtfs_index_for_trip(
     // ── 2. Active service_ids for TODAY and TOMORROW ────────────────────
     // A search close to midnight can need trips only active under
     // tomorrow's calendar entry — same reasoning as the TS version.
+    //
+    // This result depends ONLY on (today_date, tomorrow_date) — never on
+    // origin/destination/corridor — so it's identical for every search
+    // made on the same calendar day. It was previously recomputed from
+    // scratch on every call (including the retry-with-wider-window path,
+    // i.e. twice in a single compute_route call on a retry), even though
+    // stops/patterns/routes/graph right above it are all warmed once and
+    // reused. Cached here the same way, at GtfsRouterEngine's level, keyed
+    // by date so it self-invalidates the moment the date rolls over.
     let t = Instant::now();
-    let mut active_services: HashSet<(i64, String)> = HashSet::new();
-    for (date_str, dow) in [(today_date, today_dow), (tomorrow_date, tomorrow_dow)] {
-        let dow_col = DOW_COLUMNS[dow as usize];
-        let cal_sql = format!(
-            "SELECT service_id, agency FROM calendar WHERE {dow_col} = 1 AND start_date <= ?1 AND end_date >= ?1"
-        );
-        {
-            let mut stmt = conn.prepare(&cal_sql)?;
-            let rows = stmt.query_map([date_str], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (service_id, agency) = row?;
-                active_services.insert((agency, service_id));
+    let active_services: Arc<HashSet<(i64, String)>> = {
+        let mut cache_guard = active_services_cache.lock().unwrap();
+        match cache_guard.as_ref() {
+            Some((cached_today, cached_tomorrow, set))
+                if cached_today == today_date && cached_tomorrow == tomorrow_date =>
+            {
+                Arc::clone(set)
+            }
+            _ => {
+                let mut fresh: HashSet<(i64, String)> = HashSet::new();
+                for (date_str, dow) in [(today_date, today_dow), (tomorrow_date, tomorrow_dow)] {
+                    let dow_col = DOW_COLUMNS[dow as usize];
+                    let cal_sql = format!(
+                        "SELECT service_id, agency FROM calendar WHERE {dow_col} = 1 AND start_date <= ?1 AND end_date >= ?1"
+                    );
+                    {
+                        let mut stmt = conn.prepare(&cal_sql)?;
+                        let rows = stmt.query_map([date_str], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                        for row in rows {
+                            let (service_id, agency) = row?;
+                            fresh.insert((agency, service_id));
+                        }
+                    }
+                    {
+                        let mut stmt = conn.prepare(
+                            "SELECT service_id, agency, exception_type FROM calendar_dates WHERE date = ?1",
+                        )?;
+                        let rows = stmt.query_map([date_str], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                        })?;
+                        for row in rows {
+                            let (service_id, agency, exception_type) = row?;
+                            let key = (agency, service_id);
+                            if exception_type == 1 { fresh.insert(key); }
+                            else if exception_type == 2 { fresh.remove(&key); }
+                        }
+                    }
+                }
+                let fresh = Arc::new(fresh);
+                *cache_guard = Some((today_date.to_string(), tomorrow_date.to_string(), Arc::clone(&fresh)));
+                fresh
             }
         }
-        {
-            let mut stmt = conn.prepare(
-                "SELECT service_id, agency, exception_type FROM calendar_dates WHERE date = ?1",
-            )?;
-            let rows = stmt.query_map([date_str], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-            })?;
-            for row in rows {
-                let (service_id, agency, exception_type) = row?;
-                let key = (agency, service_id);
-                if exception_type == 1 { active_services.insert(key); }
-                else if exception_type == 2 { active_services.remove(&key); }
-            }
-        }
-    }
+    };
 
     mark!(t, "active_services");
 
@@ -298,15 +340,48 @@ pub fn load_gtfs_index_for_trip(
     // window does, so there's no reason to re-stage per stage.
     stage_ids(conn, "corridor_stop_pks", &corridor_stop_pks)?;
 
+    // Surfaces which side of the settings::USE_SQL_ACTIVE_TRIP_FILTER A/B
+    // this run took, right in the stage-timings log line — not a real
+    // duration, just piggybacking on the existing (label, i64) timings
+    // format so it shows up as active_trip_filter_sql=1|0 without needing
+    // a second log statement.
+    timings.push(("active_trip_filter_sql".to_string(), crate::settings::USE_SQL_ACTIVE_TRIP_FILTER as i64));
+
+    // See settings::USE_SQL_ACTIVE_TRIP_FILTER's doc — this is the other
+    // half of the A/B: stage active_trip_pks too, and let SQLite filter on
+    // it directly instead of fetching every windowed row and checking a
+    // Rust HashSet per row.
+    if crate::settings::USE_SQL_ACTIVE_TRIP_FILTER {
+        let active_trip_pks_vec: Vec<i64> = active_trip_pks.iter().copied().collect();
+        stage_ids(conn, "active_trip_pks_staged", &active_trip_pks_vec)?;
+    }
+
     let mut windowed_trip_pks: HashSet<i64> = HashSet::new();
     for &window_sec in &window_stages {
         let window_lo = (depart_sec_of_day - WINDOW_BOARD_BUFFER_SEC).max(0);
         let window_hi = depart_sec_of_day + window_sec;
 
         windowed_trip_pks.clear();
-        {
+        if crate::settings::USE_SQL_ACTIVE_TRIP_FILTER {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT trip_pk FROM stop_times \
+                "SELECT trip_pk FROM stop_times \
+                 WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
+                 AND trip_pk IN (SELECT id FROM active_trip_pks_staged) \
+                 AND departure_sec BETWEEN ?1 AND ?2"
+            )?;
+            let rows = stmt.query_map([window_lo, window_hi], |r| Ok(r.get::<_, i64>(0)?))?;
+            for row in rows {
+                windowed_trip_pks.insert(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                // No DISTINCT here on purpose: the index (stop_pk, departure_sec)
+                // isn't ordered by trip_pk, so a SQL-level DISTINCT would force
+                // SQLite to build a temporary b-tree just to dedupe — and we
+                // dedupe again for free below via the HashSet insert. Letting
+                // duplicate rows through and deduping only in Rust avoids
+                // paying for that sort twice.
+                "SELECT trip_pk FROM stop_times \
                  WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
                  AND departure_sec BETWEEN ?1 AND ?2"
             )?;
@@ -335,7 +410,6 @@ pub fn load_gtfs_index_for_trip(
         });
     }
 
-    let corridor_stop_set: HashSet<i64> = allowed_stop_pks.iter().copied().collect();
     let windowed_trip_vec: Vec<i64> = windowed_trip_pks.into_iter().collect();
 
     // Staged into a temp table + JOIN instead of chunked IN(...) — the
@@ -349,19 +423,28 @@ pub fn load_gtfs_index_for_trip(
 
     let t = Instant::now();
     {
+        // stop_pk IN (corridor_stop_pks) filters in SQL instead of after
+        // fetching: a windowed trip's full stop sequence can run well
+        // outside a narrow corridor (system-wide route vs. a slice of it),
+        // so without this, every out-of-corridor stop still gets decoded
+        // into a StopTimeEntry and cloned before being thrown away below.
+        // corridor_stop_pks is already staged from the windowing step
+        // above (same connection, not yet overwritten), so this costs no
+        // extra staging pass — unlike settings::USE_SQL_ACTIVE_TRIP_FILTER,
+        // this isn't really an A/B: it's strictly less work either way.
         let mut stmt = conn.prepare(
-            "SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec \
+            "SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type \
              FROM stop_times \
-             WHERE trip_pk IN (SELECT id FROM windowed_trip_pks)"
+             WHERE trip_pk IN (SELECT id FROM windowed_trip_pks) \
+             AND stop_pk IN (SELECT id FROM corridor_stop_pks)"
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
         })?;
         for row in rows {
-            let (trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec) = row?;
-            if !corridor_stop_set.contains(&stop_pk) { continue; }
+            let (trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type) = row?;
             let Some(&pattern_pk) = trip_pk_to_pattern.get(&trip_pk) else { continue };
-            let entry = StopTimeEntry { trip_pk, pattern_pk, stop_sequence, arrival_sec, departure_sec };
+            let entry = StopTimeEntry { trip_pk, pattern_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type };
             stop_times_by_stop.entry(stop_pk).or_default().push(entry.clone());
             stop_times_by_stop_and_trip.entry(stop_pk).or_default().insert(trip_pk, entry);
         }

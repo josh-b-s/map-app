@@ -33,6 +33,41 @@ pub struct CoarseEdge {
 
 pub struct CoarseGraph {
     pub adjacency: HashMap<i64, Vec<CoarseEdge>>,
+    /// Transit-only reverse index: for every forward transit edge `u -> v`
+    /// in `adjacency`, this holds `v -> u`. Built once (not persisted —
+    /// trivially re-derivable in one O(E) pass, not worth a second DB
+    /// table/signature to keep in sync).
+    ///
+    /// This does NOT let a one-way line be boarded backwards: it's a
+    /// lookup of "who has an edge landing on me", used only by the
+    /// destination-side half of a bidirectional search to ask "which stops
+    /// can reach me going forward along a real line" — same edge set as
+    /// `adjacency`, just re-keyed. A genuinely one-way line (only ever
+    /// emits `i -> j` for `i < j` in `flush_pattern`) still only ever
+    /// produces reverse entries mirroring that same one direction.
+    ///
+    /// Walk edges are excluded — `build_adjacency_from_scratch` already
+    /// inserts them symmetrically (`a -> b` AND `b -> a`), so forward
+    /// `adjacency` alone already answers "who can walk to me".
+    pub reverse_transit: HashMap<i64, Vec<CoarseEdge>>,
+}
+
+impl CoarseGraph {
+    pub fn new(adjacency: HashMap<i64, Vec<CoarseEdge>>) -> Self {
+        let mut reverse_transit: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        for (&from, edges) in &adjacency {
+            for e in edges {
+                if e.kind != EdgeKind::Transit { continue; }
+                reverse_transit.entry(e.to).or_default().push(CoarseEdge {
+                    to: from,
+                    kind: EdgeKind::Transit,
+                    cost: e.cost,
+                    via_pattern: e.via_pattern,
+                });
+            }
+        }
+        CoarseGraph { adjacency, reverse_transit }
+    }
 }
 
 /// Grid bucket size for walking-edge dedup — same fixed Melbourne-latitude

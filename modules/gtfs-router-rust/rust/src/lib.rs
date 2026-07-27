@@ -21,6 +21,7 @@ mod graph;
 mod corridor;
 mod loader;
 mod raptor;
+mod fxhash;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -103,12 +104,32 @@ pub struct RouteResult {
     pub timings: Vec<TimingEntry>,
 }
 
+/// Which end of the bidirectional seed BFS a `SeedBfsLevel` event came
+/// from — see corridor/seed_bfs.rs's module doc. `level` in that event is
+/// that side's OWN level counter, not a combined/global step number, since
+/// the two sides now advance independently (whichever has the smaller
+/// current frontier expands next).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SeedBfsDir {
+    Forward,
+    Backward,
+}
+
+impl From<corridor::seed_bfs::SearchDir> for SeedBfsDir {
+    fn from(d: corridor::seed_bfs::SearchDir) -> Self {
+        match d {
+            corridor::seed_bfs::SearchDir::Forward => SeedBfsDir::Forward,
+            corridor::seed_bfs::SearchDir::Backward => SeedBfsDir::Backward,
+        }
+    }
+}
+
 /// "Currently evaluating" events for a debug polyline overlay — fired
 /// live during a search, not batched into the final result, so the caller
 /// can throttle rendering (e.g. to 60fps) at the receiving end.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum DebugEvent {
-    SeedBfsLevel { level: u32, stops: Vec<LatLng> },
+    SeedBfsLevel { dir: SeedBfsDir, level: u32, stops: Vec<LatLng> },
     SeedPath { path: Vec<LatLng> },
     CorridorBoundary { left: Vec<LatLng>, right: Vec<LatLng> },
     RaptorRound { round: u32, marked_stops: Vec<LatLng> },
@@ -158,6 +179,10 @@ pub struct GtfsRouterEngine {
     conn: Mutex<Option<Connection>>,
     state: RwLock<Option<WarmState>>,
     corridor_cache: Mutex<corridor::resolver::CorridorCache>,
+    /// See loader.rs's step-2 doc: active_services depends only on
+    /// (today_date, tomorrow_date), so it's cached here across searches
+    /// instead of recomputed from calendar/calendar_dates every call.
+    active_services_cache: Mutex<Option<loader::ActiveServicesCacheEntry>>,
 }
 
 #[uniffi::export]
@@ -168,6 +193,7 @@ impl GtfsRouterEngine {
             conn: Mutex::new(None),
             state: RwLock::new(None),
             corridor_cache: Mutex::new(corridor::resolver::CorridorCache::new()),
+            active_services_cache: Mutex::new(None),
         }
     }
 
@@ -202,10 +228,11 @@ impl GtfsRouterEngine {
             routes: Arc::new(routes),
             patterns: Arc::new(patterns),
             shapes_index: Arc::new(shapes_index),
-            graph: Arc::new(graph::coarse::CoarseGraph { adjacency }),
+            graph: Arc::new(graph::coarse::CoarseGraph::new(adjacency)),
         });
         *self.conn.lock().unwrap() = Some(conn);
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
+        *self.active_services_cache.lock().unwrap() = None;
 
         Ok(())
     }
@@ -218,6 +245,7 @@ impl GtfsRouterEngine {
         *self.state.write().unwrap() = None;
         *self.conn.lock().unwrap() = None;
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
+        *self.active_services_cache.lock().unwrap() = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -245,6 +273,7 @@ impl GtfsRouterEngine {
 
         let mut index = loader::load_gtfs_index_for_trip(
             conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache,
+            &self.active_services_cache,
             origin_ll, dest_ll, depart_sec_of_day as i64,
             &today_date, today_dow, &tomorrow_date, tomorrow_dow, None,
         )?;
@@ -293,6 +322,7 @@ impl GtfsRouterEngine {
                 // to find SOME trips but not a later leg's boarding trip.
                 index = loader::load_gtfs_index_for_trip(
                     conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache,
+                    &self.active_services_cache,
                     origin_ll, dest_ll, depart_sec_of_day as i64,
                     &today_date, today_dow, &tomorrow_date, tomorrow_dow, Some(10 * 3600),
                 )?;
@@ -456,9 +486,18 @@ fn emit_pre_search_debug(
     let Some(sink) = debug else { return };
     let to_ll = |pk: i64| stops.get(pk).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon });
 
-    for (level, stop_pks) in index.debug_bfs_levels.iter().enumerate() {
+    // Each side's own level counter — the list itself is in expansion
+    // order (interleaved by whichever side had the smaller frontier), not
+    // a single shared step count, so `level` per event has to be tracked
+    // separately per direction rather than taken from the list position.
+    let (mut fwd_level, mut bwd_level) = (0u32, 0u32);
+    for (dir, stop_pks) in &index.debug_bfs_levels {
+        let level = match dir {
+            corridor::seed_bfs::SearchDir::Forward => { let l = fwd_level; fwd_level += 1; l }
+            corridor::seed_bfs::SearchDir::Backward => { let l = bwd_level; bwd_level += 1; l }
+        };
         let pts: Vec<LatLng> = stop_pks.iter().filter_map(|&pk| to_ll(pk)).collect();
-        sink.on_event(DebugEvent::SeedBfsLevel { level: level as u32, stops: pts });
+        sink.on_event(DebugEvent::SeedBfsLevel { dir: (*dir).into(), level, stops: pts });
     }
 
     // ── Resolve real GTFS shapes for the candidate seed paths ────────────

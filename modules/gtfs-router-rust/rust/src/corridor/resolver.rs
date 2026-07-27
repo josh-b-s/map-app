@@ -8,11 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use rusqlite::Connection;
-use crate::geo::{haversine_meters, LatLon};
+use crate::geo::{bbox_scaled, haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, PatternStopRow, PatternsCache, StopRow, StopsCache};
+use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, nearest_stop_pks_in_bbox, PatternStopRow, PatternsCache, StopRow, StopsCache, COORD_SCALE};
 use crate::corridor::tagging::{compute_corridor, compute_seed_path_corridor, CorridorBoundary, CorridorCandidate};
-use crate::settings::{MAX_SEED_STOPS, MAX_TRANSFERS, MIN_ACCEPTABLE_PATTERNS, MIN_SEED_STOPS, SEED_RADIUS_M};
+use crate::corridor::seed_bfs::SearchDir;
+use crate::settings::{MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_ACCEPTABLE_PATTERNS, MIN_SEED_STOPS, SEED_RADIUS_M};
 
 pub struct ResolvedCorridor {
     pub pattern_pks: HashSet<i64>,
@@ -24,7 +25,9 @@ pub struct ResolvedCorridor {
     pub widened: bool,
     pub seed_path_count: usize,
     pub debug_seed_paths: Vec<Vec<i64>>,
-    pub debug_bfs_levels: Vec<Vec<i64>>,
+    /// Each entry tagged with which side of the bidirectional search
+    /// produced it (see corridor/seed_bfs.rs), in expansion order.
+    pub debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>,
     pub debug_bfs_tree_edges: Vec<(i64, i64)>,
     pub debug_corridor_boundary: Vec<CorridorBoundary>,
     /// (label, elapsed_ms) sub-stage breakdown of resolve_corridor's own
@@ -79,15 +82,43 @@ impl CorridorCache {
 /// picked, so the seed budget goes toward genuinely different lines. Falls
 /// back to the nearest MIN_SEED_STOPS (dedup still applied) if the radius
 /// alone doesn't reach that floor.
+///
+/// Candidate stops come from a stops_rtree bbox query (see repo.rs /
+/// geo::bbox_scaled), progressively widened, instead of sorting every stop
+/// in the network by haversine distance — that used to mean two full
+/// O(n log n) sorts over the entire stops table per corridor resolution
+/// (once for origin, once for destination). Falls back to a genuine full
+/// scan only if MAX_RTREE_RADIUS_M's widening still doesn't turn up
+/// MIN_SEED_STOPS candidates (in practice: a search sitting well outside
+/// the network's actual service area) — same guarantee the old
+/// brute-force version always gave, just paid only in that rare case.
 fn nearest_for_seed(
     conn: &Connection,
-    all_stops: &[StopRow],
+    stops: &StopsCache,
     center: LatLon,
     patterns: &PatternsCache,
 ) -> rusqlite::Result<Vec<i64>> {
-    let mut ranked: Vec<(&StopRow, f64)> = all_stops.iter()
-        .map(|s| (s, haversine_meters(center, LatLon { lat: s.stop_lat, lon: s.stop_lon })))
-        .collect();
+    let mut radius_m = SEED_RADIUS_M;
+    let mut candidate_pks: Vec<i64> = Vec::new();
+    loop {
+        let (min_lat, max_lat, min_lon, max_lon) = bbox_scaled(center, radius_m, COORD_SCALE);
+        candidate_pks = nearest_stop_pks_in_bbox(conn, min_lat, max_lat, min_lon, max_lon)?;
+        if candidate_pks.len() >= MIN_SEED_STOPS || radius_m >= MAX_RTREE_RADIUS_M {
+            break;
+        }
+        radius_m *= 4.0;
+    }
+
+    let mut ranked: Vec<(&StopRow, f64)> = if candidate_pks.len() >= MIN_SEED_STOPS {
+        candidate_pks.iter()
+            .filter_map(|&pk| stops.get(pk))
+            .map(|s| (s, haversine_meters(center, LatLon { lat: s.stop_lat, lon: s.stop_lon })))
+            .collect()
+    } else {
+        stops.iter()
+            .map(|s| (s, haversine_meters(center, LatLon { lat: s.stop_lat, lon: s.stop_lon })))
+            .collect()
+    };
     ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     let mut within_radius: Vec<(&StopRow, f64)> = ranked.iter().filter(|(_, d)| *d <= SEED_RADIUS_M).cloned().collect();
@@ -145,20 +176,24 @@ pub fn resolve_corridor(
     }
 
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
+    // Previously: `let all_stops: Vec<StopRow> = stops.iter().cloned().collect();`
+    // — cloned every StopRow (including its two owned Strings) out of the
+    // cache, even though nothing below ever touches stop_id/stop_name,
+    // only stop_pk/stop_lat/stop_lon. Building `candidates` straight from
+    // `stops.iter()` (borrowed, not cloned) removes that clone — and its
+    // own "all_stops_clone" timing stage — entirely.
     let t = Instant::now();
-    let all_stops: Vec<StopRow> = stops.iter().cloned().collect();
-    let candidates: Vec<CorridorCandidate> = all_stops.iter()
+    let candidates: Vec<CorridorCandidate> = stops.iter()
         .map(|s| CorridorCandidate { stop_pk: s.stop_pk, lat: s.stop_lat, lon: s.stop_lon })
         .collect();
+    sub_timings.push(("candidates_build".to_string(), t.elapsed().as_millis() as i64));
 
+    let t = Instant::now();
     // Sequential, not concurrent — mirrors the TS version's own note about
     // a single shared SQLite connection; here it's simply because rusqlite
     // Connection isn't Sync-shareable without its own locking anyway.
-    sub_timings.push(("all_stops_clone".to_string(), t.elapsed().as_millis() as i64));
-
-    let t = Instant::now();
-    let origin_seed_pks = nearest_for_seed(conn, &all_stops, origin, patterns)?;
-    let dest_seed_pks = nearest_for_seed(conn, &all_stops, destination, patterns)?;
+    let origin_seed_pks = nearest_for_seed(conn, stops, origin, patterns)?;
+    let dest_seed_pks = nearest_for_seed(conn, stops, destination, patterns)?;
     sub_timings.push(("nearest_for_seed_x2".to_string(), t.elapsed().as_millis() as i64));
 
     let t = Instant::now();
@@ -214,7 +249,7 @@ pub fn resolve_corridor(
         let allowed_stop_pks = if !corridor.stop_pks.is_empty() {
             corridor.stop_pks
         } else {
-            all_stops.iter().map(|s| s.stop_pk).collect()
+            stops.iter().map(|s| s.stop_pk).collect()
         };
 
         let pattern_pks = if allowed_stop_pks.is_empty() {

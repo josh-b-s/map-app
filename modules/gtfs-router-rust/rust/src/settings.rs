@@ -11,6 +11,21 @@ pub const SEED_RADIUS_M: f64 = 1000.0;
 pub const MIN_SEED_STOPS: usize = 4;
 pub const MAX_SEED_STOPS: usize = 40;
 
+/// Progressive-widening cap for the stops_rtree bbox query in
+/// corridor/resolver.rs's `nearest_for_seed`: once the query radius
+/// reaches this without finding MIN_SEED_STOPS candidates, one more
+/// widened attempt is made and then it gives up and falls back to a full
+/// scan over every stop in the network instead. Because widening is
+/// geometric (x4 per step) and the cap is only checked after a query, the
+/// actual last-attempted radius can overshoot this value by up to 4x
+/// before falling back — deliberate, so a search that's *just* past the
+/// nominal cap doesn't pay full-scan cost when one more widened query
+/// would have found enough. Guarantees the same "always find at least
+/// MIN_SEED_STOPS stops, network permitting" behavior the old brute-force
+/// implementation had, for the rare edge case of a search near the
+/// boundary of a sparse network.
+pub const MAX_RTREE_RADIUS_M: f64 = 32_000.0;
+
 // ── Coarse topology graph (graph/coarse.rs) ─────────────────────────────
 pub const WALK_EDGE_THRESHOLD_M: f64 = 450.0;
 
@@ -37,6 +52,21 @@ pub const WINDOW_DISTANCE_BUFFER_SEC: f64 = 45.0 * 60.0;
 pub const INITIAL_WINDOW_MIN_SEC: f64 = 2.5 * 3600.0;
 pub const INITIAL_WINDOW_MAX_SEC: f64 = 5.0 * 3600.0;
 pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
+
+/// A/B toggle for how `windowed_trip_discovery` filters to active trips:
+/// - `true` (current default, as of on-device A/B testing): stage
+///   `active_trip_pks` into a temp table and add `AND trip_pk IN (...)` to
+///   the SQL, so SQLite filters before rows ever cross into Rust.
+/// - `false`: fetch every stop_times row in the time window, filter each
+///   one against the Rust `active_trip_pks` HashSet.
+/// Flipped to `true` after matched on-device comparisons (Caulfield to
+/// Mornington/Werribee/Epping, same routes both settings): windowed_trip_
+/// discovery was consistently faster with SQL-side filtering (-19%, -9%,
+/// -22%), including one clean case where trips_for_candidates cost was
+/// identical between runs so the comparison wasn't confounded by cache
+/// warmth. Still only 3 routes worth of evidence — revisit if a wider
+/// range of corridors doesn't hold the same pattern.
+pub const USE_SQL_ACTIVE_TRIP_FILTER: bool = true;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;

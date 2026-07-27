@@ -16,6 +16,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import {importGtfs, type ProgressCallback} from '@mapapp/gtfs-importer';
 import {ensureImportFolders, INCOMING_DIR} from './gtfsImporterLegacy';
+import {getNativeEngine, invalidateNativeRouter} from '../router/gtfsRouterNative';
 
 export type ImportProgressEvent = { table: string; inserted: number; total: number };
 
@@ -127,6 +128,15 @@ export async function runRustImport(
             );
         }
         console.log(`[rustGtfsImporter] import complete in ${elapsed()}`);
+
+        // warmedUpPath still equals dbPath from app-startup warmup — since
+        // dbPath is the same constant string before and after a re-import,
+        // just calling getNativeEngine(dbPath) again would compare that
+        // string to itself and skip warmUp() entirely. invalidateNativeRouter()
+        // resets warmedUpPath to null first, so the check below actually
+        // fires and reloads from the freshly-imported data.
+        invalidateNativeRouter();
+        getNativeEngine(dbPath);
     } catch (err) {
         console.error(`[rustGtfsImporter] import failed after ${elapsed()}:`, err);
         throw err;

@@ -13,7 +13,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::corridor::seed_bfs::find_seed_paths;
+use crate::corridor::seed_bfs::{find_seed_paths, SearchDir};
 use crate::repo::{get_pattern_pks_for_stops, StopsCache};
 use crate::settings::{
     CORRIDOR_MIN_WIDTH_M, CORRIDOR_TAPER_K_M, CORRIDOR_MIN_ACCEPTABLE_STOPS,
@@ -41,7 +41,7 @@ pub struct CorridorResult {
     pub widened: bool,
     pub seed_path_count: usize,
     pub seed_paths: Vec<Vec<i64>>,
-    pub level_frontiers: Vec<Vec<i64>>,
+    pub level_frontiers: Vec<(SearchDir, Vec<i64>)>,
     pub bfs_tree_edges: Vec<(i64, i64)>,
     pub corridor_boundaries: Vec<CorridorBoundary>,
 }
@@ -192,7 +192,7 @@ pub struct SeedPathCorridorResult {
     pub walk_radius_stop_pks: HashSet<i64>,
     pub seed_path_count: usize,
     pub seed_paths: Vec<Vec<i64>>,
-    pub level_frontiers: Vec<Vec<i64>>,
+    pub level_frontiers: Vec<(SearchDir, Vec<i64>)>,
     pub bfs_tree_edges: Vec<(i64, i64)>,
     pub corridor_boundaries: Vec<CorridorBoundary>,
     /// (label, elapsed_ms) breakdown of this function's own 3 stages —
