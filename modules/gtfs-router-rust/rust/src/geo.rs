@@ -21,6 +21,36 @@ pub fn haversine_meters(a: LatLon, b: LatLon) -> f64 {
     R * 2.0 * x.sqrt().asin()
 }
 
+/// Perpendicular distance from `point` to the INFINITE line through `line_a`
+/// and `line_b` (not the segment, a point "before" line_a or "past" line_b
+/// still measures against the line itself) — used as a straightness/detour
+/// proxy: how far off the direct origin-destination axis a stop sits.
+///
+/// Equirectangular approximation, same tradeoff `bbox_scaled` already makes
+/// for this codebase: projects onto a local tangent plane centered at
+/// `line_a` using flat meters-per-degree scaling, then does plain 2D
+/// point-to-line math. Fine at city/corridor scale, not geodesically exact.
+pub fn cross_track_distance_m(point: LatLon, line_a: LatLon, line_b: LatLon) -> f64 {
+    const METERS_PER_DEG_LAT: f64 = 111_320.0;
+    let lat_rad = line_a.lat * std::f64::consts::PI / 180.0;
+    let meters_per_deg_lon = (METERS_PER_DEG_LAT * lat_rad.cos()).max(1.0);
+
+    let to_xy = |p: LatLon| -> (f64, f64) {
+        ((p.lon - line_a.lon) * meters_per_deg_lon, (p.lat - line_a.lat) * METERS_PER_DEG_LAT)
+    };
+
+    let (bx, by) = to_xy(line_b);
+    let (px, py) = to_xy(point);
+
+    let line_len_sq = bx * bx + by * by;
+    if line_len_sq < 1e-9 {
+        // line_a == line_b, "distance to line" degenerates to distance to point
+        return (px * px + py * py).sqrt();
+    }
+
+    (bx * py - by * px).abs() / line_len_sq.sqrt()
+}
+
 /// Converts a center point + radius (meters) into a bounding box in the
 /// SAME scaled-integer units stops_rtree stores its coordinates in
 /// (degrees * `coord_scale` — see schema.sql's comment on stops_rtree),

@@ -18,8 +18,12 @@ use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::corridor::seed_bfs::{materialize_seed_paths, meet_depth, SearchDir, SeedBfsRun};
-use crate::repo::get_pattern_pks_for_stops;
-use crate::settings::{MAX_TRANSFERS, ORIGIN_DEST_WALK_RADIUS_M, SAFETY_MARGIN_LEVELS};
+use crate::geo::cross_track_distance_m;
+use crate::repo::{get_pattern_pks_for_stops, StopsCache};
+use crate::settings::{
+    CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
+    ORIGIN_DEST_WALK_RADIUS_M, SAFETY_MARGIN_LEVELS,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CorridorCandidate {
@@ -82,6 +86,7 @@ pub struct SeedPathCorridorResult {
 /// BFS cost, only the cheap ancestor-union/backtrack/DB-lookup work below.
 pub fn compute_seed_path_corridor(
     conn: &Connection,
+    stops: &StopsCache,
     run: &SeedBfsRun,
     batch_size: usize,
     candidates: &[CorridorCandidate],
@@ -133,18 +138,51 @@ pub fn compute_seed_path_corridor(
     // approximate tapered-buffer polygon from stop coordinates.
     let path_pattern_pks = seed.path_pattern_pks.clone();
 
+    // Flat cross-track prefilter: sort core_stop_pks by perpendicular
+    // distance to the straight origin-destination line, keep the
+    // straightest min(CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX) —
+    // shrinks the IN-clause (and result size) of the pattern_pks query below, which is the slowest
+    // stage. A stop we can't locate sorts last (kept only if the fraction
+    // is generous enough to reach it) rather than silently dropped.
+    let core_stop_pks_before = seed.core_stop_pks.len();
+    let t = Instant::now();
+    let filtered_core_stop_pks: HashSet<i64> = if CROSS_TRACK_STOP_FILTER_ENABLED && !seed.core_stop_pks.is_empty() {
+        let mut ranked: Vec<(i64, f64)> = seed.core_stop_pks.iter()
+            .map(|&pk| {
+                let dist = match stops.get(pk) {
+                    None => f64::MAX,
+                    Some(row) => cross_track_distance_m(
+                        LatLon { lat: row.stop_lat, lon: row.stop_lon },
+                        origin,
+                        destination,
+                    ),
+                };
+                (pk, dist)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let keep_n = (((ranked.len() as f64) * CROSS_TRACK_KEEP_FRACTION).ceil() as usize).min(CROSS_TRACK_KEEP_MAX);
+        ranked.into_iter().take(keep_n).map(|(pk, _)| pk).collect()
+    } else {
+        seed.core_stop_pks.iter().copied().collect()
+    };
+    sub_timings.push(("cross_track_filter".to_string(), t.elapsed().as_millis() as i64));
+    sub_timings.push(("count.core_stop_pks_before".to_string(), core_stop_pks_before as i64));
+    sub_timings.push(("count.core_stop_pks_after".to_string(), filtered_core_stop_pks.len() as i64));
+
     // Any pattern touching ANY stop the seed paths pass through — not just
     // exact consecutive-pair matches — so sibling pattern variants
     // (express/local, direction variants) at an interchange are kept.
     //
-    // Uses `seed.core_stop_pks` — an exact, uncapped union of every stop
-    // that's an ancestor of a kept meeting node in THIS BATCH — rather than
-    // flattening `seed.paths`, which is thinned by MAX_SEED_PATHS.
+    // Uses `filtered_core_stop_pks` — the (optionally cross-track-trimmed)
+    // union of every stop that's an ancestor of a kept meeting node in
+    // THIS BATCH — rather than flattening `seed.paths`, which is thinned
+    // by MAX_SEED_PATHS.
     let t = Instant::now();
-    let pattern_pks = if seed.core_stop_pks.is_empty() {
+    let pattern_pks = if filtered_core_stop_pks.is_empty() {
         HashSet::new()
     } else {
-        let pks: Vec<i64> = seed.core_stop_pks.iter().copied().collect();
+        let pks: Vec<i64> = filtered_core_stop_pks.iter().copied().collect();
         get_pattern_pks_for_stops(conn, &pks)?
     };
     sub_timings.push(("pattern_pks_query".to_string(), t.elapsed().as_millis() as i64));
@@ -152,7 +190,7 @@ pub fn compute_seed_path_corridor(
     Ok(SeedPathCorridorResult {
         pattern_pks, walk_radius_stop_pks: walk_radius, seed_path_count: seed.paths.len(),
         seed_paths: seed.paths, path_pattern_pks, path_depths: seed.path_depths, level_frontiers: seed.level_frontiers,
-        corridor_boundaries: Vec::new(), core_stop_pks: seed.core_stop_pks.iter().copied().collect(), sub_timings,
+        corridor_boundaries: Vec::new(), core_stop_pks: filtered_core_stop_pks, sub_timings,
     })
 }
 

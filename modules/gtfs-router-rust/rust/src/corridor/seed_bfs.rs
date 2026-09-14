@@ -50,7 +50,10 @@
 
 use std::collections::HashSet;
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
-use crate::settings::{level_cap_for, MAX_SEED_PATHS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT, TOP_N_SEED_MEETS};
+use crate::settings::{
+    level_cap_for, DEPTH_BUCKET_RANKING_ENABLED, MAX_SEED_PATHS, SAFETY_MARGIN_LEVELS,
+    SEED_MEET_DEPTH_BUCKET_WEIGHT, TOP_N_SEED_MEETS,
+};
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::repo::StopsCache;
 use crate::geo::{haversine_meters, LatLon};
@@ -413,6 +416,17 @@ fn rank_meets(
     let sort_by_straightness = |bucket: &mut Vec<(i64, u32)>| {
         bucket.sort_by_cached_key(|&(node, _)| (distance_sum_m(node).to_bits(), node));
     };
+
+    if !DEPTH_BUCKET_RANKING_ENABLED {
+        // Single bucket, no depth separation, no weighted interleave —
+        // pure global straightness sort. bucket_sizes_before still comes
+        // back length-1 so the seed_bucket{depth}_before/after logging in
+        // tagging.rs keeps working unchanged, just with one bucket to log.
+        let mut all: Vec<(i64, u32)> = meets;
+        let bucket_sizes_before = vec![all.len()];
+        sort_by_straightness(&mut all);
+        return (all, bucket_sizes_before);
+    }
 
     let num_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
     let mut buckets: Vec<Vec<(i64, u32)>> = vec![Vec::new(); num_buckets];

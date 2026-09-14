@@ -336,7 +336,7 @@ pub fn resolve_corridor(
     sub_timings.push(("count.seed_bfs_meets_total".to_string(), run.ordered_meets.len() as i64));
 
     let t = Instant::now();
-    let seed_corridor = compute_seed_path_corridor(conn, &run, batch_size, &candidates, origin, destination)?;
+    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination)?;
     let seed_corridor_wrapper_ms = t.elapsed().as_millis() as i64 - seed_corridor.sub_timings.iter().map(|(_, ms)| ms).sum::<i64>();
     sub_timings.extend(seed_corridor.sub_timings.clone());
     sub_timings.push(("seed_path_materialize_wrapper".to_string(), seed_corridor_wrapper_ms));

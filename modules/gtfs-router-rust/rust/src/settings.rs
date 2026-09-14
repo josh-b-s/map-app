@@ -62,6 +62,34 @@ pub const ORIGIN_DEST_WALK_RADIUS_M: f64 = 900.0;
 /// never the seed paths RAPTOR actually needs to board/alight on.
 pub const STOP_SEQUENCE_MARGIN: usize = 2;
 
+/// Flat cross-track prefilter on `core_stop_pks`, right before the
+/// `get_pattern_pks_for_stops` SQL call (see tagging.rs) — the goal is
+/// shrinking the IN-clause/result size on that query, which is currently
+/// the slowest stage of on-device corridor resolution. Off by default so
+/// A/B timing can isolate its effect; flip on to test.
+pub const CROSS_TRACK_STOP_FILTER_ENABLED: bool = true;
+
+/// Fraction of `core_stop_pks` to keep after sorting by cross-track
+/// distance to the origin-destination line (smallest/straightest first).
+/// 0.5 keeps the straighter half, drops the rest before the SQL query.
+pub const CROSS_TRACK_KEEP_FRACTION: f64 = 1.0;
+
+/// Absolute cap on top of CROSS_TRACK_KEEP_FRACTION — whichever is
+/// smaller wins. So "keep the straightest 50 stops" regardless of how
+/// big core_stop_pks was to begin with, rather than the fraction alone
+/// letting a huge core_stop_pks still pass through a huge count.
+pub const CROSS_TRACK_KEEP_MAX: usize = 50;
+
+/// When false, `rank_meets` skips depth-bucket separation entirely: every
+/// meeting node goes in one bucket, sorted purely by distance_sum_m
+/// straightness, no weighted interleave. Lets you A/B "bucket ranking
+/// does the narrowing" against "cross-track filtering on core_stop_pks
+/// does the narrowing" independently. Off means depth (transfer count)
+/// no longer protects a shortest-transfer candidate from being outranked
+/// by a straighter but deeper one, that safety property is what you're
+/// giving up while testing this.
+pub const DEPTH_BUCKET_RANKING_ENABLED: bool = false;
+
 // ── Journey-planning transfer budget ────────────────────────────────────
 pub const MAX_TRANSFERS: u32 = 5;
 
@@ -128,7 +156,7 @@ pub const MAX_SEED_PATHS: usize = 24; // internal guard against combinatorial ha
 /// this first batch turns up no pattern with an active trip, loader.rs's
 /// retry ladder re-materializes a bigger batch against the SAME BFS run
 /// (see SEED_MEETS_RETRY_CEILING) rather than giving up.
-pub const TOP_N_SEED_MEETS: usize = 50;
+pub const TOP_N_SEED_MEETS: usize = usize::MAX;
 
 /// Retry ladder for loader.rs: if a search comes back with no candidate
 /// patterns / no active trip at all (see resolve_corridor's `batch_size`
