@@ -123,7 +123,7 @@ fn nearest_stops(stops: &StopsCache, allowed: &HashSet<StopPk>, center: LatLon, 
 
 /// Earliest index in `entries` (sorted by departure_sec) with
 /// departure_sec >= min_depart — binary search, same as earliestDepartureIndex.
-fn earliest_departure_index(entries: &[crate::loader::StopTimeEntry], min_depart: i64) -> usize {
+fn earliest_departure_index(entries: &[std::rc::Rc<crate::loader::StopTimeEntry>], min_depart: i64) -> usize {
     entries.partition_point(|e| e.departure_sec < min_depart)
 }
 
@@ -257,7 +257,15 @@ pub fn run_search(
     for round in 0..opts.max_rounds {
         if marked.is_empty() { break; }
 
-        // Provably-safe pruning once any destination candidate is known.
+        // Provably-safe pruning once any destination candidate is known —
+        // but ONLY provably safe if ASSUMED_TRANSIT_SPEED_MPS is a genuine
+        // upper bound on how fast any vehicle in the network can ever close
+        // straight-line distance. If any line is meaningfully faster in a
+        // straight line than that (express trains, freeways, some light
+        // rail), this "lower bound" is actually an overestimate and can
+        // silently prune a stop that would have produced a strictly better
+        // journey. Worth verifying against the fastest scheduled segment
+        // speed anywhere in the feed this routes over.
         if best_dest_arrival_sec < i64::MAX {
             marked = marked.into_iter().filter(|&pk| {
                 let Some(s) = stops.get(pk) else { return true };
@@ -268,6 +276,12 @@ pub fn run_search(
             }).collect();
         }
 
+        // Thinning heuristic: dropping non-"protected" marked stops once the
+        // frontier exceeds BEST_MARKED_CAP is a deliberate accuracy/speed
+        // tradeoff, same reasoning as the destination-pruning lower bound
+        // above — it can, in principle, drop the stop a true-optimal
+        // journey needed, in exchange for bounding round cost at busy
+        // frontiers.
         if marked.len() > BEST_MARKED_CAP {
             let seed_protected: HashSet<StopPk> = marked.iter().filter(|pk| seed_path_stop_set.contains(pk)).copied().collect();
 
@@ -365,10 +379,9 @@ pub fn run_search(
                         }
                     };
                     if should_try_board {
-                        if let Some(entries) = index.stop_times_by_stop.get(&stop_pk) {
+                        if let Some(entries) = index.stop_times_by_stop_and_pattern.get(&(stop_pk, pattern_pk)) {
                             let idx = earliest_departure_index(entries, tau_at_stop);
                             for e in &entries[idx..] {
-                                if e.pattern_pk != pattern_pk { continue; }
                                 // pickup_type 0 = regular/boardable. 1 = no
                                 // pickup; 2/3 (phone agency / coordinate
                                 // with driver) need advance human contact

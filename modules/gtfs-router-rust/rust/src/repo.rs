@@ -39,6 +39,7 @@ pub struct StopRow {
 
 pub struct StopsCache {
     by_pk: Vec<Option<StopRow>>, // index 0 unused, index = stop_pk
+    count: usize,
 }
 
 impl StopsCache {
@@ -52,7 +53,7 @@ impl StopsCache {
     }
 
     pub fn len(&self) -> usize {
-        self.by_pk.iter().filter(|o| o.is_some()).count()
+        self.count
     }
 }
 
@@ -98,11 +99,12 @@ pub fn load_stops(conn: &Connection) -> rusqlite::Result<StopsCache> {
         rows.push(row);
     }
     let mut by_pk: Vec<Option<StopRow>> = (0..=max_pk).map(|_| None).collect();
+    let count = rows.len();
     for row in rows {
         let pk = row.stop_pk as usize;
         by_pk[pk] = Some(row);
     }
-    Ok(StopsCache { by_pk })
+    Ok(StopsCache { by_pk, count })
 }
 
 // ── Routes (interned into small integer ids for cheap Set/HashMap use) ────

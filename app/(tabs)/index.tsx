@@ -28,6 +28,7 @@ export default function Index() {
     const routeColor = useSelector((s: RootState) => s.route.routeColor);
     const routeLoading = useSelector((s: RootState) => s.route.loading);
     const selectedPlace = useSelector((s: RootState) => s.search.selected);
+    const debugEnabled = useSelector((s: RootState) => s.debug.enabled);
 
     const goToUserLocation = useGoToUserLocation(mapRef);
 
@@ -90,7 +91,7 @@ export default function Index() {
                 }}
                 onPress={() => Keyboard.dismiss()}
             >
-                {routeSegments.length > 0 ? (
+                {!debugEnabled && (routeSegments.length > 0 ? (
                     routeSegments.map((segment, index) => (
                         <Polyline
                             key={index}
@@ -109,7 +110,7 @@ export default function Index() {
                         strokeWidth={4}
                         strokeColor={routeColor ?? '#2563eb'}
                     />
-                ) : null}
+                ) : null)}
 
                 <DebugMapOverlay />
             </MapView>

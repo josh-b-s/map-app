@@ -29,6 +29,8 @@ import {fallbackRouteColor} from '@/services/gtfs/config/routeTypeUtil';
 import {makeKey, parseKey} from '../core/gtfsKeyUtil';
 import {haversineMeters as haversineMetersShared} from '../../geo/geoUtil';
 import {MAX_TRANSFER_WALK_SEC, NEARBY_STOPS} from '@/services/gtfs/config/routingSettings';
+import type { SeedPathHop } from '@/services/gtfs/debug/debugBfsPoints';
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Walking speed presets (m/s)
@@ -164,6 +166,17 @@ export interface GtfsDebugInfo {
     /** The raw BFS seed paths the corridor was tapered around — one
      *  polyline per path, in origin->destination order. */
     seedPaths: LatLng[][];
+    seedPathHops: SeedPathHop[][]; // NEW — per-candidate, ordered hop list
+    /** Depth (relative to the shortest meet BFS found — see seed_bfs.rs's
+     *  rank_meets depth-bucketing) of the matching entry in `seedPaths`/
+     *  `seedPathHops`. NEW — lets a debug overlay color candidates by
+     *  transfer-count tier. Populated by the native/Rust path only (see
+     *  lib.rs's SeedPath.depth); the TS path below doesn't track a
+     *  comparable depth concept, so it stays empty there, same treatment
+     *  routeChecks already gets.
+     */
+    seedPathDepths: number[];
+
     /** BFS's frontier at the end of each level, in order — level 0 is the
      *  origin seed set. Lets a debug replay show the coarse-graph search
      *  expanding outward before any of the corridor/RAPTOR stages. */
@@ -1065,6 +1078,8 @@ export async function runSearchOnIndex(
         debug = {
             corridorStops,
             seedPaths,
+            seedPathHops: [],
+            seedPathDepths: [],
             bfsLevels,
             bfsTreeEdges,
             roundMarkedStops: debugRoundMarkedStops,

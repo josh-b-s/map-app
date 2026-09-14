@@ -173,6 +173,14 @@ fn flush_pattern(
         sample_idx.sort_unstable();
         sample_idx.dedup();
 
+        // NOTE: this only emits edges from every stop to the SAMPLED stops
+        // after it — two stops that are both between two sample points
+        // (and neither one itself sampled) never get a direct coarse-graph
+        // edge here, only indirect reachability via a nearby sampled stop.
+        // Intentional (keeps clique size bounded for long patterns), and
+        // fine in practice since the coarse graph only drives corridor-shape
+        // BFS, not final RAPTOR boarding — flagged so it isn't mistaken for
+        // a bug later.
         for i in 0..n {
             for &j in &sample_idx {
                 if j <= i { continue; } // direction-respecting

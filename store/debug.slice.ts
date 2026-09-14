@@ -17,7 +17,13 @@ const PHASE_ORDER: DebugPhase[] = ['bfs', 'raptor'];
  *    found in — the "step through candidates one at a time" mode, same
  *    shape as how the raptor phase already steps through route-checks.
  *  This is genuinely a different meaning for stepIndex/phase length
- *  depending on mode, not just a rendering toggle — see phaseLength below. */
+ *  depending on mode, not just a rendering toggle — see phaseLength below.
+ *
+ *  hopColorMode (below) is a SEPARATE, orthogonal toggle: it controls how
+ *  a candidate's own shape is colored (per-hop palette vs one flat color),
+ *  not which candidates are visible or what stepIndex means. It always
+ *  shows every candidate's every hop at once, regardless of
+ *  bfsCandidateMode/stepIndex — see DebugMapOverlay.tsx. */
 export type BfsCandidateMode = 'cumulative' | 'single';
 
 // Target playback rate for the BFS "exploring" reveal. 30fps reads as
@@ -54,7 +60,7 @@ type State = {
      *  paired with the hull for whichever round it was found in.
      *  'raptor' -> flattened route-check index (0..raptorStepCount-1, NOT
      *  round index) — each step is one individual candidate route,
-     *  replacing rather than accumulating. */
+     *  replacing rather than accumulating. Unaffected by hopColorMode. */
     stepIndex: number;
     /** Whether DebugControls' auto-advance timer is currently running. */
     playing: boolean;
@@ -62,6 +68,17 @@ type State = {
      *  reset on setDebugData) since it's a display preference, not
      *  per-search state — same reasoning as `enabled` itself. */
     bfsCandidateMode: BfsCandidateMode;
+    /** Only meaningful during the bfs phase. When true, DebugMapOverlay
+     *  renders EVERY HOP of whichever candidate(s) are currently visible
+     *  (per bfsCandidateMode/stepIndex), each hop colored by a per-hop-index
+     *  palette (or the pattern's real route_color, when it has one) instead
+     *  of drawing those candidates as a single flat-colored polyline. It
+     *  only changes HOW the visible candidate(s) are colored, not WHICH
+     *  candidates are visible — so it doesn't affect phaseLength and isn't
+     *  reset on setDebugData, same "persistent display preference"
+     *  treatment as bfsCandidateMode gets. Intended for eyeballing candidate
+     *  shape/detour before deciding on a geometric pruning threshold. */
+    hopColorMode: boolean;
 };
 
 const initialState: State = {
@@ -71,12 +88,14 @@ const initialState: State = {
     stepIndex: 0,
     playing: false,
     bfsCandidateMode: 'cumulative',
+    hopColorMode: false,
 };
 
 /** Number of steps the given phase has, based on the current data (and, for
  *  'bfs', the candidate display mode). Single source of truth for
  *  advanceStep/retreatStep so phase-length logic isn't duplicated between
- *  the two. */
+ *  the two. Deliberately ignores hopColorMode — it changes how a step's
+ *  candidates are colored, not how many steps there are. */
 function phaseLength(phase: DebugPhase, data: GtfsDebugInfo, bfsCandidateMode: BfsCandidateMode): number {
     switch (phase) {
         case 'bfs':
@@ -153,6 +172,13 @@ const slice = createSlice({
                 state.playing = false;
             }
         },
+        /** Toggles hop-colored rendering — see hopColorMode doc comment.
+         *  Deliberately does NOT touch stepIndex/phase/playing: unlike
+         *  setBfsCandidateMode, this doesn't change what stepIndex means,
+         *  just how the currently-visible candidates are colored. */
+        toggleHopColorMode(state) {
+            state.hopColorMode = !state.hopColorMode;
+        },
         resetToStart(state) {
             state.phase = 'bfs';
             state.stepIndex = 0;
@@ -162,6 +188,7 @@ const slice = createSlice({
 });
 
 export const {
-    toggleDebugEnabled, setDebugData, setPlaying, advanceStep, retreatStep, setPhase, setBfsCandidateMode, resetToStart,
+    toggleDebugEnabled, setDebugData, setPlaying, advanceStep, retreatStep, setPhase, setBfsCandidateMode,
+    toggleHopColorMode, resetToStart,
 } = slice.actions;
 export default slice.reducer;

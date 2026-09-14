@@ -18,7 +18,7 @@ import type {
     GtfsJourney,
     RouteSegment,
     WALK_SPEED_MPS,
-} from './raptorRouter'; // reuse your existing TS types so both paths are interchangeable
+} from './raptorRouter';
 import { createDebugSinkCollector } from '../debug/debugSinkCollector';
 import { DB_PATH } from '@/services/db/sqliteDb';
 

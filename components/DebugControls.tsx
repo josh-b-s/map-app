@@ -3,7 +3,7 @@ import { Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
-import { advanceStep, BFS_STEP_INTERVAL_MS, DebugPhase, retreatStep, setBfsCandidateMode, setPlaying, toggleDebugEnabled } from '@/store/debug.slice';
+import { advanceStep, BFS_STEP_INTERVAL_MS, DebugPhase, retreatStep, setBfsCandidateMode, setPlaying, toggleDebugEnabled, toggleHopColorMode } from '@/store/debug.slice';
 import { flattenBfsCandidates, raptorStepCount } from '@/services/gtfs/debug/debugBfsPoints';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -66,7 +66,7 @@ type ImportBusyState = 'idle' | 'preparing' | 'benchmarking' | 'importing';
 export default function DebugControls() {
     const dispatch = useDispatch<AppDispatch>();
     const theme = useThemeStyle();
-    const { enabled, data, phase, stepIndex, playing, bfsCandidateMode } = useSelector((s: RootState) => s.debug);
+    const { enabled, data, phase, stepIndex, playing, bfsCandidateMode, hopColorMode } = useSelector((s: RootState) => s.debug);
 
     // Local (non-Redux) state for the GTFS import sub-panel — this is a
     // dev-only, one-shot tool, not app state anything else needs to react
@@ -186,7 +186,8 @@ export default function DebugControls() {
     // rounds (raptorStepCount), NOT round count. See debugBfsPoints.ts's
     // flatten helpers — shared with debug.slice.ts and DebugMapOverlay.tsx
     // so all three agree on what a "step" means without duplicated logic
-    // drifting out of sync.
+    // drifting out of sync. hopColorMode doesn't affect any of this — it's
+    // a coloring toggle, not a stepping mode; see debug.slice.ts.
     const bfsRoundCount = data?.bfsLevels?.length ?? 0;
     const bfsCandidateCount = data ? flattenBfsCandidates(data.seedPaths, data.bfsLevels).length : 0;
     const raptorStepTotal = data ? raptorStepCount(data) : 0;
@@ -257,6 +258,26 @@ export default function DebugControls() {
                             >
                                 <Ionicons
                                     name={bfsCandidateMode === 'single' ? 'layers-outline' : 'layers'}
+                                    size={16}
+                                    color={theme.color}
+                                />
+                            </TouchableOpacity>
+                        )}
+                        {/* Separate toggle from the one above — this one
+                            controls HOW a visible candidate's shape is
+                            colored (per-hop palette vs flat amber/depth
+                            color), not WHICH candidates are visible. Shows
+                            every hop of whichever candidate(s)
+                            bfsCandidateMode/stepIndex currently has visible
+                            — see DebugMapOverlay.tsx and debug.slice.ts's
+                            hopColorMode doc comment. */}
+                        {phase === 'bfs' && (
+                            <TouchableOpacity
+                                className="p-1.5"
+                                onPress={() => dispatch(toggleHopColorMode())}
+                            >
+                                <Ionicons
+                                    name={hopColorMode ? 'color-palette' : 'color-palette-outline'}
                                     size={16}
                                     color={theme.color}
                                 />

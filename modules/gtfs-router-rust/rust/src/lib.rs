@@ -127,10 +127,37 @@ impl From<corridor::seed_bfs::SearchDir> for SeedBfsDir {
 /// "Currently evaluating" events for a debug polyline overlay — fired
 /// live during a search, not batched into the final result, so the caller
 /// can throttle rendering (e.g. to 60fps) at the receiving end.
+/// One hop (one transit boarding, or one walk leg) within a candidate seed
+/// path — see SeedPath below. `hop_index` is 0-based position within the
+/// path (board -> alight #1 is hop 0, the next transit/walk leg is hop 1,
+/// etc.), meant purely for the debug view's per-hop color palette — it has
+/// no relation to RAPTOR round numbers. `route_color` is the pattern's real
+/// GTFS color when this hop is a transit leg with one; `None` for a walk
+/// hop or an uncolored pattern (the frontend falls back to a synthetic
+/// hop-index palette in that case).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SeedPathHop {
+    pub hop_index: u32,
+    pub coords: Vec<LatLng>,
+    pub is_walk: bool,
+    pub route_color: Option<String>,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum DebugEvent {
     SeedBfsLevel { dir: SeedBfsDir, level: u32, stops: Vec<LatLng> },
-    SeedPath { path: Vec<LatLng> },
+    // CHANGED: was `SeedPath { path: Vec<LatLng> }` — one flattened
+    // polyline per candidate with no hop boundary. Now emits each hop as
+    // its own segment (`hops`) so the frontend can color hop 1 vs hop 2
+    // differently instead of only being able to draw one flat color per
+    // candidate. `path_index` identifies which of the (up to
+    // MAX_SEED_PATHS) candidates these hops belong to, since hops from
+    // different candidates now arrive as separate events instead of one
+    // pre-joined polyline each. `depth` (relative to the shortest meet
+    // BFS found, 0..=SAFETY_MARGIN_LEVELS) is NEW — lets the frontend
+    // color/toggle candidates by depth (transfer-count tier) instead of
+    // every candidate defaulting to the same appearance.
+    SeedPath { path_index: u32, depth: u32, hops: Vec<SeedPathHop> },
     CorridorBoundary { left: Vec<LatLng>, right: Vec<LatLng> },
     RaptorRound { round: u32, marked_stops: Vec<LatLng> },
     // One per pattern examined within a round — the stops actually ridden
@@ -169,7 +196,6 @@ struct WarmState {
     stops: Arc<repo::StopsCache>,
     routes: Arc<repo::RoutesCache>,
     patterns: Arc<repo::PatternsCache>,
-    #[allow(dead_code)] // reserved for follow-up shape-polyline work — see raptor.rs's scope note
     shapes_index: Arc<repo::ShapesIndex>,
     graph: Arc<graph::coarse::CoarseGraph>,
 }
@@ -179,10 +205,22 @@ pub struct GtfsRouterEngine {
     conn: Mutex<Option<Connection>>,
     state: RwLock<Option<WarmState>>,
     corridor_cache: Mutex<corridor::resolver::CorridorCache>,
+    /// Raw BFS output cache, separate from corridor_cache — see
+    /// corridor::resolver::SeedBfsCache's doc. Lets a same-search retry
+    /// with a bigger batch_size (see load_gtfs_index_for_trip's retry
+    /// ladder) reuse the BFS run instead of re-walking the graph.
+    bfs_cache: Mutex<corridor::resolver::SeedBfsCache>,
     /// See loader.rs's step-2 doc: active_services depends only on
     /// (today_date, tomorrow_date), so it's cached here across searches
     /// instead of recomputed from calendar/calendar_dates every call.
     active_services_cache: Mutex<Option<loader::ActiveServicesCacheEntry>>,
+    /// Stage timings from the most recent `warm_up` call — see that
+    /// method's own doc for why this exists (added after a fresh index
+    /// build turned "native engine warmed" into 54s with zero visibility
+    /// into where the time went). Read via `warm_up_timings()` right after
+    /// `warm_up` returns; `Mutex` rather than needing `&mut self` since
+    /// `warm_up` itself only takes `&self`.
+    last_warmup_timings: Mutex<Vec<(String, i64)>>,
 }
 
 #[uniffi::export]
@@ -193,8 +231,20 @@ impl GtfsRouterEngine {
             conn: Mutex::new(None),
             state: RwLock::new(None),
             corridor_cache: Mutex::new(corridor::resolver::CorridorCache::new()),
+            bfs_cache: Mutex::new(corridor::resolver::SeedBfsCache::new()),
             active_services_cache: Mutex::new(None),
+            last_warmup_timings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Stage timings for the most recently completed `warm_up` call —
+    /// call this right after `warm_up` returns and log it the same way
+    /// `compute_route`'s `RouteResult.timings` already gets logged.
+    /// Empty if `warm_up` hasn't completed yet.
+    pub fn warm_up_timings(&self) -> Vec<TimingEntry> {
+        self.last_warmup_timings.lock().unwrap().iter()
+            .map(|(label, ms)| TimingEntry { label: label.clone(), ms: *ms })
+            .collect()
     }
 
     /// Opens `db_path` and loads/builds everything reusable across
@@ -203,22 +253,106 @@ impl GtfsRouterEngine {
     /// persisted copy exists, built fresh and persisted otherwise — same
     /// ~12-14s from-scratch cost the TS version documents, paid once).
     /// Safe to call again after a feed update; it re-opens and rebuilds.
+    ///
+    /// PERF NOTE: `stop_times`'s indexing/clustering is now entirely a
+    /// schema-level property of the DB the importer produces (WITHOUT
+    /// ROWID, keyed by `(stop_pk, departure_sec, trip_pk, stop_sequence)`
+    /// — see gtfs-importer's schema.sql) rather than something warm_up
+    /// patches in at runtime, so there's no first-run index-build cost
+    /// here to worry about any more. If a `warm_up` call against a given
+    /// DB file is surprisingly slow, check `warm_up_timings()`'s
+    /// `load_stops`/`graph_build_from_scratch` entries — those are the
+    /// remaining legitimate one-time-per-DB costs.
     pub fn warm_up(&self, db_path: String) -> Result<(), RouterError> {
+        let t_total = Instant::now();
+        let mut timings: Vec<(String, i64)> = Vec::new();
+        macro_rules! mark {
+            ($t:expr, $label:expr) => {
+                timings.push(($label.to_string(), $t.elapsed().as_millis() as i64));
+            };
+        }
+
+        let t = Instant::now();
         let mut conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA cache_size = -8000;")?;
+        mark!(t, "open_connection");
 
+        // PERF NOTE: `cache_size = -8000` is only an 8MB page cache — trivial
+        // against an ~11.86M-row `stop_times` table, so every
+        // windowed_trip_discovery/stop_times_fetch query was mostly paying
+        // for disk I/O SQLite would otherwise have cached. Bumped to 128MB
+        // (still small next to typical phone RAM) and added `mmap_size` so
+        // the OS page cache can serve pages SQLite's own cache evicted,
+        // instead of round-tripping through read() syscalls. `temp_store =
+        // MEMORY` keeps the TEMP TABLEs `stage_ids` creates (corridor_stop_
+        // pks / active_trip_pks_staged / windowed_trip_pks) off disk too —
+        // by default SQLite may spill temp tables to a file, which would
+        // otherwise silently tax every search's staging step.
+        let t = Instant::now();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA cache_size = -131072; \
+             PRAGMA mmap_size = 268435456; \
+             PRAGMA temp_store = MEMORY;"
+        )?;
+        mark!(t, "pragmas");
+
+        // REMOVED (was here): runtime `CREATE INDEX IF NOT EXISTS` for
+        // stop_times(stop_pk, departure_sec), stop_times(trip_pk), and
+        // trips(pattern_pk).
+        //
+        // Superseded by a schema-level fix in the importer crate instead of
+        // a router-side workaround: `stop_times` is now WITHOUT ROWID
+        // clustered by `(stop_pk, departure_sec, trip_pk, stop_sequence)` —
+        // see gtfs-importer's schema.sql for why — so stop_times' own
+        // physical row order already IS what
+        // idx_stop_times_stop_departure used to just duplicate, and
+        // idx_trips_pattern already exists via the importer's indexes.sql.
+        // idx_stop_times_trip was flat-out unnecessary — nothing anywhere
+        // queries stop_times by trip_pk alone — and building it from
+        // scratch over ~11.86M rows was the actual cause of the 54s
+        // warm_up spike a profiling run surfaced earlier; removing it here
+        // both avoids redoing work the importer already guarantees AND
+        // removes a genuinely wasted index build.
+        //
+        // If this engine ever needs to run against a DB built by an OLDER
+        // importer version (pre this schema change), route it through a
+        // migration/re-import step instead of re-adding defensive
+        // CREATE INDEX calls here — patching the symptom back in at the
+        // router level is exactly the workaround this fix replaced.
+
+        // ANALYZE-equivalent maintenance pass so the query planner has
+        // up-to-date statistics for the DB's actual index set (now defined
+        // entirely by the importer's schema.sql/indexes.sql, not by
+        // anything created here). Timed separately since it can itself
+        // scan a meaningful chunk of a multi-million-row table.
+        let t = Instant::now();
+        conn.execute_batch("PRAGMA optimize;")?;
+        mark!(t, "pragma_optimize");
+
+        let t = Instant::now();
         let stops = repo::load_stops(&conn)?;
+        mark!(t, "load_stops");
+        let t = Instant::now();
         let routes = repo::load_routes(&conn)?;
+        mark!(t, "load_routes");
+        let t = Instant::now();
         let patterns = repo::load_patterns(&conn, &routes)?;
+        mark!(t, "load_patterns");
+        let t = Instant::now();
         let shapes_index = repo::load_shape_index(&conn)?;
+        mark!(t, "load_shape_index");
 
+        let t = Instant::now();
         let signature = graph::store::compute_graph_signature(&conn)?;
+        mark!(t, "graph_signature");
+        let t = Instant::now();
         let adjacency = match graph::store::load_persisted_graph(&conn, &signature)? {
-            Some(adj) => adj,
+            Some(adj) => { mark!(t, "graph_load_persisted"); adj }
             None => {
                 let pattern_stops = repo::get_all_pattern_stops_ordered(&conn)?;
                 let adj = graph::coarse::build_adjacency_from_scratch(&stops, &pattern_stops);
                 graph::store::save_persisted_graph(&mut conn, &signature, &adj)?;
+                mark!(t, "graph_build_from_scratch");
                 adj
             }
         };
@@ -232,7 +366,11 @@ impl GtfsRouterEngine {
         });
         *self.conn.lock().unwrap() = Some(conn);
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
+        *self.bfs_cache.lock().unwrap() = corridor::resolver::SeedBfsCache::new();
         *self.active_services_cache.lock().unwrap() = None;
+
+        mark!(t_total, "total");
+        *self.last_warmup_timings.lock().unwrap() = timings;
 
         Ok(())
     }
@@ -245,6 +383,7 @@ impl GtfsRouterEngine {
         *self.state.write().unwrap() = None;
         *self.conn.lock().unwrap() = None;
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
+        *self.bfs_cache.lock().unwrap() = corridor::resolver::SeedBfsCache::new();
         *self.active_services_cache.lock().unwrap() = None;
     }
 
@@ -270,9 +409,10 @@ impl GtfsRouterEngine {
         let dest_ll: geo::LatLon = destination.into();
 
         let mut corridor_cache = self.corridor_cache.lock().unwrap();
+        let mut bfs_cache = self.bfs_cache.lock().unwrap();
 
         let mut index = loader::load_gtfs_index_for_trip(
-            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache,
+            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache, &mut bfs_cache,
             &self.active_services_cache,
             origin_ll, dest_ll, depart_sec_of_day as i64,
             &today_date, today_dow, &tomorrow_date, tomorrow_dow, None,
@@ -282,9 +422,7 @@ impl GtfsRouterEngine {
             return Err(RouterError::NoServiceFound);
         }
 
-        let t_debug_emit = Instant::now();
-        emit_pre_search_debug(&debug, conn, &state.stops, &state.patterns, &state.shapes_index, &state.graph, &index);
-        let mut debug_emit_ms = t_debug_emit.elapsed().as_millis() as i64;
+        let mut debug_emit_ms: i64 = 0;
 
         let opts = raptor::RaptorOptions { walking_speed_mps, ..Default::default() };
         let stops_for_cb = state.stops.clone();
@@ -300,10 +438,73 @@ impl GtfsRouterEngine {
         // captured copies since they're both alive (and both re-borrowed
         // across the retry below) for the same run_search call.
         let stops_for_route_cb = state.stops.clone();
+        let graph_for_route_cb = state.graph.clone();
+        let patterns_for_route_cb = state.patterns.clone();
+        let shapes_index_for_route_cb = state.shapes_index.clone();
         let debug_for_route_cb = debug.clone();
+        // Populated on demand as new patterns show up in ridden chains —
+        // shared across every call this search makes, so the same pattern
+        // (very likely, since RAPTOR keeps re-riding the same handful of
+        // corridor-restricted lines round after round) only costs one DB
+        // fetch total instead of one per route-check. `conn` is borrowed
+        // for the lifetime of this call (not stored past it), same as
+        // every other closure here.
+        let mut shape_cache_for_route_cb: HashMap<(i64, String), Vec<(f64, f64)>> = HashMap::new();
         let mut on_route_check = move |round: u32, ridden: &[i64], route_color: Option<&str>, route_name: Option<&str>| {
             if let Some(sink) = &debug_for_route_cb {
-                let pts: Vec<LatLng> = ridden.iter().filter_map(|&pk| stops_for_route_cb.get(pk).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon })).collect();
+                // CHANGED: this used to be a straight stop-to-stop
+                // polyline (one LatLng per ridden stop_pk, no shape
+                // resolution at all — see shapes_index's old
+                // #[allow(dead_code)] "reserved for follow-up shape-
+                // polyline work" note, which this is). Now mirrors
+                // emit_pre_search_debug's seed-path handling: walk each
+                // consecutive pair in the ridden chain, resolve the real
+                // GTFS shape for a transit edge via shaped_edge_coords
+                // (fetching+caching the shape on first use), and fall back
+                // to a straight segment only for walk edges or a pattern
+                // with no shape — instead of every hop being a straight
+                // line regardless of pattern.
+                let mut pts: Vec<LatLng> = Vec::new();
+                for w in ridden.windows(2) {
+                    let (from, to) = (w[0], w[1]);
+                    let (Some(from_ll), Some(to_ll)) = (
+                        stops_for_route_cb.get(from).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon }),
+                        stops_for_route_cb.get(to).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon }),
+                    ) else { continue };
+
+                    let edge = graph_for_route_cb.adjacency.get(&from).and_then(|edges| edges.iter().find(|e| e.to == to));
+                    let seg: Vec<LatLng> = match edge {
+                        Some(e) if e.kind == graph::coarse::EdgeKind::Transit => {
+                            match e.via_pattern.and_then(|pk| patterns_for_route_cb.get(pk).map(|m| (pk, m))) {
+                                Some((pattern_pk, meta)) => {
+                                    if let Some(shape_id) = &meta.shape_id {
+                                        let key = (meta.agency, shape_id.clone());
+                                        if !shape_cache_for_route_cb.contains_key(&key) {
+                                            if let Ok(fetched) = repo::get_shape_points(conn, &shapes_index_for_route_cb, std::slice::from_ref(&key)) {
+                                                if let Some(points) = fetched.get(&key) {
+                                                    shape_cache_for_route_cb.insert(key.clone(), points.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    shaped_edge_coords(from_ll, to_ll, pattern_pk, &patterns_for_route_cb, &shape_cache_for_route_cb)
+                                }
+                                None => vec![from_ll, to_ll],
+                            }
+                        }
+                        _ => vec![from_ll, to_ll], // walk edge, or edge not found — straight line
+                    };
+
+                    if !seg.is_empty() {
+                        if let Some(last) = pts.last() {
+                            if last.latitude == seg[0].latitude && last.longitude == seg[0].longitude {
+                                pts.extend(seg.into_iter().skip(1));
+                                continue;
+                            }
+                        }
+                        pts.extend(seg);
+                    }
+                }
                 if pts.len() >= 2 {
                     sink.on_event(DebugEvent::RaptorRouteCheck { round, coords: pts, route_color: route_color.map(String::from), route_name: route_name.map(String::from) });
                 }
@@ -321,15 +522,12 @@ impl GtfsRouterEngine {
                 // computeGtfsRoute in the TS version: a window wide enough
                 // to find SOME trips but not a later leg's boarding trip.
                 index = loader::load_gtfs_index_for_trip(
-                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache,
+                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache, &mut bfs_cache,
                     &self.active_services_cache,
                     origin_ll, dest_ll, depart_sec_of_day as i64,
                     &today_date, today_dow, &tomorrow_date, tomorrow_dow, Some(10 * 3600),
                 )?;
                 if index.no_service_found { return Err(RouterError::NoServiceFound); }
-                let t_retry_emit = Instant::now();
-                emit_pre_search_debug(&debug, conn, &state.stops, &state.patterns, &state.shapes_index, &state.graph, &index);
-                debug_emit_ms += t_retry_emit.elapsed().as_millis() as i64;
                 let t_retry = Instant::now();
                 let retried = raptor::run_search(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, &opts, Some(&mut on_round), Some(&mut on_route_check))
                     .map_err(RouterError::NoRoute)?;
@@ -341,6 +539,19 @@ impl GtfsRouterEngine {
                 retried
             }
         };
+
+        // Emitted exactly ONCE, here, using whichever `index` actually ended
+        // up producing `journeys` — NOT before the first raptor attempt.
+        // Emitting pre-emptively (as this used to) meant a retry re-emitted
+        // a full second copy of the seed-BFS/seed-path debug data (the
+        // corridor doesn't depend on the departure-time window the retry
+        // widens, so it's usually the SAME candidates re-sent under fresh
+        // path_index numbers) — a debug consumer that doesn't explicitly
+        // reset between emissions would show both attempts' candidates
+        // overlaid as if they were one search.
+        let t_debug_emit = Instant::now();
+        emit_pre_search_debug(&debug, conn, &state.stops, &state.patterns, &state.routes, &state.shapes_index, &state.graph, &index);
+        debug_emit_ms += t_debug_emit.elapsed().as_millis() as i64;
 
         // ── Real shapes for the FINAL journeys, not just the debug seed-path
         // view ── previously every journey's transit segments were straight
@@ -371,7 +582,8 @@ impl GtfsRouterEngine {
 /// onto its pattern's GTFS shape polyline so a seed-path edge can be
 /// trimmed to the real ridden portion instead of drawn as a straight line.
 /// Linear scan: shapes are at most a few hundred points and this only runs
-/// for the small candidate seed-path set, not every pattern in the feed.
+/// for the small candidate seed-path set and the raptor debug route-check
+/// callback, not every pattern in the feed.
 fn nearest_shape_index(shape: &[(f64, f64)], target: geo::LatLon) -> Option<usize> {
     shape.iter()
         .enumerate()
@@ -479,23 +691,40 @@ fn emit_pre_search_debug(
     conn: &rusqlite::Connection,
     stops: &repo::StopsCache,
     patterns: &repo::PatternsCache,
+    routes: &repo::RoutesCache,
     shapes_index: &repo::ShapesIndex,
     graph: &graph::coarse::CoarseGraph,
     index: &loader::GtfsIndex,
 ) {
+    // A pattern's real GTFS route_color, if it has one — PatternMeta itself
+    // only carries `route_key` (see repo.rs), the color lives on
+    // RoutesCache::info_by_id, same indirection raptor.rs's own route_color
+    // lookups already go through (there via loader::PatternMetaFull, which
+    // bakes the color straight onto the pattern; this cache doesn't, so the
+    // lookup is spelled out here instead).
+    let pattern_route_color = |pattern_pk: i64| -> Option<String> {
+        let meta = patterns.get(pattern_pk)?;
+        let route_id = meta.route_key?;
+        let info = routes.info_by_id.get(route_id as usize)?;
+        if info.route_color.is_empty() { None } else { Some(format!("#{}", info.route_color.trim_start_matches('#').to_uppercase())) }
+    };
     let Some(sink) = debug else { return };
     let to_ll = |pk: i64| stops.get(pk).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon });
 
-    // Each side's own level counter — the list itself is in expansion
-    // order (interleaved by whichever side had the smaller frontier), not
-    // a single shared step count, so `level` per event has to be tracked
-    // separately per direction rather than taken from the list position.
-    let (mut fwd_level, mut bwd_level) = (0u32, 0u32);
-    for (dir, stop_pks) in &index.debug_bfs_levels {
-        let level = match dir {
-            corridor::seed_bfs::SearchDir::Forward => { let l = fwd_level; fwd_level += 1; l }
-            corridor::seed_bfs::SearchDir::Backward => { let l = bwd_level; bwd_level += 1; l }
-        };
+    // BUGFIX: this used to track fwd_level/bwd_level SEPARATELY (each
+    // restarting at 0), on the theory that the frontend would want to know
+    // "which forward step" vs "which backward step" a snapshot was. But
+    // debugSinkCollector.ts (TS side) writes these into ONE flat array by
+    // `level` alone (`bfsLevels[event.inner.level] = event.inner.stops`),
+    // with no awareness of `dir` at all — so a Forward level-0 event and a
+    // Backward level-0 event collided in the same array slot, and whichever
+    // one arrived second silently won. Since debug_bfs_levels is already in
+    // expansion order (see resolver.rs's own doc comment on the field),
+    // the fix is to use each entry's OWN position in that list as `level`
+    // — a single shared step count — matching what the frontend already
+    // assumes instead of quietly fighting it.
+    for (i, (dir, stop_pks)) in index.debug_bfs_levels.iter().enumerate() {
+        let level = i as u32;
         let pts: Vec<LatLng> = stop_pks.iter().filter_map(|&pk| to_ll(pk)).collect();
         sink.on_event(DebugEvent::SeedBfsLevel { dir: (*dir).into(), level, stops: pts });
     }
@@ -527,29 +756,35 @@ fn emit_pre_search_debug(
         repo::get_shape_points(conn, shapes_index, &needed_shapes).unwrap_or_default()
     };
 
-    for path in &index.debug_seed_paths {
-        let mut pts: Vec<LatLng> = Vec::new();
-        for w in path.windows(2) {
+    for (path_index, path) in index.debug_seed_paths.iter().enumerate() {
+        // CHANGED: previously concatenated every hop's points into one flat
+        // `pts` buffer and lost the hop boundary in the process. Now each
+        // hop becomes its own SeedPathHop — no more accumulation across the
+        // loop, and no more "duplicate point at the join" handling since
+        // hops are no longer joined together at all (that's now the
+        // frontend's call, if/when it wants one flattened polyline back —
+        // see debugSinkCollector.ts's rebuildFlatSeedPaths).
+        let depth = index.debug_seed_path_depths.get(path_index).copied().unwrap_or(0);
+        let mut hops: Vec<SeedPathHop> = Vec::new();
+        for (hop_index, w) in path.windows(2).enumerate() {
             let (from, to) = (w[0], w[1]);
             let (Some(from_ll), Some(to_ll)) = (to_ll(from), to_ll(to)) else { continue };
             let edge = graph.adjacency.get(&from).and_then(|edges| edges.iter().find(|e| e.to == to));
-            let seg = match edge {
+            let (coords, is_walk, route_color) = match edge {
                 Some(e) if e.kind == graph::coarse::EdgeKind::Transit => {
                     match e.via_pattern {
-                        Some(pattern_pk) => shaped_edge_coords(from_ll, to_ll, pattern_pk, patterns, &shape_points),
-                        None => vec![from_ll, to_ll],
+                        Some(pattern_pk) => {
+                            let coords = shaped_edge_coords(from_ll, to_ll, pattern_pk, patterns, &shape_points);
+                            (coords, false, pattern_route_color(pattern_pk))
+                        }
+                        None => (vec![from_ll, to_ll], false, None),
                     }
                 }
-                _ => vec![from_ll, to_ll], // walk edge, or edge not found — straight line
+                _ => (vec![from_ll, to_ll], true, None), // walk edge, or edge not found — straight line
             };
-            // Avoid a duplicate point at the join between consecutive edges.
-            if pts.last() == seg.first() {
-                pts.extend(seg.into_iter().skip(1));
-            } else {
-                pts.extend(seg);
-            }
+            hops.push(SeedPathHop { hop_index: hop_index as u32, coords, is_walk, route_color });
         }
-        sink.on_event(DebugEvent::SeedPath { path: pts });
+        sink.on_event(DebugEvent::SeedPath { path_index: path_index as u32, depth, hops });
     }
 
     for boundary in &index.debug_corridor_boundary {

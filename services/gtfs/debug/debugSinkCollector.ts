@@ -33,6 +33,17 @@
 // not just the current round's own segment — again, only the CONTENTS
 // changed; see the type note on GtfsDebugInfo.routeChecks itself.
 //
+// HOP-COLORED CANDIDATES (new): lib.rs's SeedPath event changed shape from
+// a single flattened `path: LatLng[]` to `{ pathIndex, hops: SeedPathHop[] }`
+// — one entry per transit boarding / walk leg, not pre-joined into one
+// polyline. This collector now ALSO builds `seedPathHops` (indexed by
+// pathIndex, each entry that candidate's ordered hop list) alongside the
+// existing flat `seedPaths` reconstruction, so nothing that reads
+// `seedPaths` today has to change — hop-colored rendering is purely
+// additive. `seedPaths[pathIndex]` is rebuilt here by concatenating that
+// candidate's own hops (same dedup-shared-point logic the Rust side used
+// to do itself), so a stale/duplicate join point doesn't leak in.
+//
 // KNOWN GAPS vs the TS path (see lib.rs's DebugEvent enum):
 //   - No `bfsTreeEdges`. The Rust side emits per-level frontier SNAPSHOTS
 //     (SeedBfsLevel{level, stops}), not individual parent->child discovery
@@ -52,11 +63,14 @@
 // the first attempt's rather than replacing them. RaptorRouteCheck events
 // carry their own `round`, so a retry's round 0 will collide with the
 // first attempt's round 0 in `routeChecks[0]` the same way `roundMarkedStops`
-// already does — pre-existing behavior, not new here.
+// already does — pre-existing behavior, not new here. SeedPath events are
+// now written by `pathIndex` (see below), so a retry's re-emitted
+// candidates overwrite rather than duplicate, same reasoning.
 
 import {DebugEvent_Tags} from '@/modules/gtfs-router-rust';
 import type {DebugEvent, DebugSink} from '@/modules/gtfs-router-rust';
 import type {GtfsDebugInfo} from '../router/raptorRouter';
+import type {Pt, SeedPathHop} from '../debug/debugBfsPoints';
 
 export interface DebugCollectorHandle {
     sink: DebugSink; // plain object literal — pass THIS to compute_route's debug param
@@ -67,7 +81,17 @@ export interface DebugCollectorHandle {
  *  same lifecycle as the old class was meant to have — just not a class. */
 export function createDebugSinkCollector(): DebugCollectorHandle {
     const bfsLevels: GtfsDebugInfo['bfsLevels'] = [];
-    const seedPaths: GtfsDebugInfo['seedPaths'] = [];
+    // Indexed by path_index (write-by-index, like bfsLevels/roundMarkedStops
+    // below, so a retry's re-emitted candidate overwrites in place rather
+    // than duplicating).
+    const seedPathHops: SeedPathHop[][] = [];
+    // Depth (relative to shortest meet) of each candidate, indexed by
+    // pathIndex — same write-by-index/overwrite-on-retry treatment as
+    // seedPathHops. Comes from lib.rs's SeedPath.depth (NEW — see
+    // seed_bfs.rs's rank_meets depth-bucketing), lets rendering color a
+    // candidate by transfer-count tier instead of every candidate
+    // defaulting to one flat color.
+    const seedPathDepths: number[] = [];
     const corridorBoundary: GtfsDebugInfo['corridorBoundary'] = [];
     const roundMarkedStops: GtfsDebugInfo['roundMarkedStops'] = [];
     // Per round, every individual candidate-route polyline RAPTOR examined
@@ -87,7 +111,18 @@ export function createDebugSinkCollector(): DebugCollectorHandle {
                     bfsLevels[event.inner.level] = event.inner.stops;
                     break;
                 case DebugEvent_Tags.SeedPath:
-                    seedPaths.push(event.inner.path);
+                    // CHANGED: was `seedPaths.push(event.inner.path)` — a single
+                    // pre-flattened polyline. Now each event carries one
+                    // candidate's hops (plus its depth, NEW); write by
+                    // pathIndex (see comment above).
+                    seedPathHops[event.inner.pathIndex] = event.inner.hops.map(h => ({
+                        pathIndex: event.inner.pathIndex,
+                        hopIndex: h.hopIndex,
+                        coords: h.coords,
+                        isWalk: h.isWalk,
+                        routeColor: h.routeColor ?? undefined,
+                    }));
+                    seedPathDepths[event.inner.pathIndex] = event.inner.depth;
                     break;
                 case DebugEvent_Tags.CorridorBoundary:
                     corridorBoundary.push({left: event.inner.left, right: event.inner.right});
@@ -114,12 +149,38 @@ export function createDebugSinkCollector(): DebugCollectorHandle {
         },
     };
 
+    /** Rebuilds the flat single-polyline-per-candidate shape (`seedPaths`)
+     *  from `seedPathHops`, for callers that only need "the whole
+     *  candidate route" and don't care about hop boundaries — same
+     *  duplicate-join-point dedup the Rust side used to do itself before
+     *  hops were split apart. Keeps `seedPaths` working unchanged for any
+     *  existing consumer (flattenBfsCandidates, the cumulative/single bfs
+     *  view) without them needing to know hops exist at all. */
+    function rebuildFlatSeedPaths(): Pt[][] {
+        return seedPathHops.filter(Boolean).map(hops => {
+            const pts: Pt[] = [];
+            for (const hop of hops) {
+                const seg = hop.coords;
+                if (pts.length > 0 && seg.length > 0 &&
+                    pts[pts.length - 1].latitude === seg[0].latitude &&
+                    pts[pts.length - 1].longitude === seg[0].longitude) {
+                    pts.push(...seg.slice(1));
+                } else {
+                    pts.push(...seg);
+                }
+            }
+            return pts;
+        });
+    }
+
     return {
         sink,
         toDebugInfo(): GtfsDebugInfo {
             return {
                 corridorStops: [], // not reported by the Rust side — see header note
-                seedPaths,
+                seedPaths: rebuildFlatSeedPaths(),
+                seedPathHops: seedPathHops.filter(Boolean),
+                seedPathDepths: seedPathHops.map((hops, i) => hops ? (seedPathDepths[i] ?? 0) : undefined).filter((d): d is number => d !== undefined),
                 bfsLevels: bfsLevels.filter(Boolean), // drop any holes from out-of-order writes
                 bfsTreeEdges: [], // not reported by the Rust side — see header note
                 roundMarkedStops: roundMarkedStops.filter(Boolean),

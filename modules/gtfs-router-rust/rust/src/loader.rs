@@ -38,6 +38,7 @@
 //! queries) — the IN(SELECT) shape still needs one to be fast.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -49,7 +50,8 @@ use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
 use crate::repo::{PatternsCache, RoutesCache, StopsCache};
-use crate::corridor::resolver::{resolve_corridor, CorridorCache};
+use crate::corridor::resolver::{resolve_corridor, CorridorCache, SeedBfsCache};
+use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS};
 use crate::corridor::tagging::CorridorBoundary;
 use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
@@ -94,12 +96,23 @@ pub struct GtfsIndex {
     pub patterns_by_pk: HashMap<i64, PatternMetaFull>,
     /// pattern_pk -> [(stop_pk, stop_sequence)], ordered by stop_sequence.
     pub pattern_stops: HashMap<i64, Vec<(i64, i64)>>,
-    pub stop_times_by_stop: HashMap<i64, Vec<StopTimeEntry>>, // sorted by departure_sec
-    pub stop_times_by_stop_and_trip: HashMap<i64, HashMap<i64, StopTimeEntry>>,
+    pub stop_times_by_stop: HashMap<i64, Vec<Rc<StopTimeEntry>>>, // sorted by departure_sec
+    /// Same rows as `stop_times_by_stop`, but keyed by (stop_pk, pattern_pk)
+    /// instead of just stop_pk, each still sorted by departure_sec. Lets the
+    /// RAPTOR boarding search binary-search directly into "the next
+    /// departure of THIS pattern at this stop" instead of binary-searching
+    /// the flat per-stop list (which interleaves every OTHER pattern
+    /// serving the same stop) and then linear-scanning past every
+    /// non-matching entry to find the next one that matches — expensive at
+    /// a busy interchange served by many patterns. `stop_times_by_stop`
+    /// itself is kept as-is for any future "any pattern at this stop"
+    /// lookup, rather than removed.
+    pub stop_times_by_stop_and_pattern: HashMap<(i64, i64), Vec<Rc<StopTimeEntry>>>,
+    pub stop_times_by_stop_and_trip: HashMap<i64, HashMap<i64, Rc<StopTimeEntry>>>,
     pub no_service_found: bool,
     pub debug_seed_paths: Vec<Vec<i64>>,
+    pub debug_seed_path_depths: Vec<u32>,
     pub debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>,
-    pub debug_bfs_tree_edges: Vec<(i64, i64)>,
     pub debug_corridor_boundary: Vec<CorridorBoundary>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
@@ -107,11 +120,11 @@ pub struct GtfsIndex {
     pub timings: Vec<(String, i64)>,
 }
 
-fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>, debug_bfs_tree_edges: Vec<(i64, i64)>, debug_corridor_boundary: Vec<CorridorBoundary>, timings: Vec<(String, i64)>) -> GtfsIndex {
+fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, debug_seed_path_depths: Vec<u32>, debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>, debug_corridor_boundary: Vec<CorridorBoundary>, timings: Vec<(String, i64)>) -> GtfsIndex {
     GtfsIndex {
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
-        stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
-        no_service_found: true, debug_seed_paths, debug_bfs_levels, debug_bfs_tree_edges, debug_corridor_boundary, timings,
+        stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
+        no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary, timings,
     }
 }
 
@@ -126,19 +139,61 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
 /// inside `load_gtfs_index_for_trip`'s call chain without threading a
 /// `&mut Connection` all the way through (a bigger change than this fix
 /// warrants).
+/// Rows per multi-value INSERT batch. SQLite's own limit on bound
+/// parameters is 999 by default (`SQLITE_LIMIT_VARIABLE_NUMBER`); 500
+/// leaves headroom while still cutting a several-thousand-row staging
+/// pass from thousands of round-trips down to single digits.
+const STAGE_BATCH_SIZE: usize = 500;
+
+/// Stages a list of i64 pks into a per-connection TEMP TABLE named
+/// `table_name`, clearing any previous contents first. The table is
+/// created once (IF NOT EXISTS) and reused across searches on the same
+/// connection — cheaper than DROP/CREATE every call, and TEMP TABLEs are
+/// already connection-scoped so there's no cross-search leakage risk.
+///
+/// PERF NOTE (added alongside the on-device GTFS importer's move to
+/// batched multi-value INSERTs, same reasoning applies here): this used
+/// to `stmt.execute([id])` once per id — a fresh bind+step+reset per row.
+/// For a several-thousand-row corridor stop set or windowed-trip set,
+/// that's several thousand engine round-trips just to stage data that's
+/// about to be queried back out. Rewritten to build one multi-value
+/// `INSERT ... VALUES (?),(?),...` per `STAGE_BATCH_SIZE`-row chunk
+/// instead, cutting round-trips by ~500x with no change in what ends up
+/// in the table.
 fn stage_ids(conn: &Connection, table_name: &str, ids: &[i64]) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
         "CREATE TEMP TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY)"
     ))?;
     conn.execute_batch("BEGIN")?;
-    conn.execute(&format!("DELETE FROM {table_name}"), [])?;
-    {
-        let mut stmt = conn.prepare(&format!("INSERT INTO {table_name} (id) VALUES (?1)"))?;
-        for id in ids {
-            stmt.execute([id])?;
+    // NOTE: `conn` is a long-lived, reused connection (kept open for the
+    // engine's whole lifetime), so if anything below fails partway through
+    // the transaction we MUST roll back before returning — otherwise the
+    // connection is left sitting inside an open transaction indefinitely,
+    // silently breaking every later query/write on it. See stage_ids_inner
+    // for the fallible body; this wrapper just guarantees cleanup on Err.
+    match stage_ids_inner(conn, table_name, ids) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback: if this also fails there's nothing more
+            // we can do from here, but we still want to surface the
+            // original error rather than the rollback failure.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
         }
     }
-    conn.execute_batch("COMMIT")?;
+}
+
+fn stage_ids_inner(conn: &Connection, table_name: &str, ids: &[i64]) -> rusqlite::Result<()> {
+    conn.execute(&format!("DELETE FROM {table_name}"), [])?;
+    for chunk in ids.chunks(STAGE_BATCH_SIZE) {
+        let placeholders = chunk.iter().map(|_| "(?)").collect::<Vec<_>>().join(",");
+        let sql = format!("INSERT INTO {table_name} (id) VALUES {placeholders}");
+        let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        conn.execute(&sql, params.as_slice())?;
+    }
     Ok(())
 }
 
@@ -150,6 +205,7 @@ pub fn load_gtfs_index_for_trip(
     routes: &RoutesCache,
     graph: &CoarseGraph,
     corridor_cache: &mut CorridorCache,
+    bfs_cache: &mut SeedBfsCache,
     active_services_cache: &Mutex<Option<ActiveServicesCacheEntry>>,
     origin: LatLon,
     destination: LatLon,
@@ -168,37 +224,17 @@ pub fn load_gtfs_index_for_trip(
         };
     }
 
-    // ── 1. Corridor -> candidate patterns + stops ───────────────────────
-    let t = Instant::now();
-    let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, origin, destination)?;
-    mark!(t, "corridor_resolution");
-    for (label, ms) in &resolved.sub_timings {
-        timings.push((format!("corridor.{label}"), *ms));
-    }
-
-    let allowed_stop_pks = resolved.allowed_stop_pks.clone();
-    let candidate_pattern_pks: Vec<i64> = resolved.pattern_pks.iter().copied().collect();
-
-    if candidate_pattern_pks.is_empty() {
-        mark!(t_total, "total");
-        return Ok(empty_index(
-            allowed_stop_pks, resolved.debug_seed_paths.clone(), resolved.debug_bfs_levels.clone(),
-            resolved.debug_bfs_tree_edges.clone(), resolved.debug_corridor_boundary.clone(), timings,
-        ));
-    }
-
-    // ── 2. Active service_ids for TODAY and TOMORROW ────────────────────
+    // ── Active service_ids for TODAY and TOMORROW ───────────────────────
     // A search close to midnight can need trips only active under
     // tomorrow's calendar entry — same reasoning as the TS version.
     //
     // This result depends ONLY on (today_date, tomorrow_date) — never on
     // origin/destination/corridor — so it's identical for every search
-    // made on the same calendar day. It was previously recomputed from
-    // scratch on every call (including the retry-with-wider-window path,
-    // i.e. twice in a single compute_route call on a retry), even though
-    // stops/patterns/routes/graph right above it are all warmed once and
-    // reused. Cached here the same way, at GtfsRouterEngine's level, keyed
-    // by date so it self-invalidates the moment the date rolls over.
+    // made on the same calendar day, and identical across every attempt of
+    // the retry ladder below. Computed once, up front (moved ahead of
+    // corridor resolution for exactly that reason), cached at
+    // GtfsRouterEngine's level, keyed by date so it self-invalidates the
+    // moment the date rolls over.
     let t = Instant::now();
     let active_services: Arc<HashSet<(i64, String)>> = {
         let mut cache_guard = active_services_cache.lock().unwrap();
@@ -244,44 +280,92 @@ pub fn load_gtfs_index_for_trip(
             }
         }
     };
-
     mark!(t, "active_services");
 
-    // ── 3. Trips for candidate patterns, filtered to active services ────
-    // Staged into a temp table + JOIN instead of chunked IN(...) — see
-    // this file's module-level PERF NOTE.
-    let t = Instant::now();
-    stage_ids(conn, "candidate_pattern_pks", &candidate_pattern_pks)?;
-
-    let mut active_trip_pks: HashSet<i64> = HashSet::new();
-    let mut pattern_keys_with_active_trip: HashSet<i64> = HashSet::new();
-    // trip_pk -> pattern_pk (agency implicit via pattern; not needed further)
-    let mut trip_pk_to_pattern: HashMap<i64, i64> = HashMap::new();
-
-    {
-        let mut stmt = conn.prepare(
-            "SELECT trip_pk, agency, pattern_pk, service_id \
-             FROM trips \
-             WHERE pattern_pk IN (SELECT id FROM candidate_pattern_pks)"
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
-        })?;
-        for row in rows {
-            let (trip_pk, agency, pattern_pk, service_id) = row?;
-            if !active_services.contains(&(agency, service_id)) { continue; }
-            active_trip_pks.insert(trip_pk);
-            trip_pk_to_pattern.insert(trip_pk, pattern_pk);
-            pattern_keys_with_active_trip.insert(pattern_pk);
+    // ── Corridor -> candidate patterns -> trips actually running today ──
+    // Retried with a bigger seed-meet batch if a batch comes back with no
+    // pattern that has an active trip at all. BFS itself only ever runs
+    // ONCE per (origin, destination, max_transfers) — see corridor::
+    // resolver::SeedBfsCache — a retry here just re-slices the SAME ranked
+    // meeting-node list into a bigger batch and re-pays the cheap
+    // ancestor-union/backtrack/SQL-pattern-lookup/trips-query cost, not
+    // the graph walk. Replaces the old geometric bbox-fallback, which used
+    // to trigger on a corridor-SHAPE heuristic (MIN_ACCEPTABLE_PATTERNS)
+    // rather than on the thing that actually matters here: whether a real,
+    // currently-running trip came out the other end.
+    let mut batch_size = TOP_N_SEED_MEETS;
+    let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
+        let t = Instant::now();
+        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size)?;
+        mark!(t, "corridor_resolution");
+        for (label, ms) in &resolved.sub_timings {
+            timings.push((format!("corridor.{label}"), *ms));
         }
-    }
-    mark!(t, "trips_for_candidates");
 
-    if pattern_keys_with_active_trip.is_empty() {
+        let allowed_stop_pks = resolved.allowed_stop_pks.clone();
+        let candidate_pattern_pks: Vec<i64> = resolved.pattern_pks.iter().copied().collect();
+
+        // COUNT LOGGING (not real durations — piggybacking on the
+        // (label, i64) timings channel, same trick already used for
+        // active_trip_filter_sql). These two numbers are the actual
+        // fan-out driver for both windowed_trip_discovery/stop_times_fetch
+        // queries' `stop_pk IN (SELECT id FROM corridor_stop_pks)`
+        // semi-join. `count.seed_bfs_meets_total` (from resolve_corridor's
+        // own sub_timings) is the pre-batch candidate count — how many
+        // meeting nodes existed to choose from, independent of batch_size.
+        timings.push(("count.corridor_stop_pks".to_string(), allowed_stop_pks.len() as i64));
+        timings.push(("count.candidate_pattern_pks".to_string(), candidate_pattern_pks.len() as i64));
+
+        let mut active_trip_pks: HashSet<i64> = HashSet::new();
+        let mut pattern_keys_with_active_trip: HashSet<i64> = HashSet::new();
+        // trip_pk -> pattern_pk (agency implicit via pattern; not needed further)
+        let mut trip_pk_to_pattern: HashMap<i64, i64> = HashMap::new();
+
+        if !candidate_pattern_pks.is_empty() {
+            // Staged into a temp table + JOIN instead of chunked IN(...) —
+            // see this file's module-level PERF NOTE.
+            let t = Instant::now();
+            stage_ids(conn, "candidate_pattern_pks", &candidate_pattern_pks)?;
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT trip_pk, agency, pattern_pk, service_id \
+                     FROM trips \
+                     WHERE pattern_pk IN (SELECT id FROM candidate_pattern_pks)"
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+                })?;
+                for row in rows {
+                    let (trip_pk, agency, pattern_pk, service_id) = row?;
+                    if !active_services.contains(&(agency, service_id)) { continue; }
+                    active_trip_pks.insert(trip_pk);
+                    trip_pk_to_pattern.insert(trip_pk, pattern_pk);
+                    pattern_keys_with_active_trip.insert(pattern_pk);
+                }
+            }
+            mark!(t, "trips_for_candidates");
+            timings.push(("count.active_trip_pks".to_string(), active_trip_pks.len() as i64));
+        }
+
+        // Nothing left to gain from a bigger batch once it already covers
+        // every meeting node BFS found, or the ceiling is reached — stop
+        // retrying and return whatever this (possibly still-empty)
+        // attempt found, same as before the retry ladder existed.
+        let exhausted = batch_size >= resolved.total_seed_meets_found || batch_size >= SEED_MEETS_RETRY_CEILING;
+
+        if !pattern_keys_with_active_trip.is_empty() || exhausted {
+            break (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern);
+        }
+
+        timings.push(("seed_batch_retry.from_batch_size".to_string(), batch_size as i64));
+        batch_size = (batch_size * 2).min(SEED_MEETS_RETRY_CEILING);
+    };
+
+    if candidate_pattern_pks.is_empty() || pattern_keys_with_active_trip.is_empty() {
         mark!(t_total, "total");
         return Ok(empty_index(
-            allowed_stop_pks, resolved.debug_seed_paths.clone(), resolved.debug_bfs_levels.clone(),
-            resolved.debug_bfs_tree_edges.clone(), resolved.debug_corridor_boundary.clone(), timings,
+            allowed_stop_pks, resolved.debug_seed_paths.clone(), resolved.debug_seed_path_depths.clone(), resolved.debug_bfs_levels.clone(),
+            resolved.debug_corridor_boundary.clone(), timings,
         ));
     }
 
@@ -338,7 +422,9 @@ pub fn load_gtfs_index_for_trip(
     // Staged ONCE before the window-widening loop below — the corridor
     // stop set doesn't change across widening stages, only the time
     // window does, so there's no reason to re-stage per stage.
+    let t_stage_corridor = Instant::now();
     stage_ids(conn, "corridor_stop_pks", &corridor_stop_pks)?;
+    mark!(t_stage_corridor, "stage_corridor_stop_pks");
 
     // Surfaces which side of the settings::USE_SQL_ACTIVE_TRIP_FILTER A/B
     // this run took, right in the stage-timings log line — not a real
@@ -353,106 +439,135 @@ pub fn load_gtfs_index_for_trip(
     // Rust HashSet per row.
     if crate::settings::USE_SQL_ACTIVE_TRIP_FILTER {
         let active_trip_pks_vec: Vec<i64> = active_trip_pks.iter().copied().collect();
+        let t_stage_active = Instant::now();
         stage_ids(conn, "active_trip_pks_staged", &active_trip_pks_vec)?;
+        mark!(t_stage_active, "stage_active_trip_pks");
     }
 
+    // Per-widening-stage sub-timings — surfaced separately from the total
+    // below so a slow discovery+fetch can be traced to EITHER "the first
+    // (narrowest) window attempt is just slow" (query/index problem, same
+    // cost regardless of how many stages run) OR "we're paying for 2-3
+    // widening attempts because the initial window kept coming up empty"
+    // (a tuning problem in INITIAL_WINDOW_*/WINDOW_WIDENING_STAGES_SEC, not
+    // a query-speed problem). Previously only the sum across every attempt
+    // was visible, which conflated those two very different root causes.
+    //
+    // MERGED with stop_times_fetch (previously a separate step below):
+    // both queries were doing the exact same
+    // `stop_pk IN corridor ∧ departure_sec BETWEEN ∧ trip_pk IN active`
+    // scan — discovery to get just trip_pk, then fetch to get full rows
+    // for those trip_pks. On the common case (the first/narrowest window
+    // already finds trips — true for the large majority of searches),
+    // that's the same corridor+window scan done twice for no reason. Now
+    // each attempt fetches full rows directly; windowed_trip_pks (used
+    // only for logging/the no-service check) is derived from the result
+    // set's distinct trip_pks instead of a separate query. The widening
+    // loop still only exists to retry with a wider window when an attempt
+    // comes back empty, so nothing is wasted on the (rare) widening path
+    // either — an empty attempt fetches zero rows either way.
+    let mut stop_times_by_stop: HashMap<i64, Vec<Rc<StopTimeEntry>>> = HashMap::new();
+    let mut stop_times_by_stop_and_pattern: HashMap<(i64, i64), Vec<Rc<StopTimeEntry>>> = HashMap::new();
+    let mut stop_times_by_stop_and_trip: HashMap<i64, HashMap<i64, Rc<StopTimeEntry>>> = HashMap::new();
     let mut windowed_trip_pks: HashSet<i64> = HashSet::new();
+    let mut stages_tried: i64 = 0;
+    let mut rows_returned_total: i64 = 0;
     for &window_sec in &window_stages {
+        let t_stage = Instant::now();
+        stages_tried += 1;
         let window_lo = (depart_sec_of_day - WINDOW_BOARD_BUFFER_SEC).max(0);
         let window_hi = depart_sec_of_day + window_sec;
 
+        stop_times_by_stop.clear();
+        stop_times_by_stop_and_pattern.clear();
+        stop_times_by_stop_and_trip.clear();
         windowed_trip_pks.clear();
+        let mut rows_returned: i64 = 0;
+
+        // stop_pk IN (corridor_stop_pks) filters in SQL instead of after
+        // fetching: a trip's full stop sequence can run well outside a
+        // narrow corridor (system-wide route vs. a slice of it), so
+        // without this, every out-of-corridor stop would still get
+        // decoded into a StopTimeEntry and thrown away below.
+        //
+        // departure_sec BETWEEN matters because stop_times' PRIMARY KEY
+        // is (stop_pk, departure_sec, trip_pk, stop_sequence) — without
+        // this bound, the stop_pk IN (...) seek has to walk EVERY
+        // stop_time for each of potentially thousands of corridor stops
+        // across the whole day before trip_pk gets a chance to filter
+        // anything out. With it, each per-stop seek is a bounded range
+        // scan instead.
         if crate::settings::USE_SQL_ACTIVE_TRIP_FILTER {
             let mut stmt = conn.prepare(
-                "SELECT trip_pk FROM stop_times \
+                "SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type \
+                 FROM stop_times \
                  WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
-                 AND trip_pk IN (SELECT id FROM active_trip_pks_staged) \
-                 AND departure_sec BETWEEN ?1 AND ?2"
+                 AND departure_sec BETWEEN ?1 AND ?2 \
+                 AND trip_pk IN (SELECT id FROM active_trip_pks_staged)"
             )?;
-            let rows = stmt.query_map([window_lo, window_hi], |r| Ok(r.get::<_, i64>(0)?))?;
+            let rows = stmt.query_map([window_lo, window_hi], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
+            })?;
             for row in rows {
-                windowed_trip_pks.insert(row?);
+                rows_returned += 1;
+                let (trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type) = row?;
+                windowed_trip_pks.insert(trip_pk);
+                let Some(&pattern_pk) = trip_pk_to_pattern.get(&trip_pk) else { continue };
+                let entry = Rc::new(StopTimeEntry { trip_pk, pattern_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type });
+                stop_times_by_stop.entry(stop_pk).or_default().push(Rc::clone(&entry));
+                stop_times_by_stop_and_pattern.entry((stop_pk, pattern_pk)).or_default().push(Rc::clone(&entry));
+                stop_times_by_stop_and_trip.entry(stop_pk).or_default().insert(trip_pk, entry);
             }
         } else {
             let mut stmt = conn.prepare(
-                // No DISTINCT here on purpose: the index (stop_pk, departure_sec)
-                // isn't ordered by trip_pk, so a SQL-level DISTINCT would force
-                // SQLite to build a temporary b-tree just to dedupe — and we
-                // dedupe again for free below via the HashSet insert. Letting
-                // duplicate rows through and deduping only in Rust avoids
-                // paying for that sort twice.
-                "SELECT trip_pk FROM stop_times \
+                "SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type \
+                 FROM stop_times \
                  WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
                  AND departure_sec BETWEEN ?1 AND ?2"
             )?;
-            let rows = stmt.query_map([window_lo, window_hi], |r| Ok(r.get::<_, i64>(0)?))?;
+            let rows = stmt.query_map([window_lo, window_hi], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
+            })?;
             for row in rows {
-                let trip_pk = row?;
-                if active_trip_pks.contains(&trip_pk) {
-                    windowed_trip_pks.insert(trip_pk);
-                }
+                let (trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type) = row?;
+                if !active_trip_pks.contains(&trip_pk) { continue; }
+                rows_returned += 1;
+                windowed_trip_pks.insert(trip_pk);
+                let Some(&pattern_pk) = trip_pk_to_pattern.get(&trip_pk) else { continue };
+                let entry = Rc::new(StopTimeEntry { trip_pk, pattern_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type });
+                stop_times_by_stop.entry(stop_pk).or_default().push(Rc::clone(&entry));
+                stop_times_by_stop_and_pattern.entry((stop_pk, pattern_pk)).or_default().push(Rc::clone(&entry));
+                stop_times_by_stop_and_trip.entry(stop_pk).or_default().insert(trip_pk, entry);
             }
         }
+        rows_returned_total = rows_returned;
+        mark!(t_stage, format!("windowed_discovery_and_fetch.attempt{stages_tried}_window{window_sec}s_trips{}_rows{}", windowed_trip_pks.len(), rows_returned));
         if !windowed_trip_pks.is_empty() { break; }
     }
-    mark!(t, "windowed_trip_discovery");
+    mark!(t, "windowed_discovery_and_fetch");
+    timings.push(("windowed_trip_discovery.stages_tried".to_string(), stages_tried));
+    timings.push(("count.windowed_trip_pks".to_string(), windowed_trip_pks.len() as i64));
+    timings.push(("count.stop_times_rows_returned".to_string(), rows_returned_total));
+    timings.push(("count.stop_times_distinct_stops".to_string(), stop_times_by_stop.len() as i64));
 
     let no_service_found = windowed_trip_pks.is_empty();
     if no_service_found {
         mark!(t_total, "total");
         return Ok(GtfsIndex {
             allowed_stop_pks, patterns_by_pk, pattern_stops,
-            stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
+            stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
             no_service_found: true,
-            debug_seed_paths: resolved.debug_seed_paths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
-            debug_bfs_tree_edges: resolved.debug_bfs_tree_edges.clone(), debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
+            debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
+            debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
             timings,
         });
     }
 
-    let windowed_trip_vec: Vec<i64> = windowed_trip_pks.into_iter().collect();
-
-    // Staged into a temp table + JOIN instead of chunked IN(...) — the
-    // costliest of the three (up to ~7500 pks in earlier profiling runs,
-    // ~19 chunked queries before this fix vs. 1 staged JOIN now).
-    let t = Instant::now();
-    stage_ids(conn, "windowed_trip_pks", &windowed_trip_vec)?;
-
-    let mut stop_times_by_stop: HashMap<i64, Vec<StopTimeEntry>> = HashMap::new();
-    let mut stop_times_by_stop_and_trip: HashMap<i64, HashMap<i64, StopTimeEntry>> = HashMap::new();
-
-    let t = Instant::now();
-    {
-        // stop_pk IN (corridor_stop_pks) filters in SQL instead of after
-        // fetching: a windowed trip's full stop sequence can run well
-        // outside a narrow corridor (system-wide route vs. a slice of it),
-        // so without this, every out-of-corridor stop still gets decoded
-        // into a StopTimeEntry and cloned before being thrown away below.
-        // corridor_stop_pks is already staged from the windowing step
-        // above (same connection, not yet overwritten), so this costs no
-        // extra staging pass — unlike settings::USE_SQL_ACTIVE_TRIP_FILTER,
-        // this isn't really an A/B: it's strictly less work either way.
-        let mut stmt = conn.prepare(
-            "SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type \
-             FROM stop_times \
-             WHERE trip_pk IN (SELECT id FROM windowed_trip_pks) \
-             AND stop_pk IN (SELECT id FROM corridor_stop_pks)"
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
-        })?;
-        for row in rows {
-            let (trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type) = row?;
-            let Some(&pattern_pk) = trip_pk_to_pattern.get(&trip_pk) else { continue };
-            let entry = StopTimeEntry { trip_pk, pattern_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type };
-            stop_times_by_stop.entry(stop_pk).or_default().push(entry.clone());
-            stop_times_by_stop_and_trip.entry(stop_pk).or_default().insert(trip_pk, entry);
-        }
-    }
-    mark!(t, "stop_times_fetch");
-
     let t = Instant::now();
     for v in stop_times_by_stop.values_mut() {
+        v.sort_by_key(|e| e.departure_sec);
+    }
+    for v in stop_times_by_stop_and_pattern.values_mut() {
         v.sort_by_key(|e| e.departure_sec);
     }
     mark!(t, "stop_times_sort");
@@ -460,9 +575,9 @@ pub fn load_gtfs_index_for_trip(
 
     Ok(GtfsIndex {
         allowed_stop_pks, patterns_by_pk, pattern_stops,
-        stop_times_by_stop, stop_times_by_stop_and_trip, no_service_found: false,
-        debug_seed_paths: resolved.debug_seed_paths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
-        debug_bfs_tree_edges: resolved.debug_bfs_tree_edges.clone(), debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
+        stop_times_by_stop, stop_times_by_stop_and_pattern, stop_times_by_stop_and_trip, no_service_found: false,
+        debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
+        debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
         timings,
     })
 }

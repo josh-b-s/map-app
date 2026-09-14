@@ -29,17 +29,41 @@ pub const MAX_RTREE_RADIUS_M: f64 = 32_000.0;
 // ── Coarse topology graph (graph/coarse.rs) ─────────────────────────────
 pub const WALK_EDGE_THRESHOLD_M: f64 = 450.0;
 
-// ── Corridor tagging bbox fallback (corridor/tagging.rs) ────────────────
+// ── Corridor tagging (corridor/tagging.rs) ──────────────────────────────
 pub const ORIGIN_DEST_WALK_RADIUS_M: f64 = 900.0;
-pub const CORRIDOR_MIN_WIDTH_M: f64 = 350.0;
-pub const CORRIDOR_TAPER_K_M: f64 = 900.0;
-pub const CORRIDOR_WIDEN_MIN_WIDTH_M: f64 = 700.0;
-pub const CORRIDOR_WIDEN_TAPER_K_M: f64 = 1600.0;
-pub const CORRIDOR_MIN_ACCEPTABLE_STOPS: usize = 8;
+
+/// Replaces the old geometric CORRIDOR_STOP_PROXIMITY_FILTER (taper-buffer
+/// distance-to-segment math against seed-path polylines). The corridor
+/// path (corridor/resolver.rs's `resolve_corridor`) used to build
+/// `allowed_stop_pks` from EVERY stop of EVERY matched pattern — a
+/// pattern that only clips the true corridor for a couple of stops still
+/// dragged its entire route's stop list in. That's very likely what was
+/// driving `count.corridor_stop_pks` up into the thousands on longer trips
+/// (Epping/Montsalvat-style corridors) and inflating every SQL stage that
+/// filters on it.
+///
+/// Instead of measuring physical distance to a buffer polygon (which is
+/// wrong for any line that loops or crosses back near itself
+/// geographically while being nowhere near it ALONG the route),
+/// `resolve_corridor` now trims each matched pattern's stops by INDEX:
+/// for pattern P, find where P's ordered stop_sequence actually intersects
+/// `core_stop_pks` (the seed BFS's own exact traversed-stop set — no
+/// geometry, just graph membership), take the min/max touched index, and
+/// keep stops within that index range extended by
+/// `STOP_SEQUENCE_MARGIN` stops on each side. A sibling express/local/
+/// direction variant that only shares one interchange stop with
+/// core_stop_pks naturally gets just a narrow window around that stop,
+/// same intent the old filter had — just exact instead of approximate,
+/// and index arithmetic instead of haversine-per-stop.
+///
+/// Seed-path stops and the origin/destination walk radius are still always
+/// kept regardless (see resolve_corridor) — this only ever narrows the
+/// "extra" stops a matched pattern drags in from elsewhere on its route,
+/// never the seed paths RAPTOR actually needs to board/alight on.
+pub const STOP_SEQUENCE_MARGIN: usize = 2;
 
 // ── Journey-planning transfer budget ────────────────────────────────────
 pub const MAX_TRANSFERS: u32 = 5;
-pub const MIN_ACCEPTABLE_PATTERNS: usize = 3;
 
 // ── Mid-journey transfer walking (raptor.rs) ────────────────────────────
 pub const MAX_TRANSFER_WALK_SEC: f64 = 20.0 * 60.0;
@@ -79,7 +103,44 @@ pub const STRIDE_TARGET_SAMPLES: usize = 40;
 
 // ── Seed BFS (corridor/seed_bfs.rs) ─────────────────────────────────────
 pub const SAFETY_MARGIN_LEVELS: u32 = 1;
-pub const MAX_SEED_PATHS: usize = 24;
+
+/// Base unit for seed_bfs::rank_meets's depth-separated ranking (see
+/// depth_bucket_weight): depth 0 (the shallowest, fewest-extra-transfers
+/// bucket) gets `num_buckets * SEED_MEET_DEPTH_BUCKET_WEIGHT`, tapering
+/// linearly down to `SEED_MEET_DEPTH_BUCKET_WEIGHT` at the deepest bucket —
+/// so a truncated `batch_size` prefix is dominated by the fewest-transfer
+/// candidates first, with deeper depths only filling in the remainder.
+/// Since every depth's weight scales by the same constant, changing this
+/// value alone doesn't change the RATIO between depths (it scales all of
+/// them together) — to change the shape of the taper itself (e.g.
+/// non-linear), change depth_bucket_weight's formula instead.
+pub const SEED_MEET_DEPTH_BUCKET_WEIGHT: i64 = 50;
+pub const MAX_SEED_PATHS: usize = 24; // internal guard against combinatorial half-path fanout WITHIN a single meet's backtrack only — no longer caps the total debug path list, see materialize_seed_paths
+
+/// Default (first-attempt) batch size for resolve_corridor: of every
+/// meeting node BFS found within budget, ranked purely by distance-sum
+/// straightness — dist(origin, meet) + dist(meet, destination) — see
+/// `rank_meets` in seed_bfs.rs — the first attempt materializes only the
+/// best TOP_N_SEED_MEETS into core_stop_pks/pattern_pks. Unlike
+/// MAX_SEED_PATHS (which only trims the enumerated debug path list after
+/// the fact), this genuinely narrows what RAPTOR is allowed to consider —
+/// a meeting node outside the batch never enters core_stop_pks at all. If
+/// this first batch turns up no pattern with an active trip, loader.rs's
+/// retry ladder re-materializes a bigger batch against the SAME BFS run
+/// (see SEED_MEETS_RETRY_CEILING) rather than giving up.
+pub const TOP_N_SEED_MEETS: usize = 50;
+
+/// Retry ladder for loader.rs: if a search comes back with no candidate
+/// patterns / no active trip at all (see resolve_corridor's `batch_size`
+/// param), retry against the SAME BFS run (see corridor::resolver::
+/// SeedBfsCache) with a bigger slice of its ranked meeting-node list,
+/// instead of re-running BFS or falling back to geometric buffering.
+/// Doubling from TOP_N_SEED_MEETS is generous headroom-wise since a retry
+/// only re-pays the cheap ancestor-union/backtrack/SQL-pattern-lookup
+/// cost, not BFS itself — capped here so a genuinely sparse corridor with
+/// hundreds of meeting nodes and no real service anywhere doesn't retry
+/// indefinitely before giving up.
+pub const SEED_MEETS_RETRY_CEILING: usize = 200;
 
 /// A level is one transit boarding (see seed_bfs.rs's module doc), so the
 /// cap is a real transfer-count budget, not an arbitrary stop-count guess —
