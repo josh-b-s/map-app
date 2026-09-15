@@ -78,7 +78,14 @@ pub const CROSS_TRACK_KEEP_FRACTION: f64 = 1.0;
 /// smaller wins. So "keep the straightest 50 stops" regardless of how
 /// big core_stop_pks was to begin with, rather than the fraction alone
 /// letting a huge core_stop_pks still pass through a huge count.
-pub const CROSS_TRACK_KEEP_MAX: usize = 50;
+/// Per-depth-bucket cap — used instead of a flat cap since the
+/// flat cross-track sort can starve a deeper-but-necessary bucket
+/// entirely — a real 3-transfer option can be straighter-scored-worse
+/// than a 2-transfer alternative and lose every one of its stops to it,
+/// silently filtering out a genuinely faster journey. Capping per depth
+/// guarantees each depth gets a floor of representation regardless of how
+/// the other depths score.
+pub const CROSS_TRACK_KEEP_MAX_PER_BUCKET: usize = 25;
 
 /// When false, `rank_meets` skips depth-bucket separation entirely: every
 /// meeting node goes in one bucket, sorted purely by distance_sum_m
@@ -88,7 +95,7 @@ pub const CROSS_TRACK_KEEP_MAX: usize = 50;
 /// no longer protects a shortest-transfer candidate from being outranked
 /// by a straighter but deeper one, that safety property is what you're
 /// giving up while testing this.
-pub const DEPTH_BUCKET_RANKING_ENABLED: bool = false;
+pub const DEPTH_BUCKET_RANKING_ENABLED: bool = true;
 
 // ── Journey-planning transfer budget ────────────────────────────────────
 pub const MAX_TRANSFERS: u32 = 5;

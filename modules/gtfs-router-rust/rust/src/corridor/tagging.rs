@@ -21,7 +21,7 @@ use crate::corridor::seed_bfs::{materialize_seed_paths, meet_depth, SearchDir, S
 use crate::geo::cross_track_distance_m;
 use crate::repo::{get_pattern_pks_for_stops, StopsCache};
 use crate::settings::{
-    CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
+    CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX_PER_BUCKET, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
     ORIGIN_DEST_WALK_RADIUS_M, SAFETY_MARGIN_LEVELS,
 };
 
@@ -138,31 +138,40 @@ pub fn compute_seed_path_corridor(
     // approximate tapered-buffer polygon from stop coordinates.
     let path_pattern_pks = seed.path_pattern_pks.clone();
 
-    // Flat cross-track prefilter: sort core_stop_pks by perpendicular
-    // distance to the straight origin-destination line, keep the
-    // straightest min(CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX) —
-    // shrinks the IN-clause (and result size) of the pattern_pks query below, which is the slowest
-    // stage. A stop we can't locate sorts last (kept only if the fraction
-    // is generous enough to reach it) rather than silently dropped.
+    // Per-depth-bucket cross-track prefilter: within EACH BFS depth bucket
+    // (see core_stop_pks_by_depth's doc comment) sort that bucket's stops
+    // by perpendicular distance to the straight origin-destination line,
+    // keep the straightest min(CROSS_TRACK_KEEP_FRACTION,
+    // CROSS_TRACK_KEEP_MAX_PER_BUCKET) from EACH bucket, then union the
+    // kept stops back together. Guarantees every depth (transfer count)
+    // keeps a floor of representation regardless of how straight the
+    // other depths score — a flat sort across every stop can otherwise
+    // let a straighter-but-fewer-transfers alternative starve out every
+    // stop of a real, faster, more-transfers option. A stop we can't
+    // locate sorts last within its own bucket (kept only if the fraction/
+    // cap is generous enough to reach it) rather than silently dropped.
     let core_stop_pks_before = seed.core_stop_pks.len();
     let t = Instant::now();
     let filtered_core_stop_pks: HashSet<i64> = if CROSS_TRACK_STOP_FILTER_ENABLED && !seed.core_stop_pks.is_empty() {
-        let mut ranked: Vec<(i64, f64)> = seed.core_stop_pks.iter()
-            .map(|&pk| {
-                let dist = match stops.get(pk) {
-                    None => f64::MAX,
-                    Some(row) => cross_track_distance_m(
-                        LatLon { lat: row.stop_lat, lon: row.stop_lon },
-                        origin,
-                        destination,
-                    ),
-                };
-                (pk, dist)
-            })
-            .collect();
-        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let keep_n = (((ranked.len() as f64) * CROSS_TRACK_KEEP_FRACTION).ceil() as usize).min(CROSS_TRACK_KEEP_MAX);
-        ranked.into_iter().take(keep_n).map(|(pk, _)| pk).collect()
+        let cross_track_of = |pk: i64| -> f64 {
+            match stops.get(pk) {
+                None => f64::MAX,
+                Some(row) => cross_track_distance_m(
+                    LatLon { lat: row.stop_lat, lon: row.stop_lon },
+                    origin,
+                    destination,
+                ),
+            }
+        };
+        let mut kept: HashSet<i64> = HashSet::new();
+        for bucket in &seed.core_stop_pks_by_depth {
+            let mut ranked: Vec<(i64, f64)> = bucket.iter().map(|&pk| (pk, cross_track_of(pk))).collect();
+            ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let keep_n = (((ranked.len() as f64) * CROSS_TRACK_KEEP_FRACTION).ceil() as usize)
+                .min(CROSS_TRACK_KEEP_MAX_PER_BUCKET);
+            kept.extend(ranked.into_iter().take(keep_n).map(|(pk, _)| pk));
+        }
+        kept
     } else {
         seed.core_stop_pks.iter().copied().collect()
     };

@@ -86,6 +86,19 @@ pub struct SeedPathResult {
     /// stops/patterns are in scope for RAPTOR" (e.g.
     /// `compute_seed_path_corridor`) should use this, not `paths`.
     pub core_stop_pks: FxHashSet<i64>,
+    /// Same union as `core_stop_pks`, but split by which depth bucket
+    /// (see `meet_depth`) first reached each stop — a stop reachable from
+    /// both a depth-0 and depth-1 meet lands in the depth-0 bucket only
+    /// (shallowest-wins, same tie-break `rank_meets` uses for meeting
+    /// nodes). Index i is depth i, length is always
+    /// `SAFETY_MARGIN_LEVELS + 1`. Exists so a per-depth-bucket cross-track
+    /// filter (see tagging.rs) can rank/cap stops within each depth
+    /// independently, instead of one flat straightness sort silently
+    /// starving a deeper-but-necessary bucket (e.g. a real 3-transfer
+    /// train+tram+bus option losing every one of its stops to a shorter,
+    /// straighter 2-transfer tram+bus alternative in a flat cross-track
+    /// sort).
+    pub core_stop_pks_by_depth: Vec<FxHashSet<i64>>,
     /// Depth (relative to the shortest meet, `0..=SAFETY_MARGIN_LEVELS`) of
     /// the meeting node that produced the matching entry in `paths` — lets
     /// a debug/visualization consumer color candidate seed paths by depth
@@ -681,6 +694,7 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
             paths: Vec::new(),
             path_pattern_pks: Vec::new(),
             core_stop_pks: FxHashSet::default(),
+            core_stop_pks_by_depth: Vec::new(),
             path_depths: Vec::new(),
             levels_expanded: run.levels_expanded,
             level_frontiers: run.level_frontiers.clone(),
@@ -723,6 +737,28 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
     let meeting_pks: Vec<i64> = batch.iter().map(|&(m, _)| m).collect();
     let mut core_stop_pks = ancestor_stop_union(meeting_pks.iter().copied(), &run.parents_of_fwd);
     core_stop_pks.extend(ancestor_stop_union(meeting_pks.iter().copied(), &run.parents_of_bwd));
+
+    // Same union, split by depth bucket — shallowest-wins for any stop
+    // reachable from more than one depth (see the field's doc comment).
+    // Recomputes ancestor_stop_union per depth instead of reusing the
+    // flat pass above: cheap here since num_buckets is small
+    // (SAFETY_MARGIN_LEVELS + 1) and it's the only way to know which
+    // depth "claims" a stop first.
+    let num_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
+    let mut meets_by_depth: Vec<Vec<i64>> = vec![Vec::new(); num_buckets];
+    for &(m, combined) in batch {
+        let depth = meet_depth(combined, run.first_meet_total_level, num_buckets);
+        meets_by_depth[depth].push(m);
+    }
+    let mut core_stop_pks_by_depth: Vec<FxHashSet<i64>> = Vec::with_capacity(num_buckets);
+    let mut claimed: FxHashSet<i64> = FxHashSet::default();
+    for depth_meets in &meets_by_depth {
+        let mut this_depth = ancestor_stop_union(depth_meets.iter().copied(), &run.parents_of_fwd);
+        this_depth.extend(ancestor_stop_union(depth_meets.iter().copied(), &run.parents_of_bwd));
+        this_depth.retain(|pk| !claimed.contains(pk));
+        claimed.extend(this_depth.iter().copied());
+        core_stop_pks_by_depth.push(this_depth);
+    }
 
     let mut seen_paths: HashSet<SeedPathKey> = HashSet::new();
     let mut paths: Vec<Vec<i64>> = Vec::new();
@@ -784,6 +820,7 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
         paths,
         path_pattern_pks,
         core_stop_pks,
+        core_stop_pks_by_depth,
         path_depths,
         levels_expanded: run.levels_expanded,
         level_frontiers: run.level_frontiers.clone(),
