@@ -21,6 +21,7 @@ mod graph;
 mod corridor;
 mod loader;
 mod raptor;
+mod freq_raptor;
 mod fxhash;
 
 use std::collections::HashMap;
@@ -198,6 +199,16 @@ struct WarmState {
     patterns: Arc<repo::PatternsCache>,
     shapes_index: Arc<repo::ShapesIndex>,
     graph: Arc<graph::coarse::CoarseGraph>,
+    /// Resident frequency-graph precompute — see repo.rs's doc on both.
+    /// Loaded fully once here, same tier as patterns/routes, consumed by
+    /// loader.rs's freq_raptor pre-filter stage.
+    hops: Arc<repo::PatternHopsCache>,
+    headway: Arc<repo::PatternHeadwayCache>,
+    /// Network-wide, resident — see repo.rs's doc on PatternCumulativeCache
+    /// for why this can't just be corridor-scoped the way freq_raptor's
+    /// old per-search version was: rank_meets needs it BEFORE any corridor
+    /// has been materialized.
+    pattern_cumulative: Arc<repo::PatternCumulativeCache>,
 }
 
 #[derive(uniffi::Object)]
@@ -341,21 +352,40 @@ impl GtfsRouterEngine {
         let t = Instant::now();
         let shapes_index = repo::load_shape_index(&conn)?;
         mark!(t, "load_shape_index");
+        let t = Instant::now();
+        let hops = repo::load_pattern_hops(&conn)?;
+        mark!(t, "load_pattern_hops");
+        let t = Instant::now();
+        let headway = repo::load_pattern_headway(&conn)?;
+        mark!(t, "load_pattern_headway");
 
         let t = Instant::now();
         let signature = graph::store::compute_graph_signature(&conn)?;
         mark!(t, "graph_signature");
+
+        // Fetched unconditionally now (previously only inside the
+        // persisted-graph-miss branch below) — PatternCumulativeCache needs
+        // these same rows regardless of whether the coarse graph itself
+        // needed rebuilding, and re-querying separately would just be the
+        // same small `pattern_stops` table scan twice for no reason.
+        let t = Instant::now();
+        let pattern_stop_rows = repo::get_all_pattern_stops_ordered(&conn)?;
+        mark!(t, "load_pattern_stops");
+
         let t = Instant::now();
         let adjacency = match graph::store::load_persisted_graph(&conn, &signature)? {
             Some(adj) => { mark!(t, "graph_load_persisted"); adj }
             None => {
-                let pattern_stops = repo::get_all_pattern_stops_ordered(&conn)?;
-                let adj = graph::coarse::build_adjacency_from_scratch(&stops, &pattern_stops);
+                let adj = graph::coarse::build_adjacency_from_scratch(&stops, &pattern_stop_rows);
                 graph::store::save_persisted_graph(&mut conn, &signature, &adj)?;
                 mark!(t, "graph_build_from_scratch");
                 adj
             }
         };
+
+        let t = Instant::now();
+        let pattern_cumulative = repo::load_pattern_cumulative(&pattern_stop_rows, &hops, &stops);
+        mark!(t, "build_pattern_cumulative");
 
         *self.state.write().unwrap() = Some(WarmState {
             stops: Arc::new(stops),
@@ -363,6 +393,9 @@ impl GtfsRouterEngine {
             patterns: Arc::new(patterns),
             shapes_index: Arc::new(shapes_index),
             graph: Arc::new(graph::coarse::CoarseGraph::new(adjacency)),
+            hops: Arc::new(hops),
+            headway: Arc::new(headway),
+            pattern_cumulative: Arc::new(pattern_cumulative),
         });
         *self.conn.lock().unwrap() = Some(conn);
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
@@ -412,10 +445,11 @@ impl GtfsRouterEngine {
         let mut bfs_cache = self.bfs_cache.lock().unwrap();
 
         let mut index = loader::load_gtfs_index_for_trip(
-            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache, &mut bfs_cache,
+            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative,
+            &mut corridor_cache, &mut bfs_cache,
             &self.active_services_cache,
             origin_ll, dest_ll, depart_sec_of_day as i64,
-            &today_date, today_dow, &tomorrow_date, tomorrow_dow, None,
+            &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, None,
         )?;
 
         if index.no_service_found {
@@ -522,10 +556,11 @@ impl GtfsRouterEngine {
                 // computeGtfsRoute in the TS version: a window wide enough
                 // to find SOME trips but not a later leg's boarding trip.
                 index = loader::load_gtfs_index_for_trip(
-                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &mut corridor_cache, &mut bfs_cache,
+                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative,
+                    &mut corridor_cache, &mut bfs_cache,
                     &self.active_services_cache,
                     origin_ll, dest_ll, depart_sec_of_day as i64,
-                    &today_date, today_dow, &tomorrow_date, tomorrow_dow, Some(10 * 3600),
+                    &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, Some(10 * 3600),
                 )?;
                 if index.no_service_found { return Err(RouterError::NoServiceFound); }
                 let t_retry = Instant::now();

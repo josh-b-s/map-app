@@ -67,7 +67,7 @@ pub const STOP_SEQUENCE_MARGIN: usize = 2;
 /// shrinking the IN-clause/result size on that query, which is currently
 /// the slowest stage of on-device corridor resolution. Off by default so
 /// A/B timing can isolate its effect; flip on to test.
-pub const CROSS_TRACK_STOP_FILTER_ENABLED: bool = true;
+pub const CROSS_TRACK_STOP_FILTER_ENABLED: bool = false;
 
 /// Fraction of `core_stop_pks` to keep after sorting by cross-track
 /// distance to the origin-destination line (smallest/straightest first).
@@ -126,6 +126,68 @@ pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 /// warmth. Still only 3 routes worth of evidence — revisit if a wider
 /// range of corridors doesn't hold the same pattern.
 pub const USE_SQL_ACTIVE_TRIP_FILTER: bool = true;
+
+// ── Frequency-graph pre-filter (freq_raptor.rs) ──────────────────────────
+/// Below this many candidate patterns, skip the frequency-graph pass
+/// entirely and go straight to the real SQL stage — the pre-filter's own
+/// (small) overhead isn't worth paying when there's nothing worth
+/// narrowing. Needs real tuning against Melbourne-scale
+/// `count.candidate_pattern_pks` numbers once this is running — 40 is a
+/// starting guess, not a measured value.
+pub const FREQ_GRAPH_MIN_CANDIDATE_PATTERNS: usize = 40;
+
+/// Pruning-safety margin around the frequency graph's best estimated
+/// arrival: `margin = max(FLOOR, estimated_duration * RELATIVE_PCT)`. Both
+/// components matter — a pure relative margin is too tight on short hops
+/// and too loose on long ones (see freq_raptor.rs's module doc for the
+/// full reasoning on why a single best estimate can't be trusted alone).
+pub const FREQ_GRAPH_MARGIN_FLOOR_SEC: i64 = 8 * 60;
+pub const FREQ_GRAPH_MARGIN_RELATIVE_PCT: f64 = 0.25;
+
+/// Wait-time estimate used when `PatternHeadwayCache::headway_for` returns
+/// `None` (no data, or too few trips to compute a gap) — deliberately
+/// large/conservative rather than optimistic: an unknown headway should
+/// bias the estimate AWAY FROM this pattern looking artificially fast,
+/// not toward it, since discovering "actually this was fine" later (via
+/// the real SQL stage) is cheap, while wrongly pruning a genuinely-good
+/// route because its headway was unmeasured is a correctness bug.
+pub const FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC: i64 = 20 * 60;
+
+/// Round cap for the frequency-graph search — same transfer-budget
+/// reasoning as level_cap_for below, but this graph is cheap enough that
+/// there's no strong reason to cap it any tighter than the real search.
+pub const FREQ_GRAPH_MAX_ROUNDS: u32 = 6;
+
+// ── rank_meets real-time scoring (seed_bfs.rs) ───────────────────────────
+/// Fixed walking speed used ONLY for scoring the origin/destination "last
+/// mile" leg in rank_meets's real-time score — deliberately NOT the
+/// caller's actual per-search `walking_speed_mps` (RaptorOptions'). Two
+/// reasons: (1) `SeedBfsCache`/`CorridorCache` are keyed independent of
+/// walking speed — if ranking depended on the real per-search value, every
+/// distinct walking speed would need its own cache entry for what's
+/// otherwise the same corridor; (2) this score only needs to be
+/// DIRECTIONALLY better than straight-line distance, not exactly correct —
+/// it's picking which candidates are even worth materializing, not
+/// producing a rider-facing duration. Same 1.4 m/s as RaptorOptions'
+/// own Default (raptor.rs) — not a coincidence, just reusing the same
+/// "typical pedestrian" baseline for consistency.
+pub const RANK_MEETS_WALKING_SPEED_MPS: f64 = 1.4;
+
+/// Margin applied when `materialize_seed_paths` selects which meeting
+/// nodes in a `batch_size`-capped slice actually get backtracked into
+/// `core_stop_pks` — `margin = max(FLOOR, best_score_in_batch * PCT)`,
+/// same shape as `FREQ_GRAPH_MARGIN_*` and the same reasoning: a single
+/// best real-time estimate shouldn't be trusted alone (no schedule/
+/// missed-connection awareness at this stage either), so every meeting
+/// node within margin of the batch's best stays in play rather than only
+/// the literal single best one. `batch_size` itself is still the outer
+/// ceiling (and still what the existing retry ladder doubles) — this
+/// margin only trims WITHIN that ceiling, so a genuinely-close alternative
+/// a few nodes into the batch doesn't drag in a needlessly wide ancestor
+/// union just because count-based truncation alone can't tell "clearly
+/// worse" apart from "basically tied."
+pub const SEED_MEET_SELECT_MARGIN_FLOOR_SEC: f64 = 4.0 * 60.0;
+pub const SEED_MEET_SELECT_MARGIN_RELATIVE_PCT: f64 = 0.25;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;

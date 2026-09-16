@@ -49,9 +49,10 @@ pub type ActiveServicesCacheEntry = (String, String, Arc<HashSet<(i64, String)>>
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::repo::{PatternsCache, RoutesCache, StopsCache};
+use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternHopsCache, PatternsCache, RoutesCache, StopsCache};
 use crate::corridor::resolver::{resolve_corridor, CorridorCache, SeedBfsCache};
-use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS};
+use crate::freq_raptor;
+use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, FREQ_GRAPH_MIN_CANDIDATE_PATTERNS};
 use crate::corridor::tagging::CorridorBoundary;
 use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
@@ -204,6 +205,9 @@ pub fn load_gtfs_index_for_trip(
     patterns: &PatternsCache,
     routes: &RoutesCache,
     graph: &CoarseGraph,
+    hops: &PatternHopsCache,
+    headway: &PatternHeadwayCache,
+    pattern_cumulative: &PatternCumulativeCache,
     corridor_cache: &mut CorridorCache,
     bfs_cache: &mut SeedBfsCache,
     active_services_cache: &Mutex<Option<ActiveServicesCacheEntry>>,
@@ -214,6 +218,7 @@ pub fn load_gtfs_index_for_trip(
     today_dow: u8,      // 0=Sunday..6=Saturday, matches JS Date.getDay()
     tomorrow_date: &str,
     tomorrow_dow: u8,
+    walking_speed_mps: f64,
     force_window_sec: Option<i64>,
 ) -> rusqlite::Result<GtfsIndex> {
     let t_total = Instant::now();
@@ -296,56 +301,123 @@ pub fn load_gtfs_index_for_trip(
     let mut batch_size = TOP_N_SEED_MEETS;
     let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
         let t = Instant::now();
-        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size)?;
+        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative)?;
         mark!(t, "corridor_resolution");
         for (label, ms) in &resolved.sub_timings {
             timings.push((format!("corridor.{label}"), *ms));
         }
 
-        let allowed_stop_pks = resolved.allowed_stop_pks.clone();
-        let candidate_pattern_pks: Vec<i64> = resolved.pattern_pks.iter().copied().collect();
+        let full_allowed_stop_pks = resolved.allowed_stop_pks.clone();
+        let full_candidate_pattern_pks: Vec<i64> = resolved.pattern_pks.iter().copied().collect();
 
         // COUNT LOGGING (not real durations — piggybacking on the
         // (label, i64) timings channel, same trick already used for
         // active_trip_filter_sql). These two numbers are the actual
         // fan-out driver for both windowed_trip_discovery/stop_times_fetch
         // queries' `stop_pk IN (SELECT id FROM corridor_stop_pks)`
-        // semi-join. `count.seed_bfs_meets_total` (from resolve_corridor's
-        // own sub_timings) is the pre-batch candidate count — how many
-        // meeting nodes existed to choose from, independent of batch_size.
-        timings.push(("count.corridor_stop_pks".to_string(), allowed_stop_pks.len() as i64));
-        timings.push(("count.candidate_pattern_pks".to_string(), candidate_pattern_pks.len() as i64));
+        // semi-join — BEFORE any freq_raptor narrowing, so this still
+        // shows what BFS/batch_size alone produced. `count.seed_bfs_meets_
+        // total` (from resolve_corridor's own sub_timings) is the
+        // pre-batch candidate count — how many meeting nodes existed to
+        // choose from, independent of batch_size.
+        timings.push(("count.corridor_stop_pks".to_string(), full_allowed_stop_pks.len() as i64));
+        timings.push(("count.candidate_pattern_pks".to_string(), full_candidate_pattern_pks.len() as i64));
 
-        let mut active_trip_pks: HashSet<i64> = HashSet::new();
-        let mut pattern_keys_with_active_trip: HashSet<i64> = HashSet::new();
-        // trip_pk -> pattern_pk (agency implicit via pattern; not needed further)
-        let mut trip_pk_to_pattern: HashMap<i64, i64> = HashMap::new();
+        // ── Frequency-graph pre-filter (freq_raptor.rs) ───────────────────
+        // Narrows the materialized candidate set BEFORE trips_for_candidates
+        // / windowed_discovery_and_fetch run below, using precomputed
+        // hop-times/headways instead of real stop_times rows — see
+        // freq_raptor.rs's module doc for the algorithm and the
+        // pruning-safety margin reasoning. Gated by a size threshold:
+        // below FREQ_GRAPH_MIN_CANDIDATE_PATTERNS there's nothing worth
+        // narrowing, so this stage's own (small) overhead isn't worth
+        // paying.
+        //
+        // NOTE: straightness-based ranking upstream in resolve_corridor
+        // (rank_meets) still exists and still decides which meeting nodes
+        // get materialized into candidates at all — this doesn't replace
+        // that, it replaces what happens to an ALREADY-materialized
+        // candidate set. See the corridor-resolution design discussion:
+        // straightness's job here has shrunk to "cheap admission gate,"
+        // this is now the real decision-maker.
+        let freq_narrow = if full_candidate_pattern_pks.len() >= FREQ_GRAPH_MIN_CANDIDATE_PATTERNS {
+            let t = Instant::now();
+            let r = freq_raptor::narrow_candidates(
+                &resolved.pattern_pks, &full_allowed_stop_pks, &resolved.pattern_stop_rows,
+                hops, headway, graph, stops, origin, destination, depart_sec_of_day, walking_speed_mps,
+            );
+            mark!(t, "freq_raptor_narrow");
+            timings.push(("freq_raptor.applied".to_string(), r.is_some() as i64));
+            if let Some(res) = &r {
+                timings.push(("count.freq_narrowed_pattern_pks".to_string(), res.pattern_pks.len() as i64));
+                timings.push(("count.freq_narrowed_stop_pks".to_string(), res.stop_pks.len() as i64));
+            }
+            r
+        } else {
+            None
+        };
 
-        if !candidate_pattern_pks.is_empty() {
+        // Pulled out so the freq-narrowed attempt and the unnarrowed
+        // fallback attempt below share one code path instead of two
+        // hand-maintained copies of the exact same query.
+        let run_trips_for_candidates = |pattern_pks: &[i64]| -> rusqlite::Result<(HashSet<i64>, HashMap<i64, i64>, HashSet<i64>)> {
+            let mut active_trip_pks: HashSet<i64> = HashSet::new();
+            let mut pattern_keys_with_active_trip: HashSet<i64> = HashSet::new();
+            let mut trip_pk_to_pattern: HashMap<i64, i64> = HashMap::new();
+            if pattern_pks.is_empty() {
+                return Ok((active_trip_pks, trip_pk_to_pattern, pattern_keys_with_active_trip));
+            }
             // Staged into a temp table + JOIN instead of chunked IN(...) —
             // see this file's module-level PERF NOTE.
-            let t = Instant::now();
-            stage_ids(conn, "candidate_pattern_pks", &candidate_pattern_pks)?;
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT trip_pk, agency, pattern_pk, service_id \
-                     FROM trips \
-                     WHERE pattern_pk IN (SELECT id FROM candidate_pattern_pks)"
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
-                })?;
-                for row in rows {
-                    let (trip_pk, agency, pattern_pk, service_id) = row?;
-                    if !active_services.contains(&(agency, service_id)) { continue; }
-                    active_trip_pks.insert(trip_pk);
-                    trip_pk_to_pattern.insert(trip_pk, pattern_pk);
-                    pattern_keys_with_active_trip.insert(pattern_pk);
-                }
+            stage_ids(conn, "candidate_pattern_pks", pattern_pks)?;
+            let mut stmt = conn.prepare(
+                "SELECT trip_pk, agency, pattern_pk, service_id \
+                 FROM trips \
+                 WHERE pattern_pk IN (SELECT id FROM candidate_pattern_pks)"
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+            })?;
+            for row in rows {
+                let (trip_pk, agency, pattern_pk, service_id) = row?;
+                if !active_services.contains(&(agency, service_id)) { continue; }
+                active_trip_pks.insert(trip_pk);
+                trip_pk_to_pattern.insert(trip_pk, pattern_pk);
+                pattern_keys_with_active_trip.insert(pattern_pk);
             }
-            mark!(t, "trips_for_candidates");
-            timings.push(("count.active_trip_pks".to_string(), active_trip_pks.len() as i64));
-        }
+            Ok((active_trip_pks, trip_pk_to_pattern, pattern_keys_with_active_trip))
+        };
+
+        let t = Instant::now();
+        let (active_trip_pks, trip_pk_to_pattern, pattern_keys_with_active_trip, allowed_stop_pks, candidate_pattern_pks) =
+            if let Some(narrow) = &freq_narrow {
+                let narrowed_patterns: Vec<i64> = narrow.pattern_pks.iter().copied().collect();
+                let (a, t2p, p) = run_trips_for_candidates(&narrowed_patterns)?;
+                if !p.is_empty() {
+                    (a, t2p, p, narrow.stop_pks.clone(), narrowed_patterns)
+                } else {
+                    // CHEAP FALLBACK (see freq_raptor.rs's pruning-safety
+                    // doc): the narrowed set had NO active service today —
+                    // retry against the FULL materialized candidate set
+                    // before reaching for the expensive batch_size-doubling
+                    // retry below. This costs one more trips_for_candidates
+                    // query against data already resident (no new BFS, no
+                    // new corridor-resolution SQL) — cheap insurance
+                    // against the frequency estimate having wrongly
+                    // excluded the only patterns that actually run today,
+                    // as distinct from BFS/batch_size genuinely not having
+                    // found enough candidates (that failure mode still
+                    // falls through to the existing retry below).
+                    timings.push(("freq_raptor.fallback_to_full".to_string(), 1));
+                    let (a, t2p, p) = run_trips_for_candidates(&full_candidate_pattern_pks)?;
+                    (a, t2p, p, full_allowed_stop_pks.clone(), full_candidate_pattern_pks.clone())
+                }
+            } else {
+                let (a, t2p, p) = run_trips_for_candidates(&full_candidate_pattern_pks)?;
+                (a, t2p, p, full_allowed_stop_pks.clone(), full_candidate_pattern_pks.clone())
+            };
+        mark!(t, "trips_for_candidates");
+        timings.push(("count.active_trip_pks".to_string(), active_trip_pks.len() as i64));
 
         // Nothing left to gain from a bigger batch once it already covers
         // every meeting node BFS found, or the ceiling is reached — stop

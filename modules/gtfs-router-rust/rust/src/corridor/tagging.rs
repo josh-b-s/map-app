@@ -17,12 +17,12 @@ use std::collections::HashSet;
 use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
-use crate::corridor::seed_bfs::{materialize_seed_paths, meet_depth, SearchDir, SeedBfsRun};
+use crate::corridor::seed_bfs::{materialize_seed_paths, SearchDir, SeedBfsRun};
 use crate::geo::cross_track_distance_m;
 use crate::repo::{get_pattern_pks_for_stops, StopsCache};
 use crate::settings::{
     CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX_PER_BUCKET, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
-    ORIGIN_DEST_WALK_RADIUS_M, SAFETY_MARGIN_LEVELS,
+    ORIGIN_DEST_WALK_RADIUS_M,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -95,33 +95,30 @@ pub fn compute_seed_path_corridor(
 ) -> rusqlite::Result<SeedPathCorridorResult> {
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
 
-    // Before/after bucket-size logging: "before" is the raw supply BFS
-    // found at each transfer-depth (pre-interleave, pre-batch_size — see
-    // SeedBfsRun::bucket_sizes_before); "after" is how many from each depth
-    // actually survived this attempt's batch_size truncation of
-    // run.ordered_meets. Comparing the two per depth is what shows whether
-    // a shallow-but-scarce depth (e.g. a single train option) got crowded
-    // out by a deep-but-plentiful one (e.g. dozens of bus siblings) once
-    // truncated, rather than only ever seeing the merged total.
-    let num_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
+    // "before" is the raw supply BFS found at each transfer-depth
+    // (pre-interleave, pre-batch_size, pre-margin — see
+    // SeedBfsRun::bucket_sizes_before). "after" (logged below, once
+    // materialize_seed_paths has actually run) is how many from each depth
+    // survived BOTH this attempt's batch_size truncation AND the
+    // SEED_MEET_SELECT_MARGIN_* real-time filter — see SeedPathResult::
+    // after_counts' doc for why this has to come from materialize_seed_paths
+    // itself rather than being recomputed here from a raw ordered_meets
+    // slice. Comparing the two per depth is what shows whether a
+    // shallow-but-scarce depth (e.g. a single train option) got crowded out
+    // by a deep-but-plentiful one (e.g. dozens of bus siblings), rather than
+    // only ever seeing the merged total.
     for (depth, &before) in run.bucket_sizes_before.iter().enumerate() {
         sub_timings.push((format!("seed_bucket{depth}_before"), before as i64));
-    }
-    if !run.bucket_sizes_before.is_empty() {
-        let mut after_counts = vec![0usize; num_buckets];
-        let batch = &run.ordered_meets[..batch_size.min(run.ordered_meets.len())];
-        for &(_, combined) in batch {
-            after_counts[meet_depth(combined, run.first_meet_total_level, num_buckets)] += 1;
-        }
-        for (depth, count) in after_counts.into_iter().enumerate() {
-            sub_timings.push((format!("seed_bucket{depth}_after"), count as i64));
-        }
     }
 
     let t = Instant::now();
     let seed = materialize_seed_paths(run, batch_size);
     let walk_radius = walk_radius_stop_pks(candidates, origin, destination);
     sub_timings.push(("materialize".to_string(), t.elapsed().as_millis() as i64));
+
+    for (depth, &count) in seed.after_counts.iter().enumerate() {
+        sub_timings.push((format!("seed_bucket{depth}_after"), count as i64));
+    }
 
     if seed.paths.is_empty() {
         return Ok(SeedPathCorridorResult {

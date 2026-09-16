@@ -51,11 +51,12 @@
 use std::collections::HashSet;
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
-    level_cap_for, DEPTH_BUCKET_RANKING_ENABLED, MAX_SEED_PATHS, SAFETY_MARGIN_LEVELS,
-    SEED_MEET_DEPTH_BUCKET_WEIGHT, TOP_N_SEED_MEETS,
+    level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, MAX_SEED_PATHS,
+    RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
+    SEED_MEET_SELECT_MARGIN_FLOOR_SEC, SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, TOP_N_SEED_MEETS,
 };
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::repo::StopsCache;
+use crate::repo::{PatternCumulativeCache, StopsCache};
 use crate::geo::{haversine_meters, LatLon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,15 @@ pub struct SeedPathResult {
     pub path_depths: Vec<u32>,
     pub levels_expanded: u32,
     pub level_frontiers: Vec<(SearchDir, Vec<i64>)>,
+    /// How many meeting nodes per depth bucket actually survived BOTH the
+    /// `batch_size` count cap AND the `SEED_MEET_SELECT_MARGIN_*` real-time
+    /// filter — the true "after" counterpart to `SeedBfsRun::
+    /// bucket_sizes_before`. Computed here (not by the caller re-slicing
+    /// `run.ordered_meets` itself) because the margin filter is applied
+    /// inside this function — a caller counting from the raw
+    /// `batch_size`-sliced prefix would over-count relative to what
+    /// actually got backtracked into `core_stop_pks`.
+    pub after_counts: Vec<usize>,
 }
 
 /// The reusable output of running BFS once — everything `materialize_
@@ -118,10 +128,17 @@ pub struct SeedPathResult {
 /// comparatively cheap and fine to redo per attempt.
 pub struct SeedBfsRun {
     /// Every meeting node found within `SAFETY_MARGIN_LEVELS` of the first
-    /// meet, ranked by distance-sum straightness (see `rank_meets`) —
-    /// FULL list, not batch-limited. `materialize_seed_paths` slices a
-    /// prefix of this per attempt.
+    /// meet, ranked by real estimated hop-time (see `rank_meets`) — FULL
+    /// list, not batch-limited. `materialize_seed_paths` slices a prefix
+    /// of this per attempt, then further trims by `meet_scores` margin
+    /// (see that fn's doc).
     pub ordered_meets: Vec<(i64, u32)>,
+    /// Real estimated hop-time score for every node in `ordered_meets`
+    /// (lower is better; `f64::MAX` means unreachable/unscoreable) — same
+    /// values `rank_meets` computed to sort `ordered_meets` in the first
+    /// place, kept around so `materialize_seed_paths` can margin-filter a
+    /// batch without recomputing `real_time_from_root` a second time.
+    pub(crate) meet_scores: FxHashMap<i64, f64>,
     /// The BFS level at which the first meeting node was found — same
     /// value `rank_meets` bucketed against. Kept on the run (not just used
     /// locally in `run_seed_bfs`) so `materialize_seed_paths` can compute
@@ -354,40 +371,127 @@ fn backtrack_to_dest(
     path_so_far.pop();
 }
 
-/// Ranks meeting nodes by distance-sum straightness, WITHIN depth buckets
+/// Memoized real-time-from-root score for one BFS tree (forward from
+/// origin via `parents_of_fwd`/`origin_set`, or backward from destination
+/// via `parents_of_bwd`/`dest_set` — same shape, called once per side).
+/// A node can have several parents (a DAG, not a tree — see `ParentEdge`'s
+/// doc above), so this is a min-over-parents recursion, not a single
+/// lookup; memoized because ancestor chains overlap heavily across the
+/// candidate meeting nodes sharing these same two BFS trees — without
+/// memoizing, scoring N candidates whose chains overlap by depth D would
+/// redo the same sub-walk up to N times.
+///
+/// Per-edge cost: a transit edge (`via_pattern = Some`) looks up
+/// `PatternCumulativeCache`'s real cumulative-time difference between the
+/// two stops on that pattern — this corrects for `CoarseGraph`'s transit
+/// edges being a clique/stride-sampled simplification (an edge can skip
+/// real intermediate stops, so "real time for this edge" isn't
+/// recoverable from the edge alone; see `PatternCumulativeCache`'s own doc
+/// in repo.rs). Falls back to straight-line distance at
+/// `ASSUMED_TRANSIT_SPEED_MPS` when either endpoint has no cumulative-time
+/// data, same "don't treat a data gap as a free hop" reasoning used
+/// everywhere else this fallback appears (import.rs, freq_raptor.rs). A
+/// walk edge (`via_pattern = None`) uses straight-line distance at
+/// `RANK_MEETS_WALKING_SPEED_MPS` — real `distance_m` is available on the
+/// matching `CoarseEdge`, but finding that specific edge back out of the
+/// adjacency list per hop is more work than just recomputing haversine
+/// here, and the fallback path already does exactly that anyway.
+#[allow(clippy::too_many_arguments)]
+fn real_time_from_root(
+    node: i64,
+    parents_of: &FxHashMap<i64, FxHashSet<ParentEdge>>,
+    root_set: &FxHashSet<i64>,
+    root_point: LatLon,
+    cumulative: &PatternCumulativeCache,
+    stops: &StopsCache,
+    memo: &mut FxHashMap<i64, f64>,
+) -> f64 {
+    if let Some(&v) = memo.get(&node) { return v; }
+
+    if root_set.contains(&node) {
+        // Base case: the "last mile" from the literal origin/destination
+        // point to this seed stop — the old distance_sum_m scored the
+        // WHOLE journey this way (pure straight-line, start to finish);
+        // here it's only this one leg, with everything past the seed stop
+        // now real transit/walk time instead of more straight-line.
+        let v = match stops.get(node) {
+            None => f64::MAX, // can't locate — treat as maximally far, same as the old version's None arm, rather than vanish the candidate outright
+            Some(row) => haversine_meters(root_point, LatLon { lat: row.stop_lat, lon: row.stop_lon }) / RANK_MEETS_WALKING_SPEED_MPS,
+        };
+        memo.insert(node, v);
+        return v;
+    }
+
+    // Sentinel inserted before recursing: level_of strictly increases
+    // across a transit hop, and walk_closure only ever links same-level
+    // nodes without creating a parent cycle — so this should never
+    // actually get hit — but this guards against infinite recursion
+    // instead of silently trusting that invariant to hold forever.
+    memo.insert(node, f64::MAX);
+
+    let Some(parents) = parents_of.get(&node) else {
+        memo.insert(node, f64::MAX);
+        return f64::MAX;
+    };
+    let Some(node_row) = stops.get(node) else {
+        memo.insert(node, f64::MAX);
+        return f64::MAX;
+    };
+    let node_ll = LatLon { lat: node_row.stop_lat, lon: node_row.stop_lon };
+
+    let mut best = f64::MAX;
+    for &(p, via_pattern) in parents {
+        let t_p = real_time_from_root(p, parents_of, root_set, root_point, cumulative, stops, memo);
+        if t_p >= f64::MAX { continue; }
+        let Some(p_row) = stops.get(p) else { continue };
+        let p_ll = LatLon { lat: p_row.stop_lat, lon: p_row.stop_lon };
+
+        let edge_cost = match via_pattern {
+            Some(pattern_pk) => match (cumulative.cumulative_sec(pattern_pk, p), cumulative.cumulative_sec(pattern_pk, node)) {
+                (Some(cp), Some(cn)) if cn >= cp => (cn - cp) as f64,
+                _ => haversine_meters(p_ll, node_ll) / ASSUMED_TRANSIT_SPEED_MPS,
+            },
+            None => haversine_meters(p_ll, node_ll) / RANK_MEETS_WALKING_SPEED_MPS,
+        };
+
+        let total = t_p + edge_cost;
+        if total < best { best = total; }
+    }
+    memo.insert(node, best);
+    best
+}
+
+/// Ranks meeting nodes by REAL estimated hop-time, WITHIN depth buckets
 /// first — does NOT truncate. Truncation now happens per-attempt in
 /// `materialize_seed_paths` (see its doc comment), so a caller that needs
 /// a bigger batch after a first attempt came back empty can re-slice this
 /// SAME ranked list without re-running BFS at all.
 ///
-/// distance_sum_m is the BOTTLENECK score at the meeting node itself:
-/// `haversine(origin, meet) + haversine(meet, destination)` — how much
-/// total ground riding through this one transfer point covers. (The
-/// origin-destination straight-line distance isn't subtracted: it's the
-/// same constant for every candidate in a given search, so it wouldn't
-/// change the relative ranking — this is the plain point-to-point sum.)
-/// Deliberately NOT summed or averaged across every stop on the path —
-/// one bad connection should sink a candidate's ranking on its own, not
-/// get diluted by otherwise-fine stops, and scoring every ridden stop
-/// (rather than just the transfer point) would mean walking full per-line
-/// stop sequences for every candidate before any filtering has happened,
-/// which is real added cost for a metric that would also unfairly
-/// penalize a single wiggly bus line a rider has no way to avoid.
+/// REPLACED (previously straight-line distance_sum_m — see git history if
+/// you need the old version): scores each meeting node by real time,
+/// walking `parents_of_fwd`/`parents_of_bwd` back to the nearest seed stop
+/// via `real_time_from_root` — see that fn's doc for the per-edge cost
+/// model and why a straight lookup isn't enough. Straight-line distance
+/// was always a PROXY for "how fast can transit get you through this
+/// transfer point" — this scores that directly, using the same precomputed
+/// hop-time data `freq_raptor.rs`'s post-materialization narrowing already
+/// relies on, just applied one stage earlier, before any pattern has been
+/// materialized via SQL at all.
 ///
-/// DEPTH SEPARATION: a single global straightness sort lets a very
+/// DEPTH SEPARATION: a single global score lets a very
 /// straight-line-but-deep (near L + SAFETY_MARGIN_LEVELS) meeting node
 /// outrank every meeting node at the true shortest-transfer depth L — but
 /// straightness on the coarse graph is only a proxy; transfer count is the
 /// thing that's actually cheap to get right. So candidates are first
 /// bucketed by `depth = combined_level - first_meet_total_level`, one
 /// bucket per depth in `0..=SAFETY_MARGIN_LEVELS` (SAFETY_MARGIN_LEVELS+1
-/// buckets total), each bucket sorted by straightness independently, then
-/// the buckets are merged via smooth weighted round-robin
+/// buckets total), each bucket sorted by real-time score independently,
+/// then the buckets are merged via smooth weighted round-robin
 /// (`weighted_round_robin_merge`) — shallower depths get more weight (see
 /// `depth_bucket_weight` / `SEED_MEET_DEPTH_BUCKET_WEIGHT`). This keeps a `batch_size` prefix —
 /// including a small first-attempt TOP_N_SEED_MEETS slice — populated
 /// mostly from the fewest-transfer bucket while still letting some
-/// deeper-but-straighter alternatives through, rather than either extreme
+/// deeper-but-faster alternatives through, rather than either extreme
 /// (a pure global sort that can bury the shortest transfer count, or a
 /// strict depth-first cutoff that admits zero deeper alternatives until
 /// the shallow bucket is fully exhausted).
@@ -403,42 +507,49 @@ pub(crate) fn meet_depth(combined: u32, first_meet_total_level: i64, num_buckets
     ((combined as i64 - first_meet_total_level).max(0) as usize).min(num_buckets - 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rank_meets(
     meets: Vec<(i64, u32)>,
     origin: LatLon,
     destination: LatLon,
     stops: &StopsCache,
     first_meet_total_level: i64,
-) -> (Vec<(i64, u32)>, Vec<usize>) {
-    let distance_sum_m = |node: i64| -> f64 {
-        match stops.get(node) {
-            // A stop we can't locate can't be scored — rather than
-            // silently dropping a possibly-good journey, treat it as
-            // maximally-far so it sorts last instead of vanishing outright.
-            None => f64::MAX,
-            Some(row) => {
-                let ll = LatLon { lat: row.stop_lat, lon: row.stop_lon };
-                haversine_meters(origin, ll) + haversine_meters(ll, destination)
-            }
-        }
-    };
+    parents_of_fwd: &FxHashMap<i64, FxHashSet<ParentEdge>>,
+    parents_of_bwd: &FxHashMap<i64, FxHashSet<ParentEdge>>,
+    origin_set: &FxHashSet<i64>,
+    dest_set: &FxHashSet<i64>,
+    cumulative: &PatternCumulativeCache,
+) -> (Vec<(i64, u32)>, Vec<usize>, FxHashMap<i64, f64>) {
+    // Shared across EVERY candidate scored in this whole call, both
+    // buckets included — see real_time_from_root's doc for why this is
+    // what makes memoizing actually pay off here (heavily overlapping
+    // ancestor chains across candidates, not just within one).
+    let mut memo_fwd: FxHashMap<i64, f64> = FxHashMap::default();
+    let mut memo_bwd: FxHashMap<i64, f64> = FxHashMap::default();
+    // node -> combined real-time score, recorded as a side effect of
+    // sorting below — returned to the caller so materialize_seed_paths can
+    // margin-filter a batch without recomputing real_time_from_root.
+    let mut scores: FxHashMap<i64, f64> = FxHashMap::default();
 
-    // Precompute each node's distance once (O(n)) instead of recomputing it
-    // from inside the comparator, which sort_by would call O(n log n) times
-    // — cheap here (bounded by SEED_MEETS_RETRY_CEILING) but a one-line fix.
-    let sort_by_straightness = |bucket: &mut Vec<(i64, u32)>| {
-        bucket.sort_by_cached_key(|&(node, _)| (distance_sum_m(node).to_bits(), node));
+    let mut sort_by_real_time = |bucket: &mut Vec<(i64, u32)>, scores: &mut FxHashMap<i64, f64>| {
+        bucket.sort_by_cached_key(|&(node, _)| {
+            let t_fwd = real_time_from_root(node, parents_of_fwd, origin_set, origin, cumulative, stops, &mut memo_fwd);
+            let t_bwd = real_time_from_root(node, parents_of_bwd, dest_set, destination, cumulative, stops, &mut memo_bwd);
+            let score = if t_fwd >= f64::MAX || t_bwd >= f64::MAX { f64::MAX } else { t_fwd + t_bwd };
+            scores.insert(node, score);
+            (score.to_bits(), node)
+        });
     };
 
     if !DEPTH_BUCKET_RANKING_ENABLED {
         // Single bucket, no depth separation, no weighted interleave —
-        // pure global straightness sort. bucket_sizes_before still comes
+        // pure global real-time sort. bucket_sizes_before still comes
         // back length-1 so the seed_bucket{depth}_before/after logging in
         // tagging.rs keeps working unchanged, just with one bucket to log.
         let mut all: Vec<(i64, u32)> = meets;
         let bucket_sizes_before = vec![all.len()];
-        sort_by_straightness(&mut all);
-        return (all, bucket_sizes_before);
+        sort_by_real_time(&mut all, &mut scores);
+        return (all, bucket_sizes_before, scores);
     }
 
     let num_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
@@ -453,13 +564,13 @@ fn rank_meets(
     }
     let bucket_sizes_before: Vec<usize> = buckets.iter().map(|b| b.len()).collect();
     for bucket in &mut buckets {
-        sort_by_straightness(bucket);
+        sort_by_real_time(bucket, &mut scores);
     }
 
     let weights: Vec<i64> = (0..num_buckets)
         .map(|depth| depth_bucket_weight(depth, num_buckets))
         .collect();
-    (weighted_round_robin_merge(buckets, &weights), bucket_sizes_before)
+    (weighted_round_robin_merge(buckets, &weights), bucket_sizes_before, scores)
 }
 
 /// Bucket weight for depth-separated ranking: shallower depths (fewer
@@ -529,6 +640,7 @@ pub fn run_seed_bfs(
     origin_pks: &[i64],
     dest_pks: &[i64],
     max_transfers: u32,
+    cumulative: &PatternCumulativeCache,
 ) -> SeedBfsRun {
     let max_levels = level_cap_for(max_transfers);
     let origin_set: FxHashSet<i64> = origin_pks.iter().copied().collect();
@@ -639,6 +751,7 @@ pub fn run_seed_bfs(
     if first_meet_total_level < 0 {
         return SeedBfsRun {
             ordered_meets: Vec::new(),
+            meet_scores: FxHashMap::default(),
             first_meet_total_level: -1,
             parents_of_fwd,
             parents_of_bwd,
@@ -656,10 +769,14 @@ pub fn run_seed_bfs(
         .filter(|&(_, combined)| combined as i64 <= max_collect_combined_level)
         .collect();
     ordered_meets.sort_by_key(|&(node, combined)| (combined, node));
-    let (ordered_meets, bucket_sizes_before) = rank_meets(ordered_meets, origin, destination, stops, first_meet_total_level);
+    let (ordered_meets, bucket_sizes_before, meet_scores) = rank_meets(
+        ordered_meets, origin, destination, stops, first_meet_total_level,
+        &parents_of_fwd, &parents_of_bwd, &origin_set, &dest_set, cumulative,
+    );
 
     SeedBfsRun {
         ordered_meets,
+        meet_scores,
         first_meet_total_level,
         parents_of_fwd,
         parents_of_bwd,
@@ -698,10 +815,37 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
             path_depths: Vec::new(),
             levels_expanded: run.levels_expanded,
             level_frontiers: run.level_frontiers.clone(),
+            after_counts: Vec::new(),
         };
     }
 
-    let batch = &run.ordered_meets[..batch_size.min(run.ordered_meets.len())];
+    let capped = &run.ordered_meets[..batch_size.min(run.ordered_meets.len())];
+
+    // MARGIN FILTER: `capped` is still a raw count-based slice (batch_size
+    // remains the outer ceiling, and what the existing retry ladder
+    // doubles — see resolver.rs). Within that ceiling, drop any meeting
+    // node whose real-time score isn't within margin of the BEST score
+    // actually present in this slice — see SEED_MEET_SELECT_MARGIN_*'s doc
+    // in settings.rs. A node with no score on record (shouldn't happen —
+    // rank_meets scores every node it ever sorts — but treated as
+    // "unscoreable, keep it" rather than silently dropped, same
+    // fail-open reasoning used everywhere else an f64::MAX sentinel
+    // appears in this file) is never filtered out by this step.
+    let best_score = capped.iter()
+        .filter_map(|&(node, _)| run.meet_scores.get(&node).copied())
+        .filter(|&s| s < f64::MAX)
+        .fold(f64::MAX, f64::min);
+    let batch: Vec<(i64, u32)> = if best_score >= f64::MAX {
+        capped.to_vec()
+    } else {
+        let margin = (best_score * SEED_MEET_SELECT_MARGIN_RELATIVE_PCT).max(SEED_MEET_SELECT_MARGIN_FLOOR_SEC);
+        let threshold = best_score + margin;
+        capped.iter()
+            .filter(|&&(node, _)| run.meet_scores.get(&node).map(|&s| s <= threshold).unwrap_or(true))
+            .copied()
+            .collect()
+    };
+    let batch = batch.as_slice();
 
     // A single edge straddling the frontier gets discovered as a "meeting
     // point" from both of its endpoints (forward lands on the far end the
@@ -750,6 +894,10 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
         let depth = meet_depth(combined, run.first_meet_total_level, num_buckets);
         meets_by_depth[depth].push(m);
     }
+    // The real "after" counterpart to SeedBfsRun::bucket_sizes_before —
+    // from THIS (margin-filtered) batch, not the raw batch_size slice. See
+    // SeedPathResult::after_counts' doc.
+    let after_counts: Vec<usize> = meets_by_depth.iter().map(|d| d.len()).collect();
     let mut core_stop_pks_by_depth: Vec<FxHashSet<i64>> = Vec::with_capacity(num_buckets);
     let mut claimed: FxHashSet<i64> = FxHashSet::default();
     for depth_meets in &meets_by_depth {
@@ -824,6 +972,7 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
         path_depths,
         levels_expanded: run.levels_expanded,
         level_frontiers: run.level_frontiers.clone(),
+        after_counts,
     }
 }
 
@@ -840,7 +989,8 @@ pub fn find_seed_paths(
     origin_pks: &[i64],
     dest_pks: &[i64],
     max_transfers: u32,
+    cumulative: &PatternCumulativeCache,
 ) -> SeedPathResult {
-    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers);
+    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative);
     materialize_seed_paths(&run, TOP_N_SEED_MEETS)
 }

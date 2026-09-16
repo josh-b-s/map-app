@@ -24,6 +24,16 @@ pub struct CoarseEdge {
     pub to: i64,
     pub kind: EdgeKind,
     pub cost: f64, // 1.0 transit, 0.5 walk — kept explicit for RAPTOR/BFS scoring, though it's fully derived from `kind`
+    /// Real haversine distance in meters for Walk-kind edges; 0.0 for
+    /// Transit (meaningless there — transit "distance" isn't a walk
+    /// distance, and nothing reads this field for Transit edges).
+    /// Previously computed and then discarded (only the WALK_EDGE_THRESHOLD_M
+    /// comparison used it) — now retained so freq_raptor's walk-relax step
+    /// and any query-time consumer can get a real walk-time estimate
+    /// straight from this already-resident structure instead of
+    /// rebuilding a footpath grid per search (see freq_raptor.rs's module
+    /// doc for why this consolidation matters).
+    pub distance_m: f64,
     /// pattern_pk this transit edge came from — None for walk edges. Same
     /// debug-overlay purpose as the TS version's viaPatternKey: lets a
     /// debug view draw the actual line's real stop sequence instead of a
@@ -62,6 +72,7 @@ impl CoarseGraph {
                     to: from,
                     kind: EdgeKind::Transit,
                     cost: e.cost,
+                    distance_m: 0.0,
                     via_pattern: e.via_pattern,
                 });
             }
@@ -136,8 +147,8 @@ pub fn build_adjacency_from_scratch(
                         LatLon { lat: other.stop_lat, lon: other.stop_lon },
                     );
                     if d <= WALK_EDGE_THRESHOLD_M {
-                        add_edge(&mut adjacency, s.stop_pk, CoarseEdge { to: other_pk, kind: EdgeKind::Walk, cost: 0.5, via_pattern: None });
-                        add_edge(&mut adjacency, other_pk, CoarseEdge { to: s.stop_pk, kind: EdgeKind::Walk, cost: 0.5, via_pattern: None });
+                        add_edge(&mut adjacency, s.stop_pk, CoarseEdge { to: other_pk, kind: EdgeKind::Walk, cost: 0.5, distance_m: d, via_pattern: None });
+                        add_edge(&mut adjacency, other_pk, CoarseEdge { to: s.stop_pk, kind: EdgeKind::Walk, cost: 0.5, distance_m: d, via_pattern: None });
                     }
                 }
             }
@@ -161,7 +172,7 @@ fn flush_pattern(
         for i in 0..n {
             for j in (i + 1)..n {
                 add_edge(adjacency, stop_at(i), CoarseEdge {
-                    to: stop_at(j), kind: EdgeKind::Transit, cost: 1.0, via_pattern: Some(pattern_pk),
+                    to: stop_at(j), kind: EdgeKind::Transit, cost: 1.0, distance_m: 0.0, via_pattern: Some(pattern_pk),
                 });
             }
         }
@@ -185,7 +196,7 @@ fn flush_pattern(
             for &j in &sample_idx {
                 if j <= i { continue; } // direction-respecting
                 add_edge(adjacency, stop_at(i), CoarseEdge {
-                    to: stop_at(j), kind: EdgeKind::Transit, cost: 1.0, via_pattern: Some(pattern_pk),
+                    to: stop_at(j), kind: EdgeKind::Transit, cost: 1.0, distance_m: 0.0, via_pattern: Some(pattern_pk),
                 });
             }
         }

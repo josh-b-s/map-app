@@ -12,10 +12,10 @@
 //!
 //! ENCODING: TS packs edges as a `\x1f`-joined string of
 //! `{to}{kind}{FIELD_SEP}{viaPatternKey}` tokens, parsed back with string
-//! splits. Rust packs each edge as a fixed-width 17-byte binary record
-//! instead (i64 `to` + u8 `kind` + i64 `via_pattern`, `-1` sentinel for
-//! "none") — no string parsing on the load path, which matters here since
-//! this blob holds ~2M edges total.
+//! splits. Rust packs each edge as a fixed-width 25-byte binary record
+//! instead (i64 `to` + u8 `kind` + i64 `via_pattern` (`-1` sentinel for
+//! "none") + f64 `distance_m`) — no string parsing on the load path, which
+//! matters here since this blob holds ~2M edges total.
 
 use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,7 +25,17 @@ use crate::graph::coarse::{CoarseEdge, EdgeKind};
 /// just when the underlying GTFS data does — same reasoning as TS's
 /// GRAPH_ALGO_VERSION (a code change that produces different edges from the
 /// same row counts must still force a rebuild).
-const RUST_GRAPH_ALGO_VERSION: i64 = 1;
+///
+/// v1 -> v2: CoarseEdge gained `distance_m` (real walk distance, no longer
+/// discarded — see graph/coarse.rs), and the persisted record widened from
+/// 17 to 25 bytes to carry it. Bumping this forces any device with an
+/// existing v1 blob to fail the signature check and rebuild from scratch
+/// instead of `decode_edges` silently producing `distance_m: 0.0` for
+/// every persisted walk edge, which freq_raptor's walk-relax step would
+/// have read as "zero distance, always in range" — a real correctness bug,
+/// not just a missing feature, so a one-time forced rebuild is the right
+/// trade here.
+const RUST_GRAPH_ALGO_VERSION: i64 = 2;
 
 pub struct GraphSignature {
     pub stop_count: i64,
@@ -56,26 +66,31 @@ fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn encode_edges(edges: &[CoarseEdge]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(edges.len() * 17);
+    // 25 bytes/edge: i64 to + u8 kind + i64 via_pattern (-1 sentinel) +
+    // f64 distance_m. See RUST_GRAPH_ALGO_VERSION's doc for why this
+    // widened from the original 17-byte record.
+    let mut out = Vec::with_capacity(edges.len() * 25);
     for e in edges {
         out.extend_from_slice(&e.to.to_le_bytes());
         out.push(match e.kind { EdgeKind::Transit => 0, EdgeKind::Walk => 1 });
         out.extend_from_slice(&e.via_pattern.unwrap_or(-1).to_le_bytes());
+        out.extend_from_slice(&e.distance_m.to_le_bytes());
     }
     out
 }
 
 fn decode_edges(bytes: &[u8]) -> Vec<CoarseEdge> {
-    let mut out = Vec::with_capacity(bytes.len() / 17);
+    let mut out = Vec::with_capacity(bytes.len() / 25);
     let mut i = 0;
-    while i + 17 <= bytes.len() {
+    while i + 25 <= bytes.len() {
         let to = i64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
         let kind = if bytes[i + 8] == 0 { EdgeKind::Transit } else { EdgeKind::Walk };
         let via_raw = i64::from_le_bytes(bytes[i + 9..i + 17].try_into().unwrap());
         let via_pattern = if via_raw < 0 { None } else { Some(via_raw) };
+        let distance_m = f64::from_le_bytes(bytes[i + 17..i + 25].try_into().unwrap());
         let cost = match kind { EdgeKind::Transit => 1.0, EdgeKind::Walk => 0.5 };
-        out.push(CoarseEdge { to, kind, cost, via_pattern });
-        i += 17;
+        out.push(CoarseEdge { to, kind, cost, distance_m, via_pattern });
+        i += 25;
     }
     out
 }
