@@ -301,7 +301,7 @@ pub fn load_gtfs_index_for_trip(
     let mut batch_size = TOP_N_SEED_MEETS;
     let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
         let t = Instant::now();
-        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative)?;
+        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway)?;
         mark!(t, "corridor_resolution");
         for (label, ms) in &resolved.sub_timings {
             timings.push((format!("corridor.{label}"), *ms));

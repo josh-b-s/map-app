@@ -51,12 +51,13 @@
 use std::collections::HashSet;
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
-    level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, MAX_SEED_PATHS,
-    RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
-    SEED_MEET_SELECT_MARGIN_FLOOR_SEC, SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, TOP_N_SEED_MEETS,
+    level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
+    MAX_SEED_PATHS, RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
+    ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
+    SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::repo::{PatternCumulativeCache, StopsCache};
+use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, StopsCache};
 use crate::geo::{haversine_meters, LatLon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +397,23 @@ fn backtrack_to_dest(
 /// matching `CoarseEdge`, but finding that specific edge back out of the
 /// adjacency list per hop is more work than just recomputing haversine
 /// here, and the fallback path already does exactly that anyway.
+///
+/// TRANSFER/WAIT COST: the memo carries `(time, arrival_pattern)`, not
+/// just a scalar time — `arrival_pattern` is whichever pattern the BEST
+/// path into this node was riding when it got here (`None` if it arrived
+/// by walking, or is a root stop with no boarding yet). This is what lets
+/// a NEW boarding be told apart from CONTINUING along the same pattern: a
+/// transit edge whose `via_pattern` differs from the arriving path's
+/// `arrival_pattern` (including the "wasn't riding anything yet" case) is
+/// a real boarding, and gets `PatternHeadwayCache`'s `headway/2` wait
+/// added — same reasoning `freq_raptor` already uses for every boarding.
+/// Without this, a 2-ride journey's estimate silently treats every
+/// transfer as instant, which systematically UNDER-prices it relative to
+/// a genuinely-faster 1-ride alternative (the two estimators disagreeing
+/// on this was a real, found inconsistency — see the corridor-resolution
+/// design discussion). A walk edge never needs this: waiting doesn't apply
+/// to walking, and it resets `arrival_pattern` to `None` so whatever
+/// boarding comes after a walk is correctly treated as fresh.
 #[allow(clippy::too_many_arguments)]
 fn real_time_from_root(
     node: i64,
@@ -403,9 +421,10 @@ fn real_time_from_root(
     root_set: &FxHashSet<i64>,
     root_point: LatLon,
     cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
     stops: &StopsCache,
-    memo: &mut FxHashMap<i64, f64>,
-) -> f64 {
+    memo: &mut FxHashMap<i64, (f64, Option<i64>)>,
+) -> (f64, Option<i64>) {
     if let Some(&v) = memo.get(&node) { return v; }
 
     if root_set.contains(&node) {
@@ -413,10 +432,12 @@ fn real_time_from_root(
         // point to this seed stop — the old distance_sum_m scored the
         // WHOLE journey this way (pure straight-line, start to finish);
         // here it's only this one leg, with everything past the seed stop
-        // now real transit/walk time instead of more straight-line.
-        let v = match stops.get(node) {
-            None => f64::MAX, // can't locate — treat as maximally far, same as the old version's None arm, rather than vanish the candidate outright
-            Some(row) => haversine_meters(root_point, LatLon { lat: row.stop_lat, lon: row.stop_lon }) / RANK_MEETS_WALKING_SPEED_MPS,
+        // now real transit/walk time instead of more straight-line. No
+        // pattern ridden yet, so `arrival_pattern` is `None` — the first
+        // real boarding from here still gets its own wait charged below.
+        let v: (f64, Option<i64>) = match stops.get(node) {
+            None => (f64::MAX, None), // can't locate — treat as maximally far, same as the old version's None arm, rather than vanish the candidate outright
+            Some(row) => (haversine_meters(root_point, LatLon { lat: row.stop_lat, lon: row.stop_lon }) / RANK_MEETS_WALKING_SPEED_MPS, None),
         };
         memo.insert(node, v);
         return v;
@@ -427,38 +448,59 @@ fn real_time_from_root(
     // nodes without creating a parent cycle — so this should never
     // actually get hit — but this guards against infinite recursion
     // instead of silently trusting that invariant to hold forever.
-    memo.insert(node, f64::MAX);
+    memo.insert(node, (f64::MAX, None));
 
     let Some(parents) = parents_of.get(&node) else {
-        memo.insert(node, f64::MAX);
-        return f64::MAX;
+        memo.insert(node, (f64::MAX, None));
+        return (f64::MAX, None);
     };
     let Some(node_row) = stops.get(node) else {
-        memo.insert(node, f64::MAX);
-        return f64::MAX;
+        memo.insert(node, (f64::MAX, None));
+        return (f64::MAX, None);
     };
     let node_ll = LatLon { lat: node_row.stop_lat, lon: node_row.stop_lon };
 
     let mut best = f64::MAX;
+    let mut best_pattern: Option<i64> = None;
     for &(p, via_pattern) in parents {
-        let t_p = real_time_from_root(p, parents_of, root_set, root_point, cumulative, stops, memo);
+        let (t_p, p_arrival_pattern) = real_time_from_root(p, parents_of, root_set, root_point, cumulative, headway, stops, memo);
         if t_p >= f64::MAX { continue; }
         let Some(p_row) = stops.get(p) else { continue };
         let p_ll = LatLon { lat: p_row.stop_lat, lon: p_row.stop_lon };
 
-        let edge_cost = match via_pattern {
-            Some(pattern_pk) => match (cumulative.cumulative_sec(pattern_pk, p), cumulative.cumulative_sec(pattern_pk, node)) {
-                (Some(cp), Some(cn)) if cn >= cp => (cn - cp) as f64,
-                _ => haversine_meters(p_ll, node_ll) / ASSUMED_TRANSIT_SPEED_MPS,
-            },
-            None => haversine_meters(p_ll, node_ll) / RANK_MEETS_WALKING_SPEED_MPS,
+        let (ride_cost, arrival_pattern) = match via_pattern {
+            Some(pattern_pk) => {
+                let ride = match (cumulative.cumulative_sec(pattern_pk, p), cumulative.cumulative_sec(pattern_pk, node)) {
+                    (Some(cp), Some(cn)) if cn >= cp => (cn - cp) as f64,
+                    _ => haversine_meters(p_ll, node_ll) / ASSUMED_TRANSIT_SPEED_MPS,
+                };
+                (ride, Some(pattern_pk))
+            }
+            None => (haversine_meters(p_ll, node_ll) / RANK_MEETS_WALKING_SPEED_MPS, None),
         };
 
-        let total = t_p + edge_cost;
-        if total < best { best = total; }
+        // A boarding happens whenever this edge rides a pattern the
+        // arriving path wasn't already on — covers both a genuine
+        // transfer (was on a different pattern) and a first boarding (was
+        // on none, e.g. straight off the origin or after a walk). A walk
+        // edge (arrival_pattern = None here) never incurs this.
+        let wait_cost = match arrival_pattern {
+            Some(pk) if p_arrival_pattern != Some(pk) => match headway.headway_for(pk, t_p as i64) {
+                Some(h) => h as f64 / 2.0,
+                None => FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC as f64,
+            },
+            _ => 0.0,
+        };
+
+        let total = t_p + wait_cost + ride_cost;
+        if total < best {
+            best = total;
+            best_pattern = arrival_pattern;
+        }
     }
-    memo.insert(node, best);
-    best
+    let result = (best, best_pattern);
+    memo.insert(node, result);
+    result
 }
 
 /// Ranks meeting nodes by REAL estimated hop-time, WITHIN depth buckets
@@ -519,13 +561,14 @@ fn rank_meets(
     origin_set: &FxHashSet<i64>,
     dest_set: &FxHashSet<i64>,
     cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
 ) -> (Vec<(i64, u32)>, Vec<usize>, FxHashMap<i64, f64>) {
     // Shared across EVERY candidate scored in this whole call, both
     // buckets included — see real_time_from_root's doc for why this is
     // what makes memoizing actually pay off here (heavily overlapping
     // ancestor chains across candidates, not just within one).
-    let mut memo_fwd: FxHashMap<i64, f64> = FxHashMap::default();
-    let mut memo_bwd: FxHashMap<i64, f64> = FxHashMap::default();
+    let mut memo_fwd: FxHashMap<i64, (f64, Option<i64>)> = FxHashMap::default();
+    let mut memo_bwd: FxHashMap<i64, (f64, Option<i64>)> = FxHashMap::default();
     // node -> combined real-time score, recorded as a side effect of
     // sorting below — returned to the caller so materialize_seed_paths can
     // margin-filter a batch without recomputing real_time_from_root.
@@ -533,8 +576,8 @@ fn rank_meets(
 
     let mut sort_by_real_time = |bucket: &mut Vec<(i64, u32)>, scores: &mut FxHashMap<i64, f64>| {
         bucket.sort_by_cached_key(|&(node, _)| {
-            let t_fwd = real_time_from_root(node, parents_of_fwd, origin_set, origin, cumulative, stops, &mut memo_fwd);
-            let t_bwd = real_time_from_root(node, parents_of_bwd, dest_set, destination, cumulative, stops, &mut memo_bwd);
+            let (t_fwd, _) = real_time_from_root(node, parents_of_fwd, origin_set, origin, cumulative, headway, stops, &mut memo_fwd);
+            let (t_bwd, _) = real_time_from_root(node, parents_of_bwd, dest_set, destination, cumulative, headway, stops, &mut memo_bwd);
             let score = if t_fwd >= f64::MAX || t_bwd >= f64::MAX { f64::MAX } else { t_fwd + t_bwd };
             scores.insert(node, score);
             (score.to_bits(), node)
@@ -641,6 +684,7 @@ pub fn run_seed_bfs(
     dest_pks: &[i64],
     max_transfers: u32,
     cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
 ) -> SeedBfsRun {
     let max_levels = level_cap_for(max_transfers);
     let origin_set: FxHashSet<i64> = origin_pks.iter().copied().collect();
@@ -771,7 +815,7 @@ pub fn run_seed_bfs(
     ordered_meets.sort_by_key(|&(node, combined)| (combined, node));
     let (ordered_meets, bucket_sizes_before, meet_scores) = rank_meets(
         ordered_meets, origin, destination, stops, first_meet_total_level,
-        &parents_of_fwd, &parents_of_bwd, &origin_set, &dest_set, cumulative,
+        &parents_of_fwd, &parents_of_bwd, &origin_set, &dest_set, cumulative, headway,
     );
 
     SeedBfsRun {
@@ -824,27 +868,62 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
     // MARGIN FILTER: `capped` is still a raw count-based slice (batch_size
     // remains the outer ceiling, and what the existing retry ladder
     // doubles — see resolver.rs). Within that ceiling, drop any meeting
-    // node whose real-time score isn't within margin of the BEST score
-    // actually present in this slice — see SEED_MEET_SELECT_MARGIN_*'s doc
-    // in settings.rs. A node with no score on record (shouldn't happen —
-    // rank_meets scores every node it ever sorts — but treated as
-    // "unscoreable, keep it" rather than silently dropped, same
-    // fail-open reasoning used everywhere else an f64::MAX sentinel
-    // appears in this file) is never filtered out by this step.
-    let best_score = capped.iter()
-        .filter_map(|&(node, _)| run.meet_scores.get(&node).copied())
-        .filter(|&s| s < f64::MAX)
-        .fold(f64::MAX, f64::min);
-    let batch: Vec<(i64, u32)> = if best_score >= f64::MAX {
-        capped.to_vec()
-    } else {
+    // node whose real-time score isn't within margin of the BEST score —
+    // see SEED_MEET_SELECT_MARGIN_*'s doc in settings.rs.
+    //
+    // PER-DEPTH, not global: `capped` is already the product of
+    // `rank_meets`'s weighted round-robin merge, which deliberately keeps
+    // SOME deeper/transfer meeting nodes in the batch even when a
+    // shallower one scores much better — that's the whole point of depth
+    // bucketing (see rank_meets's doc: a strict global sort can bury a
+    // real multi-transfer option under a merely-straighter one, now
+    // merely-faster-looking one). A single global margin threshold applied
+    // AFTER that merge would immediately undo it — every deep candidate
+    // the merge preserved would likely fail a margin computed against the
+    // shallowest bucket's best score, since a fair transfer inherently
+    // costs more real time than a direct ride even when it's the right
+    // choice. Computing margin separately per depth bucket keeps each
+    // depth's own already-negotiated representation intact; only the hard
+    // SEED_MEET_SELECT_TOP_K ceiling below stays global, since that one is
+    // a pure backtracking-cost bound, not a fairness mechanism.
+    let num_margin_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
+    let mut capped_by_depth: Vec<Vec<(i64, u32)>> = vec![Vec::new(); num_margin_buckets];
+    for &(node, combined) in capped {
+        capped_by_depth[meet_depth(combined, run.first_meet_total_level, num_margin_buckets)].push((node, combined));
+    }
+    let mut batch: Vec<(i64, u32)> = Vec::with_capacity(capped.len());
+    for depth_group in &capped_by_depth {
+        if depth_group.is_empty() { continue; }
+        if !ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE {
+            batch.extend(depth_group.iter().copied());
+            continue;
+        }
+        let best_score = depth_group.iter()
+            .filter_map(|&(node, _)| run.meet_scores.get(&node).copied())
+            .filter(|&s| s < f64::MAX)
+            .fold(f64::MAX, f64::min);
+        if best_score >= f64::MAX {
+            // No scoreable node in this depth at all — same fail-open
+            // reasoning as the per-node case below: keep the whole group
+            // rather than silently dropping it.
+            batch.extend(depth_group.iter().copied());
+            continue;
+        }
         let margin = (best_score * SEED_MEET_SELECT_MARGIN_RELATIVE_PCT).max(SEED_MEET_SELECT_MARGIN_FLOOR_SEC);
         let threshold = best_score + margin;
-        capped.iter()
-            .filter(|&&(node, _)| run.meet_scores.get(&node).map(|&s| s <= threshold).unwrap_or(true))
-            .copied()
-            .collect()
-    };
+        // A node with no score on record (shouldn't happen — rank_meets
+        // scores every node it ever sorts — but treated as "unscoreable,
+        // keep it" rather than silently dropped, same fail-open reasoning
+        // used everywhere else an f64::MAX sentinel appears in this file).
+        batch.extend(depth_group.iter().filter(|&&(node, _)| run.meet_scores.get(&node).map(|&s| s <= threshold).unwrap_or(true)).copied());
+    }
+    // Hard ceiling on top of the margin filter — see SEED_MEET_SELECT_TOP_K's
+    // doc in settings.rs. Only actually sorts/truncates when the margin
+    // filter alone didn't already bring the batch under K.
+    if batch.len() > SEED_MEET_SELECT_TOP_K {
+        batch.sort_by_cached_key(|&(node, _)| run.meet_scores.get(&node).copied().unwrap_or(f64::MAX).to_bits());
+        batch.truncate(SEED_MEET_SELECT_TOP_K);
+    }
     let batch = batch.as_slice();
 
     // A single edge straddling the frontier gets discovered as a "meeting
@@ -990,7 +1069,8 @@ pub fn find_seed_paths(
     dest_pks: &[i64],
     max_transfers: u32,
     cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
 ) -> SeedPathResult {
-    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative);
+    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway);
     materialize_seed_paths(&run, TOP_N_SEED_MEETS)
 }

@@ -32,8 +32,9 @@ use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::{CoarseGraph, EdgeKind};
 use crate::repo::{PatternHeadwayCache, PatternHopsCache, PatternStopRow, StopsCache};
 use crate::settings::{
-    transfer_radius_m, ASSUMED_TRANSIT_SPEED_MPS, FREQ_GRAPH_MARGIN_FLOOR_SEC,
-    FREQ_GRAPH_MARGIN_RELATIVE_PCT, FREQ_GRAPH_MAX_ROUNDS, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
+    transfer_radius_m, ASSUMED_TRANSIT_SPEED_MPS, ENABLE_FREQ_GRAPH_MARGIN_PRUNE,
+    FREQ_GRAPH_MARGIN_FLOOR_SEC, FREQ_GRAPH_MARGIN_RELATIVE_PCT, FREQ_GRAPH_MAX_ROUNDS,
+    FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     ORIGIN_DEST_WALK_RADIUS_M,
 };
 
@@ -292,10 +293,14 @@ pub fn narrow_candidates(
     }
     if best_arrival == i64::MAX { return None; } // never got near the destination — let the caller fall back
 
-    let estimated_duration = (best_arrival - depart_sec_of_day).max(0);
-    let margin = (estimated_duration as f64 * FREQ_GRAPH_MARGIN_RELATIVE_PCT).round() as i64;
-    let margin = margin.max(FREQ_GRAPH_MARGIN_FLOOR_SEC);
-    let threshold = best_arrival + margin;
+    let threshold = if ENABLE_FREQ_GRAPH_MARGIN_PRUNE {
+        let estimated_duration = (best_arrival - depart_sec_of_day).max(0);
+        let margin = (estimated_duration as f64 * FREQ_GRAPH_MARGIN_RELATIVE_PCT).round() as i64;
+        let margin = margin.max(FREQ_GRAPH_MARGIN_FLOOR_SEC);
+        best_arrival + margin
+    } else {
+        i64::MAX
+    };
 
     // ── Union of patterns contributing to any in-play stop, by walking
     // each in-play stop's parent chain back to origin — NOT just the

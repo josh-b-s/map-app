@@ -144,6 +144,14 @@ pub const FREQ_GRAPH_MIN_CANDIDATE_PATTERNS: usize = 40;
 pub const FREQ_GRAPH_MARGIN_FLOOR_SEC: i64 = 8 * 60;
 pub const FREQ_GRAPH_MARGIN_RELATIVE_PCT: f64 = 0.25;
 
+/// On/off switch for the margin pruning above, isolated from the constants
+/// themselves so it can be A/B'd without touching their tuned values —
+/// `false` sets the threshold to `i64::MAX`, i.e. every in-play stop stays
+/// in play and this pass narrows nothing. For measuring how much this pass
+/// alone is worth, independent of `ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE`
+/// below (same shape, different stage).
+pub const ENABLE_FREQ_GRAPH_MARGIN_PRUNE: bool = false;
+
 /// Wait-time estimate used when `PatternHeadwayCache::headway_for` returns
 /// `None` (no data, or too few trips to compute a gap) — deliberately
 /// large/conservative rather than optimistic: an unknown headway should
@@ -188,6 +196,25 @@ pub const RANK_MEETS_WALKING_SPEED_MPS: f64 = 1.4;
 /// worse" apart from "basically tied."
 pub const SEED_MEET_SELECT_MARGIN_FLOOR_SEC: f64 = 4.0 * 60.0;
 pub const SEED_MEET_SELECT_MARGIN_RELATIVE_PCT: f64 = 0.25;
+
+/// On/off switch for the margin filter above, isolated from the constants
+/// themselves so it can be A/B'd without touching their tuned values —
+/// `false` skips straight to keeping the whole depth group (the
+/// `SEED_MEET_SELECT_TOP_K` hard ceiling below still applies either way,
+/// since that's a separate backtracking-cost bound, not part of this test).
+pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = true;
+
+/// Hard ceiling applied AFTER the margin filter above — bounds the
+/// pathological case margin alone can't: a wide, genuinely-flat plateau of
+/// many meeting nodes all within margin of the best (common on a dense
+/// grid of near-identical bus options, say). Margin decides WHICH
+/// candidates are close enough to trust; this just caps how many of them
+/// `core_stop_pks` ever has to carry, sorted by the same real-time score
+/// so a cap that actually bites drops the weakest candidates first, not an
+/// arbitrary interleave-order tail. Real-time-based, unlike
+/// `cross_track_filter`'s straight-line cap — see this constant's use in
+/// `materialize_seed_paths`.
+pub const SEED_MEET_SELECT_TOP_K: usize = 50;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;

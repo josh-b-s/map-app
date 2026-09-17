@@ -11,7 +11,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{bbox_scaled, haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, nearest_stop_pks_in_bbox, PatternCumulativeCache, PatternStopRow, PatternsCache, StopRow, StopsCache, COORD_SCALE};
+use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, nearest_stop_pks_in_bbox, PatternCumulativeCache, PatternHeadwayCache, PatternStopRow, PatternsCache, StopRow, StopsCache, COORD_SCALE};
 use crate::corridor::tagging::{compute_seed_path_corridor, CorridorBoundary, CorridorCandidate};
 use crate::corridor::seed_bfs::{run_seed_bfs, SearchDir, SeedBfsRun};
 use crate::settings::{
@@ -287,6 +287,7 @@ pub fn resolve_corridor(
     destination: LatLon,
     batch_size: usize,
     cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
 ) -> rusqlite::Result<Arc<ResolvedCorridor>> {
     let bfs_key = cache_key(origin, destination, MAX_TRANSFERS);
     let key = format!("{bfs_key}|batch={batch_size}");
@@ -325,7 +326,7 @@ pub fn resolve_corridor(
     let run: Arc<SeedBfsRun> = if let Some(hit) = bfs_cache.get(&bfs_key) {
         hit
     } else {
-        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative));
+        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative, headway));
         bfs_cache.insert(bfs_key.clone(), run.clone());
         run
     };
