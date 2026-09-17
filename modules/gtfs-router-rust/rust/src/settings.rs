@@ -152,6 +152,17 @@ pub const FREQ_GRAPH_MARGIN_RELATIVE_PCT: f64 = 0.25;
 /// below (same shape, different stage).
 pub const ENABLE_FREQ_GRAPH_MARGIN_PRUNE: bool = false;
 
+/// Shared shape used by both duration-based margin filters in this crate
+/// (`FREQ_GRAPH_MARGIN_*` above and `SEED_MEET_SELECT_MARGIN_*` below) —
+/// `max(floor, estimate * relative_pct)`. Kept as one function so the two
+/// sites can't quietly drift apart on the formula itself while still using
+/// independently tuned floor/pct constants and independent duration
+/// estimates (a frequency-graph relaxation vs. a per-candidate BFS
+/// backtrack — genuinely different traversals, not mergeable themselves).
+pub fn margin_threshold(estimate: f64, floor: f64, relative_pct: f64) -> f64 {
+    (estimate * relative_pct).max(floor)
+}
+
 /// Wait-time estimate used when `PatternHeadwayCache::headway_for` returns
 /// `None` (no data, or too few trips to compute a gap) — deliberately
 /// large/conservative rather than optimistic: an unknown headway should

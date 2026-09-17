@@ -32,7 +32,7 @@ use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::{CoarseGraph, EdgeKind};
 use crate::repo::{PatternHeadwayCache, PatternHopsCache, PatternStopRow, StopsCache};
 use crate::settings::{
-    transfer_radius_m, ASSUMED_TRANSIT_SPEED_MPS, ENABLE_FREQ_GRAPH_MARGIN_PRUNE,
+    transfer_radius_m, margin_threshold, ASSUMED_TRANSIT_SPEED_MPS, ENABLE_FREQ_GRAPH_MARGIN_PRUNE,
     FREQ_GRAPH_MARGIN_FLOOR_SEC, FREQ_GRAPH_MARGIN_RELATIVE_PCT, FREQ_GRAPH_MAX_ROUNDS,
     FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     ORIGIN_DEST_WALK_RADIUS_M,
@@ -294,10 +294,9 @@ pub fn narrow_candidates(
     if best_arrival == i64::MAX { return None; } // never got near the destination — let the caller fall back
 
     let threshold = if ENABLE_FREQ_GRAPH_MARGIN_PRUNE {
-        let estimated_duration = (best_arrival - depart_sec_of_day).max(0);
-        let margin = (estimated_duration as f64 * FREQ_GRAPH_MARGIN_RELATIVE_PCT).round() as i64;
-        let margin = margin.max(FREQ_GRAPH_MARGIN_FLOOR_SEC);
-        best_arrival + margin
+        let estimated_duration = (best_arrival - depart_sec_of_day).max(0) as f64;
+        let margin = margin_threshold(estimated_duration, FREQ_GRAPH_MARGIN_FLOOR_SEC as f64, FREQ_GRAPH_MARGIN_RELATIVE_PCT);
+        best_arrival + margin.round() as i64
     } else {
         i64::MAX
     };

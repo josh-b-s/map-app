@@ -53,7 +53,7 @@ use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     MAX_SEED_PATHS, RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
-    ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
+    ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
 use crate::fxhash::{FxHashMap, FxHashSet};
@@ -894,22 +894,22 @@ pub fn materialize_seed_paths(run: &SeedBfsRun, batch_size: usize) -> SeedPathRe
     let mut batch: Vec<(i64, u32)> = Vec::with_capacity(capped.len());
     for depth_group in &capped_by_depth {
         if depth_group.is_empty() { continue; }
-        if !ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE {
-            batch.extend(depth_group.iter().copied());
-            continue;
-        }
+
         let best_score = depth_group.iter()
             .filter_map(|&(node, _)| run.meet_scores.get(&node).copied())
             .filter(|&s| s < f64::MAX)
             .fold(f64::MAX, f64::min);
-        if best_score >= f64::MAX {
-            // No scoreable node in this depth at all — same fail-open
-            // reasoning as the per-node case below: keep the whole group
-            // rather than silently dropping it.
+
+        // Toggle off, or no scoreable node in this depth at all: keep the
+        // whole group rather than filtering against a threshold we can't
+        // meaningfully compute (same fail-open reasoning as the per-node
+        // case below, applied at the group level).
+        if !ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE || best_score >= f64::MAX {
             batch.extend(depth_group.iter().copied());
             continue;
         }
-        let margin = (best_score * SEED_MEET_SELECT_MARGIN_RELATIVE_PCT).max(SEED_MEET_SELECT_MARGIN_FLOOR_SEC);
+
+        let margin = margin_threshold(best_score, SEED_MEET_SELECT_MARGIN_FLOOR_SEC, SEED_MEET_SELECT_MARGIN_RELATIVE_PCT);
         let threshold = best_score + margin;
         // A node with no score on record (shouldn't happen — rank_meets
         // scores every node it ever sorts — but treated as "unscoreable,
