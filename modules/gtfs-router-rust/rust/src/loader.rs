@@ -52,7 +52,7 @@ use crate::graph::coarse::CoarseGraph;
 use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternHopsCache, PatternsCache, RoutesCache, StopsCache};
 use crate::corridor::resolver::{resolve_corridor, CorridorCache, SeedBfsCache};
 use crate::freq_raptor;
-use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, FREQ_GRAPH_MIN_CANDIDATE_PATTERNS};
+use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, FREQ_GRAPH_MIN_CANDIDATE_PATTERNS, ENABLE_SEED_PATH_MARGIN};
 use crate::corridor::tagging::CorridorBoundary;
 use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
@@ -298,7 +298,20 @@ pub fn load_gtfs_index_for_trip(
     // to trigger on a corridor-SHAPE heuristic (MIN_ACCEPTABLE_PATTERNS)
     // rather than on the thing that actually matters here: whether a real,
     // currently-running trip came out the other end.
-    let mut batch_size = TOP_N_SEED_MEETS;
+    let mut batch_size = if ENABLE_SEED_PATH_MARGIN {
+        // This mode replaces the meet-level selection layer (rank_meets'
+        // margin/top-K) with a path-level margin filter instead (see
+        // ENABLE_SEED_PATH_MARGIN's doc) — for that filter to see every
+        // meet's paths rather than only whichever meets an artificially
+        // small batch_size happened to include, every meeting node BFS
+        // found needs to be backtracked, not just the top TOP_N_SEED_MEETS.
+        // materialize_seed_paths clamps this to run.ordered_meets.len()
+        // internally, so usize::MAX is a safe "no cap" sentinel here, not
+        // an actual allocation size.
+        usize::MAX
+    } else {
+        TOP_N_SEED_MEETS
+    };
     let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
         let t = Instant::now();
         let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway)?;
@@ -323,24 +336,72 @@ pub fn load_gtfs_index_for_trip(
         timings.push(("count.corridor_stop_pks".to_string(), full_allowed_stop_pks.len() as i64));
         timings.push(("count.candidate_pattern_pks".to_string(), full_candidate_pattern_pks.len() as i64));
 
-        // ── Frequency-graph pre-filter (freq_raptor.rs) ───────────────────
-        // Narrows the materialized candidate set BEFORE trips_for_candidates
-        // / windowed_discovery_and_fetch run below, using precomputed
-        // hop-times/headways instead of real stop_times rows — see
-        // freq_raptor.rs's module doc for the algorithm and the
-        // pruning-safety margin reasoning. Gated by a size threshold:
-        // below FREQ_GRAPH_MIN_CANDIDATE_PATTERNS there's nothing worth
-        // narrowing, so this stage's own (small) overhead isn't worth
-        // paying.
-        //
-        // NOTE: straightness-based ranking upstream in resolve_corridor
-        // (rank_meets) still exists and still decides which meeting nodes
-        // get materialized into candidates at all — this doesn't replace
-        // that, it replaces what happens to an ALREADY-materialized
-        // candidate set. See the corridor-resolution design discussion:
-        // straightness's job here has shrunk to "cheap admission gate,"
-        // this is now the real decision-maker.
-        let freq_narrow = if full_candidate_pattern_pks.len() >= FREQ_GRAPH_MIN_CANDIDATE_PATTERNS {
+        // ── Candidate-set narrowing: EITHER the seed-path margin filter
+        // OR freq_raptor's frequency-graph pre-filter, never both — see
+        // ENABLE_SEED_PATH_MARGIN's doc in settings.rs for why these are
+        // two competing strategies for the same job (narrow the
+        // materialized candidate set BEFORE trips_for_candidates /
+        // windowed_discovery_and_fetch run below) rather than stacked
+        // stages. Both produce the same `FreqNarrowResult` shape so every
+        // consumer below — the active-trip lookup, the cheap
+        // fallback-to-full, all the timings/logging — is shared code,
+        // unaware of which strategy actually produced it.
+        let freq_narrow: Option<freq_raptor::FreqNarrowResult> = if ENABLE_SEED_PATH_MARGIN {
+            // Union of patterns/stops across every margin-kept whole
+            // candidate trip (resolve_corridor/materialize_seed_paths
+            // already did the actual margin filtering — this just
+            // flattens what survived). See seed_path_pattern_pks' doc for
+            // why this field isn't debug-only despite the naming symmetry
+            // with debug_seed_paths.
+            let mut pattern_pks: HashSet<i64> = HashSet::new();
+            for pats in &resolved.seed_path_pattern_pks { pattern_pks.extend(pats.iter().copied()); }
+            // Deliberately NOT narrowed to the literal stops in the
+            // margin-kept `paths` — those are a handful of discrete
+            // backtracked stop SEQUENCES, not every stop the surviving
+            // patterns actually run through. Narrowing stop_pks to just
+            // those broke real routes whose correct boarding/alighting
+            // stop simply wasn't the one a particular backtracked path
+            // happened to record, even though the pattern itself was kept
+            // (that stop's stop_times rows get filtered out downstream by
+            // `stop_pk IN corridor_stop_pks` regardless of pattern_pks).
+            // freq_raptor's own narrowing barely touches stops either (see
+            // count.freq_narrowed_stop_pks vs corridor_stop_pks in past
+            // runs) — patterns are where the real narrowing should happen,
+            // stops should stay generous.
+            let stop_pks: HashSet<i64> = full_allowed_stop_pks.clone();
+
+            let best_score = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
+            // depart_sec_of_day + best whole-trip estimate, same
+            // "estimated best arrival sec-of-day" semantics
+            // FreqNarrowResult's doc promises — kept meaningful here
+            // rather than a placeholder, since freq_raptor.applied's
+            // fallback-to-full logging below doesn't distinguish sources.
+            let estimated_best_arrival_sec = if best_score < f64::MAX {
+                depart_sec_of_day + best_score.round() as i64
+            } else {
+                depart_sec_of_day
+            };
+
+            timings.push(("count.seed_path_narrowed_pattern_pks".to_string(), pattern_pks.len() as i64));
+            timings.push(("count.seed_path_narrowed_stop_pks".to_string(), stop_pks.len() as i64));
+
+            if pattern_pks.is_empty() {
+                // No margin-kept path at all — same "couldn't estimate,
+                // fall back to unnarrowed" contract FreqNarrowResult's own
+                // doc requires of freq_raptor::narrow_candidates.
+                None
+            } else {
+                Some(freq_raptor::FreqNarrowResult { pattern_pks, stop_pks, estimated_best_arrival_sec })
+            }
+        } else if full_candidate_pattern_pks.len() >= FREQ_GRAPH_MIN_CANDIDATE_PATTERNS {
+            // ── Frequency-graph pre-filter (freq_raptor.rs) ───────────────
+            // Narrows the materialized candidate set using precomputed
+            // hop-times/headways instead of real stop_times rows — see
+            // freq_raptor.rs's module doc for the algorithm and the
+            // pruning-safety margin reasoning. Gated by a size threshold:
+            // below FREQ_GRAPH_MIN_CANDIDATE_PATTERNS there's nothing worth
+            // narrowing, so this stage's own (small) overhead isn't worth
+            // paying.
             let t = Instant::now();
             let r = freq_raptor::narrow_candidates(
                 &resolved.pattern_pks, &full_allowed_stop_pks, &resolved.pattern_stop_rows,

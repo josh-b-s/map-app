@@ -37,6 +37,15 @@ pub struct ResolvedCorridor {
     /// this attempt's batch_size didn't reach the one with real service."
     pub total_seed_meets_found: usize,
     pub debug_seed_paths: Vec<Vec<i64>>,
+    /// Pattern_pks ridden by the matching entry in `debug_seed_paths` —
+    /// NOT debug-only despite the naming symmetry with `debug_seed_paths`:
+    /// loader.rs reads this (unioned across every kept path) as the
+    /// pattern candidate set when `ENABLE_SEED_PATH_MARGIN` is on, in
+    /// place of freq_raptor's narrowing.
+    pub seed_path_pattern_pks: Vec<Vec<i64>>,
+    /// Whole-trip estimated score for the matching entry in
+    /// `debug_seed_paths` — see `SeedPathResult::path_scores`.
+    pub seed_path_scores: Vec<f64>,
     /// Depth (relative to shortest meet) of the matching entry in
     /// `debug_seed_paths` — lets a debug/visualization consumer color
     /// candidate seed paths by depth instead of every candidate looking
@@ -338,8 +347,17 @@ pub fn resolve_corridor(
     sub_timings.push(("count.seed_bfs_meets_total".to_string(), run.ordered_meets.len() as i64));
 
     let t = Instant::now();
-    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination)?;
-    let seed_corridor_wrapper_ms = t.elapsed().as_millis() as i64 - seed_corridor.sub_timings.iter().map(|(_, ms)| ms).sum::<i64>();
+    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway)?;
+    // Only sum entries that are actually milliseconds — every "count."-
+    // prefixed entry in seed_corridor.sub_timings is a raw count (paths,
+    // stops, whatever), not a duration, and summing those in here is what
+    // made this go negative once enough count.* entries existed alongside
+    // the real per-stage ms values.
+    let seed_corridor_ms_sum: i64 = seed_corridor.sub_timings.iter()
+        .filter(|(name, _)| !name.starts_with("count."))
+        .map(|(_, ms)| ms)
+        .sum();
+    let seed_corridor_wrapper_ms = t.elapsed().as_millis() as i64 - seed_corridor_ms_sum;
     sub_timings.extend(seed_corridor.sub_timings.clone());
     sub_timings.push(("seed_path_materialize_wrapper".to_string(), seed_corridor_wrapper_ms));
 
@@ -376,6 +394,8 @@ pub fn resolve_corridor(
         seed_path_count: seed_corridor.seed_path_count,
         total_seed_meets_found: run.ordered_meets.len(),
         debug_seed_paths: seed_corridor.seed_paths,
+        seed_path_pattern_pks: seed_corridor.path_pattern_pks,
+        seed_path_scores: seed_corridor.path_scores,
         debug_seed_path_depths: seed_corridor.path_depths,
         debug_bfs_levels: seed_corridor.level_frontiers,
         debug_corridor_boundary: seed_corridor.corridor_boundaries,

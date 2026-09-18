@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::corridor::seed_bfs::{materialize_seed_paths, SearchDir, SeedBfsRun};
 use crate::geo::cross_track_distance_m;
-use crate::repo::{get_pattern_pks_for_stops, StopsCache};
+use crate::repo::{get_pattern_pks_for_stops, PatternCumulativeCache, PatternHeadwayCache, StopsCache};
 use crate::settings::{
     CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX_PER_BUCKET, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
     ORIGIN_DEST_WALK_RADIUS_M,
@@ -62,6 +62,12 @@ pub struct SeedPathCorridorResult {
     /// use this + repo::get_shape_points/PatternMeta for debug rendering
     /// instead of `corridor_boundaries` (now always empty; see seed_bfs.rs).
     pub path_pattern_pks: Vec<Vec<i64>>,
+    /// Whole-trip estimated real duration for the matching entry in
+    /// `seed_paths` — see `SeedPathResult::path_scores` in seed_bfs.rs.
+    /// Real (not debug-only) when `ENABLE_SEED_PATH_MARGIN` is on: that's
+    /// what resolve_corridor/loader.rs use to build the margin-based
+    /// alternative to freq_raptor's narrowing.
+    pub path_scores: Vec<f64>,
     /// Depth (relative to the shortest meet) of the matching entry in
     /// `seed_paths` — see `SeedPathResult::path_depths` in seed_bfs.rs.
     pub path_depths: Vec<u32>,
@@ -92,6 +98,8 @@ pub fn compute_seed_path_corridor(
     candidates: &[CorridorCandidate],
     origin: LatLon,
     destination: LatLon,
+    cumulative: &PatternCumulativeCache,
+    headway: &PatternHeadwayCache,
 ) -> rusqlite::Result<SeedPathCorridorResult> {
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
 
@@ -112,9 +120,14 @@ pub fn compute_seed_path_corridor(
     }
 
     let t = Instant::now();
-    let seed = materialize_seed_paths(run, batch_size);
+    let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops);
     let walk_radius = walk_radius_stop_pks(candidates, origin, destination);
     sub_timings.push(("materialize".to_string(), t.elapsed().as_millis() as i64));
+
+    // Pre-truncation candidate volume — see path_count_before_margin's doc
+    // for why this needs measuring rather than assuming from settings.
+    sub_timings.push(("count.seed_paths_before_margin".to_string(), seed.path_count_before_margin as i64));
+    sub_timings.push(("count.seed_paths_after_margin".to_string(), seed.paths.len() as i64));
 
     for (depth, &count) in seed.after_counts.iter().enumerate() {
         sub_timings.push((format!("seed_bucket{depth}_after"), count as i64));
@@ -123,7 +136,7 @@ pub fn compute_seed_path_corridor(
     if seed.paths.is_empty() {
         return Ok(SeedPathCorridorResult {
             pattern_pks: HashSet::new(), walk_radius_stop_pks: walk_radius, seed_path_count: 0,
-            seed_paths: Vec::new(), path_pattern_pks: Vec::new(), path_depths: Vec::new(), level_frontiers: seed.level_frontiers,
+            seed_paths: Vec::new(), path_pattern_pks: Vec::new(), path_scores: Vec::new(), path_depths: Vec::new(), level_frontiers: seed.level_frontiers,
             corridor_boundaries: Vec::new(), core_stop_pks: HashSet::new(), sub_timings,
         });
     }
@@ -195,7 +208,7 @@ pub fn compute_seed_path_corridor(
 
     Ok(SeedPathCorridorResult {
         pattern_pks, walk_radius_stop_pks: walk_radius, seed_path_count: seed.paths.len(),
-        seed_paths: seed.paths, path_pattern_pks, path_depths: seed.path_depths, level_frontiers: seed.level_frontiers,
+        seed_paths: seed.paths, path_pattern_pks, path_scores: seed.path_scores, path_depths: seed.path_depths, level_frontiers: seed.level_frontiers,
         corridor_boundaries: Vec::new(), core_stop_pks: filtered_core_stop_pks, sub_timings,
     })
 }

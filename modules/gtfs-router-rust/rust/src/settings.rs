@@ -213,7 +213,7 @@ pub const SEED_MEET_SELECT_MARGIN_RELATIVE_PCT: f64 = 0.25;
 /// `false` skips straight to keeping the whole depth group (the
 /// `SEED_MEET_SELECT_TOP_K` hard ceiling below still applies either way,
 /// since that's a separate backtracking-cost bound, not part of this test).
-pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = true;
+pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = false;
 
 /// Hard ceiling applied AFTER the margin filter above — bounds the
 /// pathological case margin alone can't: a wide, genuinely-flat plateau of
@@ -225,7 +225,31 @@ pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = true;
 /// arbitrary interleave-order tail. Real-time-based, unlike
 /// `cross_track_filter`'s straight-line cap — see this constant's use in
 /// `materialize_seed_paths`.
-pub const SEED_MEET_SELECT_TOP_K: usize = 50;
+pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
+
+/// EXPERIMENTAL — an alternative final-candidate-set strategy explored
+/// alongside `freq_raptor`'s narrow-then-scan approach: instead of feeding
+/// McRAPTOR `core_stop_pks` (freq_raptor's temporally-narrowed ancestor
+/// union), rank EVERY assembled whole candidate trip in `paths` by
+/// `score_seed_path` and keep everything within margin of the best (same
+/// `max(FLOOR, best*PCT)` shape as every other margin filter here — see
+/// `margin_threshold`), meant to be handed to a lightweight per-path
+/// verifier rather than a full McRAPTOR scan. When this is on, the
+/// PER-MEET margin/top-K filter in `materialize_seed_paths`
+/// (`ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE`/`SEED_MEET_SELECT_TOP_K`) is
+/// bypassed entirely — this mode replaces that selection layer rather
+/// than stacking on top of it, so every meeting node's paths get
+/// backtracked and judged on their OWN assembled-path score. Off by
+/// default — `paths`/`path_scores` still get computed either way (cheap
+/// relative to BFS itself), this constant only controls whether they get
+/// filtered to the margin-kept set here. Does NOT affect `core_stop_pks`
+/// directly — loader.rs decides whether to use this mode's
+/// `seed_path_pattern_pks`/paths instead of freq_raptor's narrowing, so
+/// the two remain independently A/B-able in principle even though in
+/// practice loader.rs currently switches on this same constant.
+pub const ENABLE_SEED_PATH_MARGIN: bool = true;
+pub const SEED_PATH_MARGIN_FLOOR_SEC: f64 = 5.0 * 60.0;
+pub const SEED_PATH_MARGIN_RELATIVE_PCT: f64 = 0.25;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;
