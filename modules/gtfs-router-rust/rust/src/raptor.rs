@@ -79,6 +79,13 @@ pub struct Journey {
     pub transfer_count: i64,
     pub departure_time_sec: i64,
     pub arrival_time_sec: i64,
+    /// Distinct pattern_pks this journey actually rode, in board order —
+    /// added so a caller can check candidate-narrowing completeness (does
+    /// the seed-path margin's kept pattern set actually contain every
+    /// pattern the REAL best journey used) using McRAPTOR's own result as
+    /// ground truth, without needing a second full run. Not used for
+    /// display; existing `legs`/`segments` still drive rendering.
+    pub used_pattern_pks: Vec<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +562,13 @@ fn reconstruct_path(
     }
     steps.reverse();
 
+    let mut used_pattern_pks: Vec<i64> = Vec::new();
+    for step in &steps {
+        if let Step::Transit { pattern_pk, .. } = step {
+            if !used_pattern_pks.contains(pattern_pk) { used_pattern_pks.push(*pattern_pk); }
+        }
+    }
+
     let mut segments: Vec<RouteSegment> = Vec::new();
     let mut legs: Vec<Leg> = Vec::new();
     let mut all_coords: Vec<LatLon> = vec![origin];
@@ -681,6 +695,7 @@ fn reconstruct_path(
         origin_stop_name,
         dest_stop_name,
         transfer_stop_name,
+        used_pattern_pks,
         total_duration_min: (arrival_sec - departure_sec) / 60,
         total_walking_meters: total_walking_meters.round() as i64,
         transfer_count: (transfer_count - 1).max(0),

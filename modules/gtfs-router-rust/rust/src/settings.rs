@@ -112,6 +112,40 @@ pub const INITIAL_WINDOW_MIN_SEC: f64 = 2.5 * 3600.0;
 pub const INITIAL_WINDOW_MAX_SEC: f64 = 5.0 * 3600.0;
 pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 
+/// EXPERIMENTAL — uses the seed-path margin's whole-trip duration estimate
+/// (`resolved.seed_path_scores`, always computed regardless of
+/// `ENABLE_SEED_PATH_MARGIN`) to size the FIRST stop_times fetch window,
+/// instead of, and now AUTHORITATIVE over, the distance-only
+/// `distance_scaled_sec` heuristic above — see the doc at this constant's
+/// use in loader.rs for why min'ing the two together defeated the one
+/// case this was meant to help (a multi-transfer journey where a LATER
+/// leg's boarding falls past the distance heuristic's window even though
+/// the first leg's trips exist fine within it). 50%, not the 25% used for
+/// pattern/stop margins elsewhere — this margin protects against a
+/// DIFFERENT, worse failure mode than those: a too-tight PATTERN margin
+/// costs you a possibly-better route (McRAPTOR still finds SOME route); a
+/// too-tight WINDOW here means the correct trip's stop_times row isn't
+/// even fetched, which is caught by the existing window_stages widening
+/// loop / the outer forced-10hr retry, but each of those is much more
+/// expensive than just starting with a wide-enough window. Falls back to
+/// the distance heuristic only when no duration estimate is available at
+/// all (`resolved.seed_path_scores` empty or all-unscoreable) — so this
+/// can only help query latency relative to today's behavior, never
+/// regress a query the estimate doesn't cover.
+pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
+pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
+pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.5;
+/// Separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC — that one
+/// was sized for the distance heuristic's much cruder estimate; a
+/// multi-transfer journey's real duration (walk+ride+wait across every
+/// leg) can legitimately exceed 5 hours' worth of window without being
+/// wrong, so capping the duration-based path at the same 5hr ceiling would
+/// silently reintroduce the exact failure mode this constant exists to
+/// avoid. Still well under WINDOW_WIDENING_STAGES_SEC's first stage
+/// (10hr), so a duration estimate that's badly wrong still gets caught by
+/// that widening loop rather than fetching an enormous window outright.
+pub const DURATION_WINDOW_MAX_SEC: f64 = 8.0 * 3600.0;
+
 /// A/B toggle for how `windowed_trip_discovery` filters to active trips:
 /// - `true` (current default, as of on-device A/B testing): stage
 ///   `active_trip_pks` into a temp table and add `AND trip_pk IN (...)` to

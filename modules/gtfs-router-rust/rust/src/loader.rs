@@ -58,6 +58,8 @@ use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
     INITIAL_WINDOW_MAX_SEC, INITIAL_WINDOW_MIN_SEC, WINDOW_BOARD_BUFFER_SEC,
     WINDOW_DISTANCE_BUFFER_SEC, WINDOW_DISTANCE_SCALE_SEC_PER_KM, WINDOW_WIDENING_STAGES_SEC,
+    ENABLE_DURATION_BASED_WINDOW, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT,
+    DURATION_WINDOW_MAX_SEC, margin_threshold,
 };
 
 const DOW_COLUMNS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -115,6 +117,14 @@ pub struct GtfsIndex {
     pub debug_seed_path_depths: Vec<u32>,
     pub debug_bfs_levels: Vec<(SearchDir, Vec<i64>)>,
     pub debug_corridor_boundary: Vec<CorridorBoundary>,
+    /// Pattern_pks + whole-trip estimated scores from EVERY margin-kept
+    /// candidate seed path — always populated, independent of
+    /// ENABLE_SEED_PATH_MARGIN, so lib.rs can measure candidate-generation
+    /// completeness against whatever journey McRAPTOR actually finds (see
+    /// Journey::used_pattern_pks' doc), regardless of which narrowing
+    /// strategy is actually driving routing this run.
+    pub seed_path_pattern_pks: Vec<Vec<i64>>,
+    pub seed_path_scores: Vec<f64>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
     /// own console.log breakdown.
@@ -125,7 +135,8 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
     GtfsIndex {
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
-        no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary, timings,
+        no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary,
+        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), timings,
     }
 }
 
@@ -545,8 +556,43 @@ pub fn load_gtfs_index_for_trip(
     let t = Instant::now();
     let straight_line_m = haversine_meters(origin, destination);
     let distance_scaled_sec = (straight_line_m / 1000.0) * WINDOW_DISTANCE_SCALE_SEC_PER_KM + WINDOW_DISTANCE_BUFFER_SEC;
+    let distance_based_window_sec = distance_scaled_sec.max(INITIAL_WINDOW_MIN_SEC).min(INITIAL_WINDOW_MAX_SEC);
+
+    // See ENABLE_DURATION_BASED_WINDOW's doc — this is now AUTHORITATIVE
+    // when available, not min'd against the distance heuristic. Min'ing
+    // against distance defeated the one case this was meant to help: a
+    // multi-transfer journey where a LATER leg's boarding (after a
+    // transfer wait) falls past window_hi even though the first leg's
+    // trips exist fine within a narrower window — raptor::run_search
+    // returns Err (candidates.is_empty(), not "window empty") in exactly
+    // that case, forcing the expensive 10hr retry. The duration estimate
+    // already integrates walk+ride+wait across the WHOLE assembled path
+    // (see score_seed_path), so it's naturally often LARGER than the
+    // distance-only heuristic on a multi-transfer trip — that's the
+    // useful case, not one to clamp away. Still floored at
+    // INITIAL_WINDOW_MIN_SEC and capped at DURATION_WINDOW_MAX_SEC (a
+    // separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC, since
+    // that one was sized for the distance heuristic's much cruder
+    // estimate). Falls back to the distance heuristic only when no
+    // duration estimate is available at all.
+    let duration_based_window_sec: Option<f64> = if ENABLE_DURATION_BASED_WINDOW {
+        let best_score = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
+        if best_score < f64::MAX {
+            let margin = margin_threshold(best_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
+            Some((best_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(d) = duration_based_window_sec {
+        timings.push(("window.duration_based_sec".to_string(), d.round() as i64));
+    }
+    timings.push(("window.distance_based_sec".to_string(), distance_based_window_sec.round() as i64));
+
     let initial_window_sec = force_window_sec.map(|v| v as f64)
-        .unwrap_or_else(|| distance_scaled_sec.max(INITIAL_WINDOW_MIN_SEC).min(INITIAL_WINDOW_MAX_SEC));
+        .unwrap_or_else(|| duration_based_window_sec.unwrap_or(distance_based_window_sec));
 
     let mut window_stages: Vec<i64> = vec![initial_window_sec.round() as i64];
     window_stages.extend(WINDOW_WIDENING_STAGES_SEC.iter().copied());
@@ -692,6 +738,7 @@ pub fn load_gtfs_index_for_trip(
             no_service_found: true,
             debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
             debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
+            seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
             timings,
         });
     }
@@ -711,6 +758,7 @@ pub fn load_gtfs_index_for_trip(
         stop_times_by_stop, stop_times_by_stop_and_pattern, stop_times_by_stop_and_trip, no_service_found: false,
         debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
         debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
+        seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
         timings,
     })
 }

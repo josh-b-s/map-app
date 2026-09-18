@@ -546,12 +546,23 @@ impl GtfsRouterEngine {
         };
 
         let t_raptor = Instant::now();
+        let mut pending_failed_attempt_timings: Vec<TimingEntry> = Vec::new();
         let result = raptor::run_search(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, &opts, Some(&mut on_round), Some(&mut on_route_check));
         let mut raptor_ms = t_raptor.elapsed().as_millis() as i64;
 
         let journeys = match result {
             Ok(j) => j,
             Err(_) => {
+                // Capture the FAILED first attempt's own diagnostics before
+                // `index` gets overwritten below — otherwise there's no way
+                // to tell "narrowing excluded the trip that would've served
+                // the narrow window" from "genuinely no service in that
+                // window" after the fact, since only the eventually-
+                // successful index's stats normally reach the log.
+                let first_attempt_timings: Vec<TimingEntry> = index.timings.iter()
+                    .map(|(label, ms)| TimingEntry { label: format!("failed_attempt.{label}"), ms: *ms })
+                    .collect();
+
                 // Same retry-with-a-forced-wide-window fallback as
                 // computeGtfsRoute in the TS version: a window wide enough
                 // to find SOME trips but not a later leg's boarding trip.
@@ -571,6 +582,7 @@ impl GtfsRouterEngine {
                 // attempt's — a retry happening at all is itself useful
                 // diagnostic info, not something to hide by summing it in.
                 raptor_ms += t_retry.elapsed().as_millis() as i64;
+                pending_failed_attempt_timings = first_attempt_timings;
                 retried
             }
         };
@@ -608,6 +620,45 @@ impl GtfsRouterEngine {
         timings.push(TimingEntry { label: "raptor_search".to_string(), ms: raptor_ms });
         timings.push(TimingEntry { label: "debug_emit".to_string(), ms: debug_emit_ms });
         timings.push(TimingEntry { label: "journey_shape_resolve".to_string(), ms: shape_resolve_ms });
+        // count.forced_wide_window_retry=1 means the narrow, distance-based
+        // first attempt found NO route at all (raptor::run_search's own
+        // Err — empty candidate set, not just an empty window) and this
+        // response is entirely the forced-10hr-window retry's work.
+        // failed_attempt.* entries (only present when this is 1) are that
+        // FAILED first attempt's own stage timings/counts, preserved so a
+        // narrowing-caused failure can be told apart from a
+        // genuinely-narrow-window-had-no-service one after the fact —
+        // normally only the eventually-successful attempt's stats survive
+        // to this log line.
+        timings.push(TimingEntry { label: "count.forced_wide_window_retry".to_string(), ms: !pending_failed_attempt_timings.is_empty() as i64 });
+        timings.append(&mut pending_failed_attempt_timings);
+
+        // ── Candidate-generation completeness check ───────────────────────
+        // Uses McRAPTOR's own real result as ground truth: does the
+        // seed-path margin's kept pattern set actually contain every
+        // pattern the REAL best journey rode? Runs regardless of whether
+        // ENABLE_SEED_PATH_MARGIN is the active narrowing strategy this
+        // run — so this accumulates a completeness signal on every real
+        // query, not just ones deliberately run in that mode. A `false`
+        // here means: if this mode HAD been driving routing, it would
+        // have missed the true best journey outright (wrong pattern
+        // excluded), not just returned a slower one.
+        {
+            let best_score = index.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
+            if best_score < f64::MAX {
+                let margin = settings::margin_threshold(best_score, settings::SEED_PATH_MARGIN_FLOOR_SEC, settings::SEED_PATH_MARGIN_RELATIVE_PCT);
+                let threshold = best_score + margin;
+                let mut kept_patterns: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                for (i, pats) in index.seed_path_pattern_pks.iter().enumerate() {
+                    let s = index.seed_path_scores.get(i).copied().unwrap_or(f64::MAX);
+                    if s <= threshold || s >= f64::MAX { kept_patterns.extend(pats.iter().copied()); }
+                }
+                for j in &journeys {
+                    let missing = j.used_pattern_pks.iter().filter(|pk| !kept_patterns.contains(pk)).count();
+                    timings.push(TimingEntry { label: "count.seed_path_completeness_missing_patterns".to_string(), ms: missing as i64 });
+                }
+            }
+        }
 
         Ok(RouteResult { journeys: journeys.into_iter().map(journey_to_ffi).collect(), timings })
     }
