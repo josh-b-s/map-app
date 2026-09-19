@@ -4,7 +4,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
 import { advanceStep, BFS_STEP_INTERVAL_MS, DebugPhase, retreatStep, setBfsCandidateMode, setPlaying, toggleDebugEnabled, toggleHopColorMode } from '@/store/debug.slice';
-import { flattenBfsCandidates, raptorStepCount } from '@/services/gtfs/debug/debugBfsPoints';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 import * as FileSystem from 'expo-file-system/legacy';
 import {ensureImportFolders, INCOMING_DIR} from "@/services/gtfs/import/gtfsImporterLegacy";
@@ -66,7 +65,7 @@ type ImportBusyState = 'idle' | 'preparing' | 'benchmarking' | 'importing';
 export default function DebugControls() {
     const dispatch = useDispatch<AppDispatch>();
     const theme = useThemeStyle();
-    const { enabled, data, phase, stepIndex, playing, bfsCandidateMode, hopColorMode } = useSelector((s: RootState) => s.debug);
+    const { enabled, hasData, phase, stepIndex, playing, bfsCandidateMode, hopColorMode, bfsRoundCount, bfsCandidateCount, raptorStepCount: raptorStepTotal } = useSelector((s: RootState) => s.debug);
 
     // Local (non-Redux) state for the GTFS import sub-panel — this is a
     // dev-only, one-shot tool, not app state anything else needs to react
@@ -188,9 +187,6 @@ export default function DebugControls() {
     // so all three agree on what a "step" means without duplicated logic
     // drifting out of sync. hopColorMode doesn't affect any of this — it's
     // a coloring toggle, not a stepping mode; see debug.slice.ts.
-    const bfsRoundCount = data?.bfsLevels?.length ?? 0;
-    const bfsCandidateCount = data ? flattenBfsCandidates(data.seedPaths, data.bfsLevels).length : 0;
-    const raptorStepTotal = data ? raptorStepCount(data) : 0;
 
     // Auto-advance timer — lives here (not in the slice) since Redux
     // reducers must stay synchronous; this just dispatches advanceStep on an
@@ -206,7 +202,6 @@ export default function DebugControls() {
         return () => clearInterval(id);
     }, [playing, dispatch, phase]);
 
-    const hasData = !!data;
     const stepLabel = phase === 'bfs'
         ? (bfsCandidateMode === 'single'
             ? `Candidate ${stepIndex + 1}/${Math.max(1, bfsCandidateCount)}`

@@ -287,14 +287,20 @@ pub fn get_pattern_pks_for_stops(conn: &Connection, stop_pks: &[i64]) -> rusqlit
     Ok(rows.into_iter().collect())
 }
 
-/// Which routes (as interned RouteId) serve each of the given stop pks —
-/// one bulk query. Mirrors getRouteKeysForStopKeys, used by corridor seed
-/// selection to skip a stop that adds no new route to the seed set.
-pub fn get_route_ids_for_stops(
+/// Which PATTERNS (not routes) serve each of the given stop pks — one bulk
+/// query. Used by corridor seed selection to skip a stop that adds no new
+/// pattern to the seed set. Deliberately pattern_pk-granularity rather than
+/// route-level: two patterns can share the same route number (e.g. inbound
+/// vs outbound, an express vs all-stops variant) while genuinely diverging
+/// in which stops they serve, so collapsing to "same route" risks discarding
+/// a farther stop that's actually the ONLY seed for a pattern the closer
+/// stop doesn't serve at all — the closer stop "covering" that route number
+/// wouldn't mean it covers that specific ride. Same rows the old route-level
+/// version queried; just not collapsed through PatternsCache.route_key.
+pub fn get_patterns_by_stop(
     conn: &Connection,
     stop_pks: &[i64],
-    patterns: &PatternsCache,
-) -> rusqlite::Result<HashMap<i64, HashSet<RouteId>>> {
+) -> rusqlite::Result<HashMap<i64, HashSet<i64>>> {
     if stop_pks.is_empty() { return Ok(HashMap::new()); }
     let rows: Vec<(i64, i64)> = chunked_in_i64(
         conn, stop_pks,
@@ -302,13 +308,9 @@ pub fn get_route_ids_for_stops(
         "",
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let mut out: HashMap<i64, HashSet<RouteId>> = HashMap::new();
+    let mut out: HashMap<i64, HashSet<i64>> = HashMap::new();
     for (stop_pk, pattern_pk) in rows {
-        if let Some(meta) = patterns.get(pattern_pk) {
-            if let Some(route_key) = meta.route_key {
-                out.entry(stop_pk).or_default().insert(route_key);
-            }
-        }
+        out.entry(stop_pk).or_default().insert(pattern_pk);
     }
     Ok(out)
 }

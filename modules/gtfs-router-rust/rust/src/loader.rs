@@ -59,7 +59,7 @@ use crate::settings::{
     INITIAL_WINDOW_MAX_SEC, INITIAL_WINDOW_MIN_SEC, WINDOW_BOARD_BUFFER_SEC,
     WINDOW_DISTANCE_BUFFER_SEC, WINDOW_DISTANCE_SCALE_SEC_PER_KM, WINDOW_WIDENING_STAGES_SEC,
     ENABLE_DURATION_BASED_WINDOW, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT,
-    DURATION_WINDOW_MAX_SEC, margin_threshold,
+    DURATION_WINDOW_MAX_SEC, WINDOW_DURATION_REFERENCE_PERCENTILE, margin_threshold, percentile,
 };
 
 const DOW_COLUMNS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -582,10 +582,10 @@ pub fn load_gtfs_index_for_trip(
     // estimate). Falls back to the distance heuristic only when no
     // duration estimate is available at all.
     let duration_based_window_sec: Option<f64> = if ENABLE_DURATION_BASED_WINDOW {
-        let best_score = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
-        if best_score < f64::MAX {
-            let margin = margin_threshold(best_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
-            Some((best_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC))
+        let ref_score = percentile(&resolved.seed_path_scores, WINDOW_DURATION_REFERENCE_PERCENTILE);
+        if ref_score < f64::MAX {
+            let margin = margin_threshold(ref_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
+            Some((ref_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC))
         } else {
             None
         }

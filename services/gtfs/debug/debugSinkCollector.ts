@@ -101,7 +101,14 @@ export function createDebugSinkCollector(): DebugCollectorHandle {
     const routeChecks: GtfsDebugInfo['routeChecks'] = [];
 
     const sink: DebugSink = {
-        onEvent(event: DebugEvent): void {
+        // ONE bridge crossing per search: Rust hands over every pre-search
+        // event in a single batch (see lib.rs's DebugSink::on_event_batch).
+        onEventBatch(events: DebugEvent[]): void {
+            for (const event of events) handleEvent(event);
+        },
+    };
+
+    function handleEvent(event: DebugEvent): void {
             switch (event.tag) {
                 case DebugEvent_Tags.SeedBfsLevel:
                     // level is a sequential index but events could in principle
@@ -146,8 +153,7 @@ export function createDebugSinkCollector(): DebugCollectorHandle {
                     });
                     break;
             }
-        },
-    };
+    }
 
     /** Rebuilds the flat single-polyline-per-candidate shape (`seedPaths`)
      *  from `seedPathHops`, for callers that only need "the whole

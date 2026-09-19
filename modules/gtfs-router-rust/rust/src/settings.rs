@@ -186,6 +186,9 @@ pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 /// can only help query latency relative to today's behavior, never
 /// regress a query the estimate doesn't cover.
 pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
+/// Percentile of the seed-path scores used as the window's reference duration
+/// (0.25 = the 25th-percentile / "top 25% fastest" path, not the single best).
+pub const WINDOW_DURATION_REFERENCE_PERCENTILE: f64 = 0.25;
 pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
 pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.5;
 /// Separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC — that one

@@ -5,11 +5,26 @@
 //! stop-to-stop paths with a pattern_pk per hop (`GtfsIndex::seed_path_edges`,
 //! aligned with `debug_seed_paths`). Rather than re-searching the whole
 //! network, this just walks each candidate in order and checks whether a
-//! real trip actually exists to ride it: same stop_times rows RAPTOR itself
-//! boards from, no exploration, no alternate boardings considered.
+//! real trip actually exists to ride it — same stop_times rows RAPTOR
+//! itself boards from, no exploration of alternate stop-to-stop routes.
 //!
-//! A candidate fails if any hop has no boardable trip, or the trip doesn't
-//! reach the next stop in sequence. Failing candidates are skipped, not
+//! One thing this DOES explore, deliberately: which PATTERN boards each
+//! hop. A candidate's `pattern_pk` is only a hint for which physical stop
+//! sequence the hop rides — not a hard constraint on which trip boards
+//! it. Multiple patterns (e.g. peak-express vs all-stops variants of the
+//! same line) can serve an identical stop sequence with very different
+//! frequencies; if verification only ever checked the one pattern the
+//! seed BFS happened to attach to that hop, a candidate could get stuck
+//! waiting hours for that pattern's next departure while a different
+//! pattern covering the exact same stops departed within minutes. So
+//! boarding search here tries every real departure at the stop
+//! (`stop_times_by_stop`, all patterns, sorted by departure_sec) earliest
+//! first, and takes the first one that actually rides through the rest of
+//! the hop's stops in order — genuinely the earliest ride available,
+//! not the earliest ride on whichever pattern was guessed upstream.
+//!
+//! A candidate fails if any hop has no boardable trip (on any pattern) that
+//! reaches the next stop in sequence. Failing candidates are skipped, not
 //! retried with a different trip choice — this is a verifier, not a search.
 
 use crate::geo::{haversine_meters, LatLon};
@@ -79,18 +94,18 @@ fn verify_one_path(
     edges: &[Option<i64>],
     depart_sec_of_day: i64,
     walking_speed_mps: f64,
-) -> Option<Journey> {
-    if path.is_empty() || edges.len() != path.len() - 1 { return None; }
+) -> Result<Journey, String> {
+    if path.is_empty() || edges.len() != path.len() - 1 { return Err("malformed_path".to_string()); }
 
-    let first_stop = stops.get(path[0])?;
+    let first_stop = stops.get(path[0]).ok_or_else(|| "missing_stop_row".to_string())?;
     let origin_dist = haversine_meters(origin, LatLon { lat: first_stop.stop_lat, lon: first_stop.stop_lon });
     let mut time = depart_sec_of_day + walk_time_sec(origin_dist, walking_speed_mps);
     let mut steps = vec![Step::OriginWalk { to: path[0], dist_m: origin_dist }];
 
-    for leg in &group_into_legs(path, edges) {
+    for (leg_idx, leg) in group_into_legs(path, edges).iter().enumerate() {
         match leg {
             LegSpec::Walk(from, to) => {
-                let (from_row, to_row) = (stops.get(*from)?, stops.get(*to)?);
+                let (Some(from_row), Some(to_row)) = (stops.get(*from), stops.get(*to)) else { return Err("missing_stop_row".to_string()) };
                 let dist = haversine_meters(
                     LatLon { lat: from_row.stop_lat, lon: from_row.stop_lon },
                     LatLon { lat: to_row.stop_lat, lon: to_row.stop_lon },
@@ -100,29 +115,56 @@ fn verify_one_path(
             }
             LegSpec::Transit { pattern_pk, stops: leg_stops } => {
                 let board = leg_stops[0];
-                let entries = index.stop_times_by_stop_and_pattern.get(&(board, *pattern_pk))?;
+                // Earliest genuinely-boardable trip AT THIS STOP that
+                // actually rides through the rest of leg_stops, in order —
+                // searched across every pattern serving this stop, not
+                // just `pattern_pk` (the seed-path candidate's pattern is
+                // only a hint for which physical stop sequence to ride;
+                // it's not a hard constraint on which trip boards it, and
+                // treating it as one meant a candidate could get stuck
+                // waiting hours for the NEXT departure on that one
+                // specific pattern variant while a different pattern
+                // covering the identical stop sequence departed sooner).
+                // `stop_times_by_stop` is every pattern's departures at
+                // this stop, sorted by departure_sec, so the first entry
+                // that validates all the way through is the genuine
+                // earliest ride — no need to consider anything later.
+                let Some(entries) = index.stop_times_by_stop.get(&board) else { return Err(format!("leg{leg_idx}_no_stop_times_at_board_stop")) };
                 let idx = entries.partition_point(|e| e.departure_sec < time);
-                let board_entry = entries[idx..].iter().find(|e| e.pickup_type == 0)?;
-                let trip_pk = board_entry.trip_pk;
+                let mut found: Option<(&std::rc::Rc<crate::loader::StopTimeEntry>, i64, &std::rc::Rc<crate::loader::StopTimeEntry>)> = None;
+                'candidates: for board_entry in entries[idx..].iter() {
+                    if board_entry.pickup_type != 0 { continue; }
+                    let trip_pk = board_entry.trip_pk;
 
-                // Ride through every intermediate stop on this same trip,
-                // requiring strictly increasing stop_sequence (moving
-                // forward, never doubling back onto an earlier point).
-                let mut last_seq = board_entry.stop_sequence;
-                let mut alight_entry = board_entry;
-                for &stop_pk in &leg_stops[1..] {
-                    let entry = index.stop_times_by_stop_and_trip.get(&stop_pk)?.get(&trip_pk)?;
-                    if entry.stop_sequence <= last_seq { return None; }
-                    last_seq = entry.stop_sequence;
-                    alight_entry = entry;
+                    // Ride through every intermediate stop on this same
+                    // trip, requiring strictly increasing stop_sequence
+                    // (moving forward, never doubling back onto an
+                    // earlier point). A trip that doesn't serve one of
+                    // leg_stops, or serves it out of order (a different
+                    // branch/pattern diverging before the alight point),
+                    // isn't a match — try the next-earliest departure.
+                    let mut last_seq = board_entry.stop_sequence;
+                    let mut alight_entry = board_entry;
+                    for &stop_pk in &leg_stops[1..] {
+                        let Some(entry) = index.stop_times_by_stop_and_trip.get(&stop_pk).and_then(|m| m.get(&trip_pk)) else { continue 'candidates };
+                        if entry.stop_sequence <= last_seq { continue 'candidates; }
+                        last_seq = entry.stop_sequence;
+                        alight_entry = entry;
+                    }
+                    // Only the real alight point needs to allow drop-off —
+                    // stops ridden through in the middle don't.
+                    if alight_entry.drop_off_type != 0 { continue; }
+
+                    found = Some((board_entry, trip_pk, alight_entry));
+                    break;
                 }
-                // Only the real alight point needs to allow drop-off —
-                // stops ridden through in the middle don't.
-                if alight_entry.drop_off_type != 0 { return None; }
+                let Some((board_entry, trip_pk, alight_entry)) = found else { return Err(format!("leg{leg_idx}_no_trip_rides_all_stops")) };
+                let boarded_pattern_pk = board_entry.pattern_pk;
+                let _ = pattern_pk; // candidate's pattern was only a hint — the actually-boarded trip's own pattern (above) is what's real
 
                 time = alight_entry.arrival_sec;
                 steps.push(Step::Transit {
-                    trip_pk, pattern_pk: *pattern_pk, board, alight: *leg_stops.last().unwrap(),
+                    trip_pk, pattern_pk: boarded_pattern_pk, board, alight: *leg_stops.last().unwrap(),
                     board_seq: board_entry.stop_sequence, alight_seq: alight_entry.stop_sequence,
                     depart_sec: board_entry.departure_sec, arrive_sec: alight_entry.arrival_sec,
                 });
@@ -130,7 +172,7 @@ fn verify_one_path(
         }
     }
 
-    Some(build_journey(index, stops, origin, destination, &steps, depart_sec_of_day, walking_speed_mps))
+    Ok(build_journey(index, stops, origin, destination, &steps, depart_sec_of_day, walking_speed_mps))
 }
 
 /// Turns a verified `Step` sequence into a `Journey` — same segment/leg
@@ -297,13 +339,23 @@ pub fn verify_seed_paths(
     depart_sec_of_day: i64,
     walking_speed_mps: f64,
 ) -> Result<Vec<Journey>, String> {
-    let mut journeys: Vec<Journey> = index.debug_seed_paths.iter()
-        .zip(index.seed_path_edges.iter())
-        .filter_map(|(path, edges)| verify_one_path(index, stops, origin, destination, path, edges, depart_sec_of_day, walking_speed_mps))
-        .collect();
+    let mut journeys: Vec<Journey> = Vec::new();
+    let mut fail_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (path, edges) in index.debug_seed_paths.iter().zip(index.seed_path_edges.iter()) {
+        match verify_one_path(index, stops, origin, destination, path, edges, depart_sec_of_day, walking_speed_mps) {
+            Ok(j) => journeys.push(j),
+            Err(reason) => *fail_counts.entry(reason).or_insert(0) += 1,
+        }
+    }
 
     if journeys.is_empty() {
-        return Err("No genuinely boardable route found among the candidate seed paths.".to_string());
+        let reasons = if fail_counts.is_empty() { "none".to_string() } else {
+            fail_counts.iter().map(|(k, v)| format!("{k}x{v}")).collect::<Vec<_>>().join(",")
+        };
+        return Err(format!(
+            "No genuinely boardable route found among the candidate seed paths (seed_paths={}, stop_times_stops={}, failures=[{}]).",
+            index.debug_seed_paths.len(), index.stop_times_by_stop.len(), reasons
+        ));
     }
 
     journeys.sort_by_key(|j| j.arrival_time_sec);

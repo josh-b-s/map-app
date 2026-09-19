@@ -3,7 +3,8 @@ import { Polygon, Polyline, Marker, LatLng as MapLatLng } from 'react-native-map
 import { View, Text } from 'react-native';
 import { useSelector } from 'react-redux';
 import { RootState } from '@/store/store';
-import { flattenRaptorSteps, flattenBfsCandidates, flattenHopColoredCandidates, hopColor, depthColor } from '@/services/gtfs/debug/debugBfsPoints';
+import { flattenRaptorSteps, flattenHopColoredCandidates, hopColor, depthColor } from '@/services/gtfs/debug/debugBfsPoints';
+import { useDebugData, useBfsCandidateSteps } from '@/services/gtfs/debug/debugDataStore';
 
 const BFS_HULL_COLOR = '#3b82f6';
 // NOTE: was a single fixed amber for every bfs candidate regardless of
@@ -141,12 +142,11 @@ function RouteNameLabel({ coords, name, color }: { coords: Pt[]; name?: string; 
  * is off or there's no data yet.
  */
 export default function DebugMapOverlay() {
-    const { enabled, data, phase, stepIndex, bfsCandidateMode, hopColorMode } = useSelector((s: RootState) => s.debug);
-
-    const bfsCandidateSteps = useMemo(() => {
-        if (!data) return [];
-        return flattenBfsCandidates(data.seedPaths, data.bfsLevels, data.seedPathDepths);
-    }, [data]);
+    const { enabled, phase, stepIndex, bfsCandidateMode, hopColorMode } = useSelector((s: RootState) => s.debug);
+    // Data lives outside Redux (see debugDataStore.ts); candidate steps are
+    // computed once per search there, not on every render.
+    const data = useDebugData();
+    const bfsCandidateSteps = useBfsCandidateSteps();
 
     const bfsView = useMemo(() => {
         if (!data || phase !== 'bfs') return null;

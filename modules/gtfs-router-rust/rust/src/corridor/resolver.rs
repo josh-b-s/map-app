@@ -11,7 +11,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::{bbox_scaled, haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, nearest_stop_pks_in_bbox, PatternCumulativeCache, PatternHeadwayCache, PatternStopRow, PatternsCache, StopRow, StopsCache, COORD_SCALE};
+use crate::repo::{get_pattern_stops_for_patterns, get_patterns_by_stop, nearest_stop_pks_in_bbox, PatternCumulativeCache, PatternHeadwayCache, PatternStopRow, PatternsCache, StopRow, StopsCache, COORD_SCALE};
 use crate::corridor::tagging::{compute_seed_path_corridor, CorridorBoundary, CorridorCandidate};
 use crate::corridor::seed_bfs::{run_seed_bfs, SearchDir, SeedBfsRun};
 use crate::settings::{
@@ -139,10 +139,15 @@ impl SeedBfsCache {
 }
 
 /// Selects BFS seed stops within `max_walk_distance_m` of `center`, skipping a stop
-/// if every route serving it is already covered by a closer seed already
-/// picked, so the seed budget goes toward genuinely different lines. Falls
-/// back to the nearest MIN_SEED_STOPS (dedup still applied) if the radius
-/// alone doesn't reach that floor.
+/// if every PATTERN (not just route) serving it is already covered by a
+/// closer seed already picked, so the seed budget goes toward genuinely
+/// different rides rather than being spent on several stops of the same
+/// physical pattern. Pattern-level rather than route-level deliberately —
+/// see `get_pattern_pks_for_stops`'s doc for why route-level dedup can
+/// wrongly discard a farther stop that's the only seed for a genuinely
+/// different pattern sharing that route number. Falls back to the nearest
+/// MIN_SEED_STOPS (dedup still applied) if the radius alone doesn't reach
+/// that floor.
 ///
 /// Candidate stops come from a stops_rtree bbox query (see repo.rs /
 /// geo::bbox_scaled), progressively widened, instead of sorting every stop
@@ -157,7 +162,6 @@ fn nearest_for_seed(
     conn: &Connection,
     stops: &StopsCache,
     center: LatLon,
-    patterns: &PatternsCache,
     max_walk_distance_m: f64,
 ) -> rusqlite::Result<Vec<i64>> {
     let mut radius_m = max_walk_distance_m;
@@ -191,19 +195,19 @@ fn nearest_for_seed(
     let raw_candidates: Vec<(&StopRow, f64)> = within_radius.into_iter().take(MAX_SEED_STOPS * 3).collect();
     let candidate_pks: Vec<i64> = raw_candidates.iter().map(|(s, _)| s.stop_pk).collect();
 
-    let routes_by_stop = get_route_ids_for_stops(conn, &candidate_pks, patterns)?;
+    let routes_by_stop = get_patterns_by_stop(conn, &candidate_pks)?;
 
-    let mut covered_routes: HashSet<u32> = HashSet::new();
+    let mut covered_patterns: HashSet<i64> = HashSet::new();
     let mut selected: Vec<&StopRow> = Vec::new();
     for (s, _) in &raw_candidates {
         if selected.len() >= MAX_SEED_STOPS { break; }
         match routes_by_stop.get(&s.stop_pk) {
             None => { selected.push(s); continue; }
-            Some(routes) if routes.is_empty() => { selected.push(s); continue; }
-            Some(routes) => {
-                let adds_new = routes.iter().any(|r| !covered_routes.contains(r));
+            Some(pats) if pats.is_empty() => { selected.push(s); continue; }
+            Some(pats) => {
+                let adds_new = pats.iter().any(|p| !covered_patterns.contains(p));
                 if !adds_new { continue; }
-                for &r in routes { covered_routes.insert(r); }
+                for &p in pats { covered_patterns.insert(p); }
                 selected.push(s);
             }
         }
@@ -295,7 +299,13 @@ fn trim_pattern_stops_by_sequence(
 pub fn resolve_corridor(
     conn: &Connection,
     stops: &StopsCache,
-    patterns: &PatternsCache,
+    // Formerly threaded through to nearest_for_seed for route-level seed
+    // dedup — now unused here, since get_pattern_pks_for_stops (used by
+    // nearest_for_seed) queries pattern_pk directly and no longer needs
+    // PatternsCache's route_key lookup. Kept in the signature rather than
+    // removed so this stays a purely additive change for loader.rs's
+    // existing call site.
+    _patterns: &PatternsCache,
     graph: &CoarseGraph,
     cache: &mut CorridorCache,
     bfs_cache: &mut SeedBfsCache,
@@ -336,8 +346,8 @@ pub fn resolve_corridor(
     // Sequential, not concurrent — mirrors the TS version's own note about
     // a single shared SQLite connection; here it's simply because rusqlite
     // Connection isn't Sync-shareable without its own locking anyway.
-    let origin_seed_pks = nearest_for_seed(conn, stops, origin, patterns, max_walk_distance_m)?;
-    let dest_seed_pks = nearest_for_seed(conn, stops, destination, patterns, max_walk_distance_m)?;
+    let origin_seed_pks = nearest_for_seed(conn, stops, origin, max_walk_distance_m)?;
+    let dest_seed_pks = nearest_for_seed(conn, stops, destination, max_walk_distance_m)?;
     sub_timings.push(("nearest_for_seed_x2".to_string(), t.elapsed().as_millis() as i64));
 
     // BFS itself — cached WITHOUT batch_size (see SeedBfsCache doc), so a

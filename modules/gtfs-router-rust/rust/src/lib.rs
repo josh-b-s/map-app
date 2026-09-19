@@ -175,7 +175,11 @@ pub enum DebugEvent {
 
 #[uniffi::export(with_foreign)]
 pub trait DebugSink: Send + Sync {
-    fn on_event(&self, event: DebugEvent);
+    /// Receives EVERY pre-search debug event in a single call, in emission
+    /// order (BFS levels, then seed paths, then corridor boundaries).
+    /// Replaces the old per-event `on_event`, which crossed the JS bridge
+    /// once per event (1600+ synchronous crossings per search).
+    fn on_event_batch(&self, events: Vec<DebugEvent>);
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -572,10 +576,23 @@ impl GtfsRouterEngine {
                     let s = index.seed_path_scores.get(i).copied().unwrap_or(f64::MAX);
                     if s <= threshold || s >= f64::MAX { kept_patterns.extend(pats.iter().copied()); }
                 }
+                // One aggregate entry, not one per journey — was pushing a
+                // separate identically-labeled TimingEntry per journey
+                // (17 journeys => 17 duplicate "...missing_patterns=Nms"
+                // entries in the timings log), which is noise that scales
+                // with candidate count rather than a real diagnostic
+                // signal. `ms` here is a pattern-count, not a duration —
+                // same field-reuse the per-journey version already did,
+                // just summed instead of repeated.
+                let mut total_missing = 0i64;
+                let mut journeys_with_missing = 0i64;
                 for j in &journeys {
-                    let missing = j.used_pattern_pks.iter().filter(|pk| !kept_patterns.contains(pk)).count();
-                    timings.push(TimingEntry { label: "count.seed_path_completeness_missing_patterns".to_string(), ms: missing as i64 });
+                    let missing = j.used_pattern_pks.iter().filter(|pk| !kept_patterns.contains(pk)).count() as i64;
+                    total_missing += missing;
+                    if missing > 0 { journeys_with_missing += 1; }
                 }
+                timings.push(TimingEntry { label: "count.seed_path_completeness_missing_patterns".to_string(), ms: total_missing });
+                timings.push(TimingEntry { label: "count.seed_path_completeness_affected_journeys".to_string(), ms: journeys_with_missing });
             }
         }
 
@@ -714,6 +731,7 @@ fn emit_pre_search_debug(
         if info.route_color.is_empty() { None } else { Some(format!("#{}", info.route_color.trim_start_matches('#').to_uppercase())) }
     };
     let Some(sink) = debug else { return };
+    let mut events: Vec<DebugEvent> = Vec::new();
     let to_ll = |pk: i64| stops.get(pk).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon });
 
     // BUGFIX: this used to track fwd_level/bwd_level SEPARATELY (each
@@ -731,7 +749,7 @@ fn emit_pre_search_debug(
     for (i, (dir, stop_pks)) in index.debug_bfs_levels.iter().enumerate() {
         let level = i as u32;
         let pts: Vec<LatLng> = stop_pks.iter().filter_map(|&pk| to_ll(pk)).collect();
-        sink.on_event(DebugEvent::SeedBfsLevel { dir: (*dir).into(), level, stops: pts });
+        events.push(DebugEvent::SeedBfsLevel { dir: (*dir).into(), level, stops: pts });
     }
 
     // ── Resolve real GTFS shapes for the candidate seed paths ────────────
@@ -789,14 +807,16 @@ fn emit_pre_search_debug(
             };
             hops.push(SeedPathHop { hop_index: hop_index as u32, coords, is_walk, route_color });
         }
-        sink.on_event(DebugEvent::SeedPath { path_index: path_index as u32, depth, hops });
+        events.push(DebugEvent::SeedPath { path_index: path_index as u32, depth, hops });
     }
 
     for boundary in &index.debug_corridor_boundary {
         let left: Vec<LatLng> = boundary.left.iter().map(|p| LatLng { latitude: p.lat, longitude: p.lon }).collect();
         let right: Vec<LatLng> = boundary.right.iter().map(|p| LatLng { latitude: p.lat, longitude: p.lon }).collect();
-        sink.on_event(DebugEvent::CorridorBoundary { left, right });
+        events.push(DebugEvent::CorridorBoundary { left, right });
     }
+
+    if !events.is_empty() { sink.on_event_batch(events); }
 }
 
 fn journey_to_ffi(j: raptor::Journey) -> Journey {

@@ -3,6 +3,7 @@ import type { LatLng } from '@/services/places/places';
 import { computeGtfsRoute, GtfsRouteResult, GtfsJourney } from '@/services/gtfs/router/raptorRouter';
 import { computeGtfsRouteNative } from '@/services/gtfs/router/gtfsRouterNative';
 import { setDebugData } from './debug.slice';
+import { publishDebugData } from '@/services/gtfs/debug/debugDataStore';
 
 // Flip to compare the Rust engine against the existing TS/op-sqlite path —
 // both are called with the exact same args and return the exact same
@@ -36,8 +37,12 @@ export const computeRoute = createAsyncThunk<
         // extraReducers, since debug data belongs in debug.slice, not route
         // state — this keeps "what journey is displayed" and "what did the
         // search look like internally" as separate concerns.
-        dispatch(setDebugData(debugMode ? (result.debug ?? null) : null));
-        return result;
+        // The big debug payload goes to the module-level store; only its
+        // small meta enters Redux. Also DON'T return `result` as-is: a
+        // thunk's return value becomes the `fulfilled` action payload, which
+        // RTK's dev middleware deep-walks — so strip `debug` from it.
+        dispatch(setDebugData(publishDebugData(debugMode ? result.debug : null)));
+        return { journeys: result.journeys };
     } catch (err) {
         console.error('[route.slice] computeRoute failed:', err);
         if (err instanceof Error) console.error(err.stack);

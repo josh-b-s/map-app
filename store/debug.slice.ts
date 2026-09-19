@@ -1,6 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
-import {GtfsDebugInfo} from "@/services/gtfs/router/raptorRouter";
-import { raptorStepCount, flattenBfsCandidates } from '@/services/gtfs/debug/debugBfsPoints';
+import type { DebugMeta } from '@/services/gtfs/debug/debugDataStore';
 
 
 export type DebugPhase = 'bfs' | 'raptor';
@@ -49,7 +48,15 @@ type State = {
      *  isn't just a rendering toggle, it avoids the (small) collection cost
      *  on every normal search. */
     enabled: boolean;
-    data: GtfsDebugInfo | null;
+    /** The debug data itself lives in services/gtfs/debug/debugDataStore.ts,
+     *  NOT in Redux (see that file's header). Redux only holds a version
+     *  (bumped per search, so subscribers re-read) and the step counts
+     *  phaseLength needs. */
+    hasData: boolean;
+    dataVersion: number;
+    bfsRoundCount: number;
+    bfsCandidateCount: number;
+    raptorStepCount: number;
     /** Which stage of the search is currently being shown. */
     phase: DebugPhase;
     /** Meaning depends on phase (and, for 'bfs', on bfsCandidateMode):
@@ -83,7 +90,11 @@ type State = {
 
 const initialState: State = {
     enabled: false,
-    data: null,
+    hasData: false,
+    dataVersion: 0,
+    bfsRoundCount: 0,
+    bfsCandidateCount: 0,
+    raptorStepCount: 0,
     phase: 'bfs',
     stepIndex: 0,
     playing: false,
@@ -96,14 +107,14 @@ const initialState: State = {
  *  advanceStep/retreatStep so phase-length logic isn't duplicated between
  *  the two. Deliberately ignores hopColorMode — it changes how a step's
  *  candidates are colored, not how many steps there are. */
-function phaseLength(phase: DebugPhase, data: GtfsDebugInfo, bfsCandidateMode: BfsCandidateMode): number {
+function phaseLength(phase: DebugPhase, s: State, bfsCandidateMode: BfsCandidateMode): number {
     switch (phase) {
         case 'bfs':
             return bfsCandidateMode === 'single'
-                ? Math.max(1, flattenBfsCandidates(data.seedPaths, data.bfsLevels).length)
-                : Math.max(1, data.bfsLevels.length);
+                ? Math.max(1, s.bfsCandidateCount)
+                : Math.max(1, s.bfsRoundCount);
         case 'raptor':
-            return Math.max(1, raptorStepCount(data));
+            return Math.max(1, s.raptorStepCount);
     }
 }
 
@@ -114,8 +125,13 @@ const slice = createSlice({
         toggleDebugEnabled(state) {
             state.enabled = !state.enabled;
         },
-        setDebugData(state, action: PayloadAction<GtfsDebugInfo | null>) {
-            state.data = action.payload;
+        setDebugData(state, action: PayloadAction<DebugMeta | null>) {
+            const m = action.payload;
+            state.hasData = !!m;
+            state.dataVersion = m?.version ?? state.dataVersion + 1;
+            state.bfsRoundCount = m?.bfsRoundCount ?? 0;
+            state.bfsCandidateCount = m?.bfsCandidateCount ?? 0;
+            state.raptorStepCount = m?.raptorStepCount ?? 0;
             state.phase = 'bfs';
             state.stepIndex = 0;
             state.playing = false;
@@ -128,8 +144,8 @@ const slice = createSlice({
          *  end (last RAPTOR route-check) rather than looping — a search has a
          *  natural beginning and end, looping would be confusing to watch. */
         advanceStep(state) {
-            if (!state.data) return;
-            const len = phaseLength(state.phase, state.data, state.bfsCandidateMode);
+            if (!state.hasData) return;
+            const len = phaseLength(state.phase, state, state.bfsCandidateMode);
             if (state.stepIndex < len - 1) {
                 state.stepIndex += 1;
                 return;
@@ -144,18 +160,18 @@ const slice = createSlice({
         },
         /** Mirror of advanceStep, for manual step-back. */
         retreatStep(state) {
-            if (!state.data) return;
+            if (!state.hasData) return;
             if (state.stepIndex > 0) { state.stepIndex -= 1; return; }
             const prevPhaseIdx = PHASE_ORDER.indexOf(state.phase) - 1;
             if (prevPhaseIdx >= 0) {
                 state.phase = PHASE_ORDER[prevPhaseIdx];
-                state.stepIndex = phaseLength(state.phase, state.data, state.bfsCandidateMode) - 1;
+                state.stepIndex = phaseLength(state.phase, state, state.bfsCandidateMode) - 1;
             }
         },
         /** Jump straight to a phase (e.g. tapping a phase label), landing on
          *  that phase's first step. */
         setPhase(state, action: PayloadAction<DebugPhase>) {
-            if (!state.data) return;
+            if (!state.hasData) return;
             state.phase = action.payload;
             state.stepIndex = 0;
             state.playing = false;
