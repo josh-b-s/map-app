@@ -87,7 +87,7 @@ export async function warmUpGtfsEngine(): Promise<void> {
         // it's cheap to skip if unused and keeps this file oblivious to
         // which path route.slice.ts is currently set to.
         try {
-            getNativeEngine(DB_PATH); // warms up + records warmedUpPath so the first real search's own getEngine(DB_PATH) call is a no-op
+            await getNativeEngine(DB_PATH); // warms up + records warmedUpPath so the first real search's own getEngine(DB_PATH) call is a no-op
             console.log(`[gtfsWarmup] native engine warmed: ${Date.now() - t0}ms total`);
         } catch (nativeErr) {
             // Non-fatal on its own — if the native path isn't in use this

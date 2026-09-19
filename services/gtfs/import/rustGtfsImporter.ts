@@ -136,7 +136,7 @@ export async function runRustImport(
         // resets warmedUpPath to null first, so the check below actually
         // fires and reloads from the freshly-imported data.
         invalidateNativeRouter();
-        getNativeEngine(dbPath);
+        await getNativeEngine(dbPath);
     } catch (err) {
         console.error(`[rustGtfsImporter] import failed after ${elapsed()}:`, err);
         throw err;

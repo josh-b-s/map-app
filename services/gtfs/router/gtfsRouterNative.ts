@@ -28,13 +28,25 @@ const { GtfsRouterEngine } = gtfsRouterRust.gtfs_router;
 let engine: InstanceType<typeof GtfsRouterEngine> | null = null;
 let warmedUpPath: string | null = null;
 
-function getEngine(dbPath: string) {
+// warmUp/computeRoute are ASYNC now: the Rust side runs them on a worker
+// thread, so the JS thread (and UI) stays responsive during the ~12-14s
+// cold warm-up and every search. `warmUpPromise` coalesces concurrent
+// callers (app-launch warmup + an early first search) onto one warm-up.
+let warmUpPromise: Promise<void> | null = null;
+
+async function getEngine(dbPath: string): Promise<InstanceType<typeof GtfsRouterEngine>> {
     if (!engine) engine = new GtfsRouterEngine();
+    const eng = engine;
     if (warmedUpPath !== dbPath) {
-        engine.warmUp(dbPath); // rebuilds/loads coarse graph + reusable state, ~12-14s cold
-        warmedUpPath = dbPath;
+        if (!warmUpPromise) {
+            // rebuilds/loads coarse graph + reusable state, ~12-14s cold
+            warmUpPromise = eng.warmUp(dbPath)
+                .then(() => { warmedUpPath = dbPath; })
+                .finally(() => { warmUpPromise = null; });
+        }
+        await warmUpPromise;
     }
-    return engine;
+    return eng;
 }
 
 /**
@@ -43,7 +55,7 @@ function getEngine(dbPath: string) {
  * real search's own getEngine(dbPath) call sees warmedUpPath already set
  * and skips calling warm_up() a second time.
  */
-export function getNativeEngine(dbPath?: string) {
+export async function getNativeEngine(dbPath?: string) {
     if (dbPath) return getEngine(dbPath);
     if (!engine) engine = new GtfsRouterEngine();
     return engine;
@@ -53,6 +65,7 @@ export function getNativeEngine(dbPath?: string) {
 export function invalidateNativeRouter() {
     engine?.invalidate();
     warmedUpPath = null;
+    warmUpPromise = null;
 }
 
 function secToTimeString(sec?: number): string | undefined {
@@ -147,7 +160,7 @@ export async function computeGtfsRouteNative(
     maxWalkDistanceM: number = 1.4 * 20 * 60,
     debugMode: boolean = false,
 ): Promise<GtfsRouteResult> {
-    const eng = getEngine(DB_PATH);
+    const eng = await getEngine(DB_PATH);
 
     const today = departureTime;
     const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000);
@@ -157,7 +170,7 @@ export async function computeGtfsRouteNative(
     const collector = debugMode ? createDebugSinkCollector() : null;
 
     try {
-        const result: RouteResult = eng.computeRoute(
+        const result: RouteResult = await eng.computeRoute(
             origin,
             destination,
             departSecOfDay,

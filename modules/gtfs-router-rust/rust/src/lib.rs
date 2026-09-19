@@ -26,12 +26,72 @@ mod freq_raptor;
 mod fxhash;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 use rusqlite::Connection;
 use crate::geo::haversine_meters;
 
 uniffi::setup_scaffolding!();
+
+// ── Off-JS-thread execution ───────────────────────────────────────────────
+// `warm_up` (~10-14s cold) and `compute_route` (0.2-3.7s) are CPU/IO bound
+// and used to run synchronously on the calling thread — i.e. the React
+// Native JS thread — freezing the whole UI for their duration. Both are now
+// exported as `async` and run their blocking body on a dedicated OS thread;
+// the returned future just parks a Waker until that thread finishes, so the
+// JS thread stays free (uniffi/ubrn poll it via the waker; no tokio needed).
+struct BlockingShared<T> {
+    result: Option<T>,
+    waker: Option<Waker>,
+}
+
+struct BlockingTask<T> {
+    shared: Arc<Mutex<BlockingShared<T>>>,
+}
+
+impl<T> Future for BlockingTask<T> {
+    type Output = T;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let mut g = self.shared.lock().unwrap();
+        match g.result.take() {
+            Some(r) => Poll::Ready(r),
+            None => {
+                g.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+fn run_blocking<T, F>(f: F) -> BlockingTask<Result<T, RouterError>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RouterError> + Send + 'static,
+{
+    let shared = Arc::new(Mutex::new(BlockingShared { result: None, waker: None }));
+    let thread_shared = Arc::clone(&shared);
+    let spawned = std::thread::Builder::new()
+        .name("gtfs-router-worker".to_string())
+        .stack_size(16 * 1024 * 1024) // Rust's 2MB default is tight for the recursive scoring/backtracking
+        .spawn(move || {
+            // A panic must not leave the JS promise pending forever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                .unwrap_or_else(|_| Err(RouterError::Db("native router panicked".to_string())));
+            let waker = {
+                let mut g = thread_shared.lock().unwrap();
+                g.result = Some(result);
+                g.waker.take()
+            };
+            if let Some(w) = waker { w.wake(); }
+        });
+    if let Err(e) = spawned {
+        shared.lock().unwrap().result = Some(Err(RouterError::Db(format!("failed to spawn worker thread: {e}"))));
+    }
+    BlockingTask { shared }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct LatLng {
@@ -279,7 +339,13 @@ impl GtfsRouterEngine {
     /// DB file is surprisingly slow, check `warm_up_timings()`'s
     /// `load_stops`/`graph_build_from_scratch` entries — those are the
     /// remaining legitimate one-time-per-DB costs.
-    pub fn warm_up(&self, db_path: String) -> Result<(), RouterError> {
+    pub async fn warm_up(self: Arc<Self>, db_path: String) -> Result<(), RouterError> {
+        run_blocking(move || self.warm_up_blocking(db_path)).await
+    }
+}
+
+impl GtfsRouterEngine {
+    fn warm_up_blocking(&self, db_path: String) -> Result<(), RouterError> {
         let t_total = Instant::now();
         let mut timings: Vec<(String, i64)> = Vec::new();
         macro_rules! mark {
@@ -413,6 +479,10 @@ impl GtfsRouterEngine {
         Ok(())
     }
 
+}
+
+#[uniffi::export]
+impl GtfsRouterEngine {
     /// Drops all in-memory caches (stops/routes/patterns/graph/corridor) and
     /// the open connection. Call after a GTFS feed re-import, then call
     /// `warm_up` again — the persisted coarse graph will also be rebuilt,
@@ -425,8 +495,32 @@ impl GtfsRouterEngine {
         *self.active_services_cache.lock().unwrap() = None;
     }
 
+    /// Runs the whole search on a worker thread (see `run_blocking`) so the
+    /// JS thread is never blocked; resolves when the search completes.
     #[allow(clippy::too_many_arguments)]
-    pub fn compute_route(
+    pub async fn compute_route(
+        self: Arc<Self>,
+        origin: LatLng,
+        destination: LatLng,
+        depart_sec_of_day: i32,
+        today_date: String,
+        today_dow: u8,
+        tomorrow_date: String,
+        tomorrow_dow: u8,
+        walking_speed_mps: f64,
+        max_walk_distance_m: f64,
+        debug: Option<Arc<dyn DebugSink>>,
+    ) -> Result<RouteResult, RouterError> {
+        run_blocking(move || self.compute_route_blocking(
+            origin, destination, depart_sec_of_day, today_date, today_dow,
+            tomorrow_date, tomorrow_dow, walking_speed_mps, max_walk_distance_m, debug,
+        )).await
+    }
+}
+
+impl GtfsRouterEngine {
+    #[allow(clippy::too_many_arguments)]
+    fn compute_route_blocking(
         &self,
         origin: LatLng,
         destination: LatLng,
