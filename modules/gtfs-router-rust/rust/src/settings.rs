@@ -353,8 +353,19 @@ pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 /// even though in practice loader.rs currently switches on this same
 /// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
-pub const SEED_PATH_MARGIN_FLOOR_SEC: f64 = 5.0 * 60.0;
-pub const SEED_PATH_MARGIN_RELATIVE_PCT: f64 = 0.25;
+
+/// Max distinct-stop candidate paths kept per ORDERED pattern sequence,
+/// after the top-25% score filter (best-scoring kept). Bounds the
+/// walk-closure platform fanout (several boardable stops of one line at the
+/// same level) while still keeping a few alternative boarding/transfer
+/// stops, which the old one-path-per-sequence dedup threw away. 0 = no cap.
+pub const MAX_PATHS_PER_PATTERN_SEQUENCE: usize = 3;
+
+/// Assembly-time guard for the same fanout: once this many distinct-stop
+/// paths exist for one pattern sequence, further ones are skipped BEFORE
+/// allocation/scoring. Must be >= MAX_PATHS_PER_PATTERN_SEQUENCE; larger
+/// gives the scoring-based cap a better pool to pick from. 0 = no guard.
+pub const MAX_ASSEMBLED_PER_PATTERN_SEQUENCE: usize = 16;
 /// The margin is measured from this percentile of scored candidates, not
 /// the single fastest one. The fastest candidate's score is a sample of
 /// one, built from averaged headway/cumulative-time estimates rather than

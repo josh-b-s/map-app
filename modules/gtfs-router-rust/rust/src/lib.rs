@@ -661,10 +661,9 @@ impl GtfsRouterEngine {
         // have missed the true best journey outright (wrong pattern
         // excluded), not just returned a slower one.
         {
-            let best_score = index.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
-            if best_score < f64::MAX {
-                let margin = settings::margin_threshold(best_score, settings::SEED_PATH_MARGIN_FLOOR_SEC, settings::SEED_PATH_MARGIN_RELATIVE_PCT);
-                let threshold = best_score + margin;
+            // Same cutoff seed_bfs.rs's path filter uses: the fastest 25% of scored paths, no margin.
+            let threshold = settings::percentile(&index.seed_path_scores, settings::SEED_PATH_MARGIN_REFERENCE_PERCENTILE);
+            if threshold < f64::MAX {
                 let mut kept_patterns: std::collections::HashSet<i64> = std::collections::HashSet::new();
                 for (i, pats) in index.seed_path_pattern_pks.iter().enumerate() {
                     let s = index.seed_path_scores.get(i).copied().unwrap_or(f64::MAX);

@@ -48,16 +48,17 @@
 //! std HashMap since that's a bigger, shared, persisted structure — not
 //! touched by this change.
 
-use std::collections::HashSet;
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
-    MAX_SEED_PATHS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT, SEED_PATH_MARGIN_FLOOR_SEC,
-    SEED_PATH_MARGIN_RELATIVE_PCT, SEED_PATH_MARGIN_REFERENCE_PERCENTILE, percentile,
+    MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
+    SEED_PATH_MARGIN_REFERENCE_PERCENTILE, percentile,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
-use crate::fxhash::{FxHashMap, FxHashSet};
+use crate::fxhash::{FxHashMap, FxHashSet, FxHasher};
+use std::hash::Hasher;
+use std::time::Instant;
 use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, StopsCache};
 use crate::geo::{haversine_meters, LatLon};
 
@@ -104,6 +105,9 @@ pub struct SeedPathResult {
     /// meeting node in the batch, so this number isn't derivable from
     /// settings alone and needs measuring.
     pub path_count_before_margin: usize,
+    /// Per-stage diagnostics from path assembly (label, value) — counts are
+    /// labeled `count.*`, durations `ms.*`. Forwarded into the stage timings.
+    pub stats: Vec<(String, i64)>,
     /// Every stop_pk that lies on SOME real origin-to-destination path
     /// within budget — i.e. every ancestor (in either tree) of a meeting
     /// node kept within `SAFETY_MARGIN_LEVELS` AND within whatever batch
@@ -336,6 +340,23 @@ fn transit_hop_backward(
 /// — the signature is what path assembly dedupes on below, instead of the
 /// raw stops.
 type HalfPath = (Vec<i64>, Vec<i64>, Vec<Option<i64>>);
+
+/// Per-hop shape codes, exactly what verifier.rs's `group_into_legs`
+/// distinguishes: 0 = walk, 1 = continues the SAME ride as the previous
+/// hop, 2 = starts a new ride. Two paths with equal stops and equal shape
+/// verify identically regardless of which pattern IDs the hops were tagged
+/// with.
+fn shape_codes<I: Iterator<Item = Option<i64>>>(edges: I) -> impl Iterator<Item = u8> {
+    let mut prev: Option<i64> = None;
+    edges.map(move |e| {
+        let c = match e {
+            None => 0,
+            Some(p) => if prev == Some(p) { 1 } else { 2 },
+        };
+        prev = e;
+        c
+    })
+}
 
 fn backtrack_to_origin(
     node: i64,
@@ -991,6 +1012,7 @@ pub fn materialize_seed_paths(
             path_scores: Vec::new(),
             path_edges: Vec::new(),
             path_count_before_margin: 0,
+            stats: Vec::new(),
             core_stop_pks: FxHashSet::default(),
             core_stop_pks_by_depth: Vec::new(),
             path_depths: Vec::new(),
@@ -1071,28 +1093,17 @@ pub fn materialize_seed_paths(
     }
     let batch = batch.as_slice();
 
-    // A single edge straddling the frontier gets discovered as a "meeting
-    // point" from both of its endpoints (forward lands on the far end the
-    // same step backward lands on the near end) — dedupe by content, not
-    // just by meeting node, or the same path comes out twice.
-    //
-    // Dedup key is the PATTERN signature (which real lines were ridden, in
-    // order) when the path has one, falling back to the raw stop sequence
-    // only for the rare all-walk path (no transit boardings at all, so no
-    // pattern to key on). Keying on stops instead of patterns was the
-    // original design, and it's what let the walk-closure's platform
-    // fanout (e.g. several stops of the same line, all reachable at the
-    // same level) multiply out into many enumerated "different" paths
-    // that were actually the same route via a different platform — this
-    // collapses those back into one, while genuinely different lines or
-    // junctions still produce distinct signatures and stay distinct.
-    // (std HashSet here, not FxHash — small cardinality capped at
-    // MAX_SEED_PATHS, not worth a specialized hasher.)
-    #[derive(PartialEq, Eq, Hash)]
-    enum SeedPathKey {
-        ByPattern(Vec<i64>),
-        ByStops(Vec<i64>),
-    }
+    // PATH DEDUP (see the assembly loop below). A single edge straddling
+    // the frontier is discovered as a "meeting point" from both endpoints,
+    // and one physical route is enumerated once per pattern VARIANT (peak /
+    // all-stops variants sharing a stop sequence), once per meeting node
+    // that lies on it, and once per walk-closure platform. Paths are
+    // therefore keyed by what the verifier actually distinguishes: the
+    // exact stop list plus each hop's SHAPE (walk / continue same ride /
+    // new ride). Pattern variants with the same key are MERGED (their
+    // patterns unioned into the kept path so no variant's trips are lost
+    // downstream, best score kept), and a per-pattern-sequence cap
+    // bounds platform fanout.
 
     // Correctness-relevant output: every stop that's an ancestor of a kept
     // meeting node, on EITHER side. Computed once, up front, from THIS
@@ -1132,30 +1143,38 @@ pub fn materialize_seed_paths(
         core_stop_pks_by_depth.push(this_depth);
     }
 
-    let mut seen_paths: HashSet<SeedPathKey> = HashSet::new();
+    let t_assemble = Instant::now();
+    let mut t_backtrack_us: u128 = 0;
+    let mut t_score_us: u128 = 0;
+    let mut combos_examined: i64 = 0;
+    let mut dup_cross_meet: i64 = 0;
+    let mut dup_pattern_variant: i64 = 0;
+    let mut variant_rescored: i64 = 0;
+    let mut skipped_sig_fanout: i64 = 0;
+
+    // hash(stops + hop shapes) -> indices into `paths` with that hash.
+    // Collisions are resolved by comparing content, no cloning.
+    let mut by_key: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+    // hash(ordered pattern signature) -> paths assembled so far for it.
+    let mut sig_counts: FxHashMap<u64, usize> = FxHashMap::default();
     let mut paths: Vec<Vec<i64>> = Vec::new();
     let mut path_pattern_pks: Vec<Vec<i64>> = Vec::new();
+    // First-seen ORDERED pattern sequence, used only to group paths for the
+    // per-sequence cap (path_pattern_pks itself becomes a merged set).
+    let mut path_sig: Vec<Vec<i64>> = Vec::new();
     let mut path_depths: Vec<u32> = Vec::new();
     let mut path_scores: Vec<f64> = Vec::new();
     let mut path_edges: Vec<Vec<Option<i64>>> = Vec::new();
     for &(m, combined) in batch {
-        // Depth relative to the shortest meet, same computation `rank_meets`
-        // uses for bucketing — kept here per-path (not just per-meet) so a
-        // debug consumer can color EVERY candidate seed path by depth, not
-        // just look it up via the meeting node.
         let depth = (combined as i64 - run.first_meet_total_level).max(0) as u32;
 
+        let t_bt = Instant::now();
         let mut fwd_paths: Vec<HalfPath> = Vec::new();
         {
             let mut path_so_far = Vec::new();
             let mut pattern_so_far = Vec::new();
             let mut edges_so_far = Vec::new();
             let mut in_path = FxHashSet::default();
-            // MAX_SEED_PATHS here is purely an internal guard against
-            // combinatorial fanout WITHIN one meet's half-path enumeration
-            // (e.g. several parent branches at the same level) — unrelated
-            // to how many total candidates get shown in the debug view,
-            // which is no longer capped below.
             backtrack_to_origin(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.origin_set, &run.parents_of_fwd, &mut fwd_paths, MAX_SEED_PATHS);
         }
         let mut bwd_paths: Vec<HalfPath> = Vec::new();
@@ -1166,36 +1185,87 @@ pub fn materialize_seed_paths(
             let mut in_path = FxHashSet::default();
             backtrack_to_dest(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.dest_set, &run.parents_of_bwd, &mut bwd_paths, MAX_SEED_PATHS);
         }
+        t_backtrack_us += t_bt.elapsed().as_micros();
 
         if fwd_paths.is_empty() && run.origin_set.contains(&m) { fwd_paths.push((vec![m], vec![], vec![])); }
         if bwd_paths.is_empty() && run.dest_set.contains(&m) { bwd_paths.push((vec![m], vec![], vec![])); }
 
         for (fp, fpat, fedges) in &fwd_paths {
             for (bp, bpat, bedges) in &bwd_paths {
-                let mut full = fp.clone();
-                full.extend_from_slice(&bp[1..]);
+                combos_examined += 1;
+                let stops_iter = move || fp.iter().chain(bp[1..].iter());
+                let edges_iter = move || fedges.iter().chain(bedges.iter()).copied();
 
+                // No allocation until we know the path is new.
+                let mut h = FxHasher::default();
+                for s in stops_iter() { h.write_i64(*s); }
+                for c in shape_codes(edges_iter()) { h.write_u64(c as u64); }
+                let key_hash = h.finish();
+
+                let existing = by_key.get(&key_hash).and_then(|idxs| {
+                    idxs.iter().copied().find(|&i| {
+                        paths[i].iter().eq(stops_iter())
+                            && shape_codes(path_edges[i].iter().copied()).eq(shape_codes(edges_iter()))
+                    })
+                });
+
+                if let Some(i) = existing {
+                    // Same stops, same hop shapes: only the pattern IDs can
+                    // differ. Union them in so every variant's trips stay
+                    // available to the loader/verifier.
+                    let mut added = false;
+                    for &p in fpat.iter().chain(bpat.iter()) {
+                        if !path_pattern_pks[i].contains(&p) { path_pattern_pks[i].push(p); added = true; }
+                    }
+                    if !added {
+                        dup_cross_meet += 1;
+                        continue;
+                    }
+                    dup_pattern_variant += 1;
+                    // A different variant can have a better estimate (headway
+                    // etc.), so keep the best score across merged variants.
+                    let full: Vec<i64> = stops_iter().copied().collect();
+                    let edges: Vec<Option<i64>> = edges_iter().collect();
+                    let t_sc = Instant::now();
+                    let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops, walking_speed_mps);
+                    t_score_us += t_sc.elapsed().as_micros();
+                    variant_rescored += 1;
+                    if score < path_scores[i] { path_scores[i] = score; }
+                    continue;
+                }
+
+                // New stop list. Bound platform fanout BEFORE paying for
+                // allocation + scoring: many stops of one line reachable at
+                // the same level otherwise multiply into near-identical paths.
+                let mut sh = FxHasher::default();
+                for &p in fpat.iter().chain(bpat.iter()) { sh.write_i64(p); }
+                let sig_hash = sh.finish();
+                let sig_count = sig_counts.entry(sig_hash).or_insert(0);
+                if MAX_ASSEMBLED_PER_PATTERN_SEQUENCE > 0 && *sig_count >= MAX_ASSEMBLED_PER_PATTERN_SEQUENCE {
+                    skipped_sig_fanout += 1;
+                    continue;
+                }
+                *sig_count += 1;
+
+                let full: Vec<i64> = stops_iter().copied().collect();
+                let edges: Vec<Option<i64>> = edges_iter().collect();
                 let mut sig = fpat.clone();
                 sig.extend_from_slice(bpat);
-                let key = if sig.is_empty() {
-                    SeedPathKey::ByStops(full.clone())
-                } else {
-                    SeedPathKey::ByPattern(sig.clone())
-                };
+                let t_sc = Instant::now();
+                let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops, walking_speed_mps);
+                t_score_us += t_sc.elapsed().as_micros();
 
-                if seen_paths.insert(key) {
-                    let mut edges = fedges.clone();
-                    edges.extend_from_slice(bedges);
-                    let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops, walking_speed_mps);
-                    paths.push(full);
-                    path_pattern_pks.push(sig);
-                    path_depths.push(depth);
-                    path_scores.push(score);
-                    path_edges.push(edges);
-                }
+                by_key.entry(key_hash).or_default().push(paths.len());
+                paths.push(full);
+                path_sig.push(sig.clone());
+                path_pattern_pks.push(sig);
+                path_depths.push(depth);
+                path_scores.push(score);
+                path_edges.push(edges);
             }
         }
     }
+    let assemble_ms = t_assemble.elapsed().as_millis() as i64;
 
     let path_count_before_margin = paths.len();
     if ENABLE_SEED_PATH_MARGIN {
@@ -1217,8 +1287,9 @@ pub fn materialize_seed_paths(
         // try.
         let reference_score = percentile(&path_scores, SEED_PATH_MARGIN_REFERENCE_PERCENTILE);
         if reference_score < f64::MAX {
-            let margin = margin_threshold(reference_score, SEED_PATH_MARGIN_FLOOR_SEC, SEED_PATH_MARGIN_RELATIVE_PCT);
-            let threshold = reference_score + margin;
+            // No margin on top: keep exactly the fastest
+            // SEED_PATH_MARGIN_REFERENCE_PERCENTILE (25%) of scored paths.
+            let threshold = reference_score;
             // Same fail-open reasoning as every other f64::MAX sentinel in
             // this file: a path that couldn't be scored gets kept, not
             // silently dropped, since "couldn't score it" isn't evidence
@@ -1232,17 +1303,57 @@ pub fn materialize_seed_paths(
             path_depths = order.iter().map(|&i| path_depths[i]).collect();
             path_scores = order.iter().map(|&i| path_scores[i]).collect();
             path_edges = order.iter().map(|&i| path_edges[i].clone()).collect();
+            path_sig = order.iter().map(|&i| path_sig[i].clone()).collect();
         }
         // best_score >= f64::MAX means nothing here was scoreable at all —
         // same fail-open reasoning, keep everything rather than filter
         // against a threshold that can't mean anything.
     }
 
+    // ── Per-pattern-sequence cap ─────────────────────────────────────────
+    // Runs AFTER the top-25% score filter above so that filter still ranks
+    // the full deduped field. Keeps the best few distinct-stop paths per
+    // ordered pattern sequence (a few alternative transfer/boarding stops
+    // survive; platform fanout doesn't).
+    let count_after_margin = paths.len();
+    if MAX_PATHS_PER_PATTERN_SEQUENCE > 0 && !paths.is_empty() {
+        let mut order: Vec<usize> = (0..paths.len()).collect();
+        order.sort_by(|&a, &b| path_scores[a].partial_cmp(&path_scores[b]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut per_sig: FxHashMap<&Vec<i64>, usize> = FxHashMap::default();
+        let mut keep: Vec<usize> = Vec::with_capacity(order.len());
+        for &i in &order {
+            let c = per_sig.entry(&path_sig[i]).or_insert(0);
+            if *c < MAX_PATHS_PER_PATTERN_SEQUENCE { *c += 1; keep.push(i); }
+        }
+        drop(per_sig);
+        paths = keep.iter().map(|&i| paths[i].clone()).collect();
+        path_pattern_pks = keep.iter().map(|&i| path_pattern_pks[i].clone()).collect();
+        path_depths = keep.iter().map(|&i| path_depths[i]).collect();
+        path_scores = keep.iter().map(|&i| path_scores[i]).collect();
+        path_edges = keep.iter().map(|&i| path_edges[i].clone()).collect();
+    }
+    let dropped_by_cap = (count_after_margin - paths.len()) as i64;
+
+    let stats: Vec<(String, i64)> = vec![
+        ("count.paths_combos_examined".to_string(), combos_examined),
+        ("count.paths_unique_assembled".to_string(), path_count_before_margin as i64),
+        ("count.paths_dup_cross_meet".to_string(), dup_cross_meet),
+        ("count.paths_dup_pattern_variant_merged".to_string(), dup_pattern_variant),
+        ("count.paths_variant_rescored".to_string(), variant_rescored),
+        ("count.paths_skipped_sig_fanout".to_string(), skipped_sig_fanout),
+        ("count.paths_dropped_by_sig_cap".to_string(), dropped_by_cap),
+        ("count.paths_final".to_string(), paths.len() as i64),
+        ("ms.paths_backtrack".to_string(), (t_backtrack_us / 1000) as i64),
+        ("ms.paths_score".to_string(), (t_score_us / 1000) as i64),
+        ("ms.paths_assemble_total".to_string(), assemble_ms),
+    ];
+
     SeedPathResult {
         paths,
         path_pattern_pks,
         path_scores,
         path_edges,
+        stats,
         path_count_before_margin,
         core_stop_pks,
         core_stop_pks_by_depth,

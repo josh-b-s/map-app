@@ -133,6 +133,7 @@ pub fn compute_seed_path_corridor(
     // Pre-truncation candidate volume — see path_count_before_margin's doc
     // for why this needs measuring rather than assuming from settings.
     sub_timings.push(("count.seed_paths_before_margin".to_string(), seed.path_count_before_margin as i64));
+    for (label, value) in &seed.stats { sub_timings.push((label.clone(), *value)); }
     sub_timings.push(("count.seed_paths_after_margin".to_string(), seed.paths.len() as i64));
 
     for (depth, &count) in seed.after_counts.iter().enumerate() {
