@@ -125,6 +125,11 @@ pub struct GtfsIndex {
     /// strategy is actually driving routing this run.
     pub seed_path_pattern_pks: Vec<Vec<i64>>,
     pub seed_path_scores: Vec<f64>,
+    /// Per-hop pattern_pk for each entry in `debug_seed_paths` — see
+    /// `ResolvedCorridor::seed_path_edges`. What `verifier.rs` walks
+    /// against real stop_times to confirm a candidate is genuinely
+    /// boardable, in place of a full McRAPTOR scan.
+    pub seed_path_edges: Vec<Vec<Option<i64>>>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
     /// own console.log breakdown.
@@ -136,7 +141,7 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
         no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary,
-        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), timings,
+        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(), timings,
     }
 }
 
@@ -325,7 +330,7 @@ pub fn load_gtfs_index_for_trip(
     };
     let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
         let t = Instant::now();
-        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway)?;
+        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway, walking_speed_mps)?;
         mark!(t, "corridor_resolution");
         for (label, ms) in &resolved.sub_timings {
             timings.push((format!("corridor.{label}"), *ms));
@@ -739,6 +744,7 @@ pub fn load_gtfs_index_for_trip(
             debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
             debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
             seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
+            seed_path_edges: resolved.seed_path_edges.clone(),
             timings,
         });
     }
@@ -759,6 +765,7 @@ pub fn load_gtfs_index_for_trip(
         debug_seed_paths: resolved.debug_seed_paths.clone(), debug_seed_path_depths: resolved.debug_seed_path_depths.clone(), debug_bfs_levels: resolved.debug_bfs_levels.clone(),
         debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
         seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
+        seed_path_edges: resolved.seed_path_edges.clone(),
         timings,
     })
 }

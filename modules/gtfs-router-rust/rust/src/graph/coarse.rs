@@ -81,11 +81,17 @@ impl CoarseGraph {
     }
 }
 
-/// Grid bucket size for walking-edge dedup — same fixed Melbourne-latitude
-/// constant the TS version hardcodes, with the same caveat: not wired to
-/// WALK_EDGE_THRESHOLD_M, must stay >= it or the 3x3-neighbor-cell scan can
-/// miss real neighbors.
-const GRID_CELL_DEG: f64 = 0.006;
+/// Grid bucket size for walking-edge dedup. Derived from
+/// WALK_EDGE_THRESHOLD_M (same `radius/111_000*1.1` shape raptor.rs used
+/// for its own speed-scaled footpath grid) rather than a fixed constant —
+/// this used to be hardcoded at 0.006 with a comment warning it "must
+/// stay >= WALK_EDGE_THRESHOLD_M or the 3x3-neighbor-cell scan can miss
+/// real neighbors", which was fine while that threshold was a small fixed
+/// 450m but silently breaks the moment it's raised. Deriving it removes
+/// the hand-sync duty entirely.
+fn grid_cell_deg() -> f64 {
+    (WALK_EDGE_THRESHOLD_M / 111_000.0 * 1.1).max(0.006)
+}
 
 /// Full from-scratch build: per-line transit cliques + spatially-bucketed
 /// walking edges. O(k^2) per pattern below FULL_CLIQUE_MAX_STOPS, stride-
@@ -125,7 +131,7 @@ pub fn build_adjacency_from_scratch(
 
     // ── Walking edges: spatially bucketed, not O(n^2) ───────────────────
     let cell_of = |lat: f64, lon: f64| -> (i64, i64) {
-        ((lat / GRID_CELL_DEG).floor() as i64, (lon / GRID_CELL_DEG).floor() as i64)
+        ((lat / grid_cell_deg()).floor() as i64, (lon / grid_cell_deg()).floor() as i64)
     };
     let mut grid: HashMap<(i64, i64), Vec<i64>> = HashMap::new(); // cell -> stop_pks
     for s in stops.iter() {

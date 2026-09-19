@@ -21,6 +21,7 @@ mod graph;
 mod corridor;
 mod loader;
 mod raptor;
+mod verifier;
 mod freq_raptor;
 mod fxhash;
 
@@ -458,96 +459,13 @@ impl GtfsRouterEngine {
 
         let mut debug_emit_ms: i64 = 0;
 
-        let opts = raptor::RaptorOptions { walking_speed_mps, ..Default::default() };
-        let stops_for_cb = state.stops.clone();
-        let debug_for_cb = debug.clone();
-        let mut on_round = move |round: u32, marked: &[i64]| {
-            if let Some(sink) = &debug_for_cb {
-                let pts: Vec<LatLng> = marked.iter().filter_map(|&pk| stops_for_cb.get(pk).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon })).collect();
-                sink.on_event(DebugEvent::RaptorRound { round, marked_stops: pts });
-            }
-        };
-
-        // Separate clones from on_round's — both closures need their own
-        // captured copies since they're both alive (and both re-borrowed
-        // across the retry below) for the same run_search call.
-        let stops_for_route_cb = state.stops.clone();
-        let graph_for_route_cb = state.graph.clone();
-        let patterns_for_route_cb = state.patterns.clone();
-        let shapes_index_for_route_cb = state.shapes_index.clone();
-        let debug_for_route_cb = debug.clone();
-        // Populated on demand as new patterns show up in ridden chains —
-        // shared across every call this search makes, so the same pattern
-        // (very likely, since RAPTOR keeps re-riding the same handful of
-        // corridor-restricted lines round after round) only costs one DB
-        // fetch total instead of one per route-check. `conn` is borrowed
-        // for the lifetime of this call (not stored past it), same as
-        // every other closure here.
-        let mut shape_cache_for_route_cb: HashMap<(i64, String), Vec<(f64, f64)>> = HashMap::new();
-        let mut on_route_check = move |round: u32, ridden: &[i64], route_color: Option<&str>, route_name: Option<&str>| {
-            if let Some(sink) = &debug_for_route_cb {
-                // CHANGED: this used to be a straight stop-to-stop
-                // polyline (one LatLng per ridden stop_pk, no shape
-                // resolution at all — see shapes_index's old
-                // #[allow(dead_code)] "reserved for follow-up shape-
-                // polyline work" note, which this is). Now mirrors
-                // emit_pre_search_debug's seed-path handling: walk each
-                // consecutive pair in the ridden chain, resolve the real
-                // GTFS shape for a transit edge via shaped_edge_coords
-                // (fetching+caching the shape on first use), and fall back
-                // to a straight segment only for walk edges or a pattern
-                // with no shape — instead of every hop being a straight
-                // line regardless of pattern.
-                let mut pts: Vec<LatLng> = Vec::new();
-                for w in ridden.windows(2) {
-                    let (from, to) = (w[0], w[1]);
-                    let (Some(from_ll), Some(to_ll)) = (
-                        stops_for_route_cb.get(from).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon }),
-                        stops_for_route_cb.get(to).map(|s| LatLng { latitude: s.stop_lat, longitude: s.stop_lon }),
-                    ) else { continue };
-
-                    let edge = graph_for_route_cb.adjacency.get(&from).and_then(|edges| edges.iter().find(|e| e.to == to));
-                    let seg: Vec<LatLng> = match edge {
-                        Some(e) if e.kind == graph::coarse::EdgeKind::Transit => {
-                            match e.via_pattern.and_then(|pk| patterns_for_route_cb.get(pk).map(|m| (pk, m))) {
-                                Some((pattern_pk, meta)) => {
-                                    if let Some(shape_id) = &meta.shape_id {
-                                        let key = (meta.agency, shape_id.clone());
-                                        if !shape_cache_for_route_cb.contains_key(&key) {
-                                            if let Ok(fetched) = repo::get_shape_points(conn, &shapes_index_for_route_cb, std::slice::from_ref(&key)) {
-                                                if let Some(points) = fetched.get(&key) {
-                                                    shape_cache_for_route_cb.insert(key.clone(), points.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    shaped_edge_coords(from_ll, to_ll, pattern_pk, &patterns_for_route_cb, &shape_cache_for_route_cb)
-                                }
-                                None => vec![from_ll, to_ll],
-                            }
-                        }
-                        _ => vec![from_ll, to_ll], // walk edge, or edge not found — straight line
-                    };
-
-                    if !seg.is_empty() {
-                        if let Some(last) = pts.last() {
-                            if last.latitude == seg[0].latitude && last.longitude == seg[0].longitude {
-                                pts.extend(seg.into_iter().skip(1));
-                                continue;
-                            }
-                        }
-                        pts.extend(seg);
-                    }
-                }
-                if pts.len() >= 2 {
-                    sink.on_event(DebugEvent::RaptorRouteCheck { round, coords: pts, route_color: route_color.map(String::from), route_name: route_name.map(String::from) });
-                }
-            }
-        };
-
+        // Verifier walks fixed seed-path candidates against real
+        // stop_times, no rounds, no exploration, so there is no
+        // round-by-round debug feed to wire up here anymore. See
+        // verifier.rs's header for why the old McRAPTOR scan is gone.
         let t_raptor = Instant::now();
         let mut pending_failed_attempt_timings: Vec<TimingEntry> = Vec::new();
-        let result = raptor::run_search(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, &opts, Some(&mut on_round), Some(&mut on_route_check));
+        let result = verifier::verify_seed_paths(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps);
         let mut raptor_ms = t_raptor.elapsed().as_millis() as i64;
 
         let journeys = match result {
@@ -575,7 +493,7 @@ impl GtfsRouterEngine {
                 )?;
                 if index.no_service_found { return Err(RouterError::NoServiceFound); }
                 let t_retry = Instant::now();
-                let retried = raptor::run_search(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, &opts, Some(&mut on_round), Some(&mut on_route_check))
+                let retried = verifier::verify_seed_paths(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps)
                     .map_err(RouterError::NoRoute)?;
                 // Retry's own load + search time gets appended as separate
                 // timing entries below rather than overwriting the first

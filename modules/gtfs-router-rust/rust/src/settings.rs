@@ -27,7 +27,36 @@ pub const MAX_SEED_STOPS: usize = 40;
 pub const MAX_RTREE_RADIUS_M: f64 = 32_000.0;
 
 // ── Coarse topology graph (graph/coarse.rs) ─────────────────────────────
-pub const WALK_EDGE_THRESHOLD_M: f64 = 450.0;
+/// Build-time CEILING on which stop pairs even get a walk edge — not the
+/// effective per-search cutoff. The graph is built once (persisted, see
+/// graph/store.rs) and reused across every request regardless of walking
+/// speed, so it has to be wide enough to cover the widest transfer any
+/// caller could reasonably need: `transfer_radius_m` at a fast walker (2.0
+/// m/s over MAX_TRANSFER_WALK_SEC) is 2400m, so this stays comfortably
+/// above that. The actual per-request limit is applied later, in
+/// seed_bfs.rs's `walk_closure`, against each edge's real `distance_m`
+/// using `transfer_radius_m(walking_speed_mps)` — a genuine caller-speed-
+/// scaled distance, unlike this constant. Used to be the effective cutoff
+/// itself (450m) before that per-request filter existed, which meant a
+/// journey needing a wider transfer than 450m was structurally
+/// unreachable no matter how fast the walker was — see graph/coarse.rs's
+/// GRID_CELL_DEG constant, replaced by a `grid_cell_deg()` function that
+/// derives from this value, so raising this doesn't silently break the
+/// neighbor scan.
+pub const WALK_EDGE_THRESHOLD_M: f64 = 2_500.0;
+
+/// Cache-key granularity for the per-request max walk distance (see
+/// corridor/resolver.rs's `cache_key`). Bucketing avoids a fresh
+/// corridor/BFS cache entry for every tiny float difference in walking
+/// speed while still giving genuinely different walking abilities (e.g. a
+/// wheelchair user vs. a fast walker) their own correctly-filtered
+/// candidate set.
+pub const WALK_DISTANCE_CACHE_BUCKET_M: f64 = 250.0;
+
+pub fn bucket_walk_distance_m(m: f64) -> i64 {
+    ((m / WALK_DISTANCE_CACHE_BUCKET_M).round() as i64) * WALK_DISTANCE_CACHE_BUCKET_M as i64
+}
+
 
 // ── Corridor tagging (corridor/tagging.rs) ──────────────────────────────
 pub const ORIGIN_DEST_WALK_RADIUS_M: f64 = 900.0;
@@ -197,6 +226,19 @@ pub fn margin_threshold(estimate: f64, floor: f64, relative_pct: f64) -> f64 {
     (estimate * relative_pct).max(floor)
 }
 
+/// Nearest-rank percentile of a set of scores (0.0 = min, 1.0 = max),
+/// ignoring `f64::MAX` sentinels (unscored entries — see every margin
+/// filter's "fail open" note). `p` is clamped to `[0, 1]`. Returns
+/// `f64::MAX` if nothing was scorable.
+pub fn percentile(scores: &[f64], p: f64) -> f64 {
+    let mut scored: Vec<f64> = scores.iter().copied().filter(|&s| s < f64::MAX).collect();
+    if scored.is_empty() { return f64::MAX; }
+    scored.sort_by(|a, b| a.total_cmp(b));
+    let p = p.clamp(0.0, 1.0);
+    let idx = ((scored.len() - 1) as f64 * p).round() as usize;
+    scored[idx]
+}
+
 /// Wait-time estimate used when `PatternHeadwayCache::headway_for` returns
 /// `None` (no data, or too few trips to compute a gap) — deliberately
 /// large/conservative rather than optimistic: an unknown headway should
@@ -261,29 +303,42 @@ pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = false;
 /// `materialize_seed_paths`.
 pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 
-/// EXPERIMENTAL — an alternative final-candidate-set strategy explored
-/// alongside `freq_raptor`'s narrow-then-scan approach: instead of feeding
-/// McRAPTOR `core_stop_pks` (freq_raptor's temporally-narrowed ancestor
-/// union), rank EVERY assembled whole candidate trip in `paths` by
+/// Final-candidate-set strategy: instead of feeding McRAPTOR
+/// `core_stop_pks` (freq_raptor's temporally-narrowed ancestor union),
+/// rank EVERY assembled whole candidate trip in `paths` by
 /// `score_seed_path` and keep everything within margin of the best (same
 /// `max(FLOOR, best*PCT)` shape as every other margin filter here — see
-/// `margin_threshold`), meant to be handed to a lightweight per-path
-/// verifier rather than a full McRAPTOR scan. When this is on, the
+/// `margin_threshold`). These margin-kept paths are what `verifier.rs`
+/// walks against real stop_times — there's no full McRAPTOR scan any
+/// more, so this is the only candidate-set strategy in play, not one of
+/// two being A/B'd. When this is on, the
 /// PER-MEET margin/top-K filter in `materialize_seed_paths`
 /// (`ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE`/`SEED_MEET_SELECT_TOP_K`) is
 /// bypassed entirely — this mode replaces that selection layer rather
 /// than stacking on top of it, so every meeting node's paths get
-/// backtracked and judged on their OWN assembled-path score. Off by
-/// default — `paths`/`path_scores` still get computed either way (cheap
-/// relative to BFS itself), this constant only controls whether they get
-/// filtered to the margin-kept set here. Does NOT affect `core_stop_pks`
-/// directly — loader.rs decides whether to use this mode's
-/// `seed_path_pattern_pks`/paths instead of freq_raptor's narrowing, so
-/// the two remain independently A/B-able in principle even though in
-/// practice loader.rs currently switches on this same constant.
+/// backtracked and judged on their OWN assembled-path score. On by
+/// default — `paths`/`path_scores`/`path_edges` get computed either way
+/// (cheap relative to BFS itself), this constant only controls whether
+/// they get filtered to the margin-kept set here. Does NOT affect
+/// `core_stop_pks` directly — loader.rs decides whether to use this
+/// mode's `seed_path_pattern_pks`/paths instead of freq_raptor's
+/// narrowing, so the two remain independently toggleable in principle
+/// even though in practice loader.rs currently switches on this same
+/// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 pub const SEED_PATH_MARGIN_FLOOR_SEC: f64 = 5.0 * 60.0;
 pub const SEED_PATH_MARGIN_RELATIVE_PCT: f64 = 0.25;
+/// The margin is measured from this percentile of scored candidates, not
+/// the single fastest one. The fastest candidate's score is a sample of
+/// one, built from averaged headway/cumulative-time estimates rather than
+/// a real trip lookup — an outlier-prone anchor for a cutoff that then
+/// decides which candidates the verifier even gets to try. Anchoring on
+/// the 25th percentile instead (the top quarter of candidates by
+/// estimated cost) is a steadier reference: it isn't dragged down by one
+/// candidate whose average-case estimate happened to look unrealistically
+/// good, while still only drawing the line among the genuinely fast
+/// candidates rather than the whole field.
+pub const SEED_PATH_MARGIN_REFERENCE_PERCENTILE: f64 = 0.25;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;

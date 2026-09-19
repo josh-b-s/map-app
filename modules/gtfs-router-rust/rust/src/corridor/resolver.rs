@@ -15,8 +15,8 @@ use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, neare
 use crate::corridor::tagging::{compute_seed_path_corridor, CorridorBoundary, CorridorCandidate};
 use crate::corridor::seed_bfs::{run_seed_bfs, SearchDir, SeedBfsRun};
 use crate::settings::{
-    MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_SEED_STOPS, ORIGIN_DEST_WALK_RADIUS_M,
-    SEED_RADIUS_M, STOP_SEQUENCE_MARGIN,
+    bucket_walk_distance_m, transfer_radius_m, MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_SEED_STOPS,
+    ORIGIN_DEST_WALK_RADIUS_M, SEED_RADIUS_M, STOP_SEQUENCE_MARGIN,
 };
 
 pub struct ResolvedCorridor {
@@ -46,6 +46,10 @@ pub struct ResolvedCorridor {
     /// Whole-trip estimated score for the matching entry in
     /// `debug_seed_paths` — see `SeedPathResult::path_scores`.
     pub seed_path_scores: Vec<f64>,
+    /// Per-hop pattern_pk for the matching entry in `debug_seed_paths` —
+    /// see `SeedPathResult::path_edges`. Not debug-only: `verifier.rs`
+    /// reads this to check each candidate against real stop_times.
+    pub seed_path_edges: Vec<Vec<Option<i64>>>,
     /// Depth (relative to shortest meet) of the matching entry in
     /// `debug_seed_paths` — lets a debug/visualization consumer color
     /// candidate seed paths by depth instead of every candidate looking
@@ -64,12 +68,13 @@ pub struct ResolvedCorridor {
 
 fn round_coord(n: f64) -> f64 { (n * 10_000.0).round() / 10_000.0 } // ~11m
 
-fn cache_key(origin: LatLon, destination: LatLon, max_transfers: u32) -> String {
+fn cache_key(origin: LatLon, destination: LatLon, max_transfers: u32, max_walk_distance_m: f64) -> String {
     format!(
-        "{},{}|{},{}|{}",
+        "{},{}|{},{}|{}|walk={}",
         round_coord(origin.lat), round_coord(origin.lon),
         round_coord(destination.lat), round_coord(destination.lon),
         max_transfers,
+        bucket_walk_distance_m(max_walk_distance_m),
     )
 }
 
@@ -297,8 +302,16 @@ pub fn resolve_corridor(
     batch_size: usize,
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
+    walking_speed_mps: f64,
 ) -> rusqlite::Result<Arc<ResolvedCorridor>> {
-    let bfs_key = cache_key(origin, destination, MAX_TRANSFERS);
+    // Real, caller-speed-scaled transfer/walk-edge distance — see
+    // transfer_radius_m's doc and WALK_EDGE_THRESHOLD_M's updated one.
+    // Baked into the cache key (bucketed) so a materially different
+    // walking ability gets its own correctly-filtered corridor instead of
+    // silently reusing whichever speed happened to populate the cache
+    // first.
+    let max_walk_distance_m = transfer_radius_m(walking_speed_mps);
+    let bfs_key = cache_key(origin, destination, MAX_TRANSFERS, max_walk_distance_m);
     let key = format!("{bfs_key}|batch={batch_size}");
     if let Some(cached) = cache.get(&key) {
         return Ok(cached);
@@ -335,7 +348,7 @@ pub fn resolve_corridor(
     let run: Arc<SeedBfsRun> = if let Some(hit) = bfs_cache.get(&bfs_key) {
         hit
     } else {
-        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative, headway));
+        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative, headway, max_walk_distance_m));
         bfs_cache.insert(bfs_key.clone(), run.clone());
         run
     };
@@ -347,7 +360,7 @@ pub fn resolve_corridor(
     sub_timings.push(("count.seed_bfs_meets_total".to_string(), run.ordered_meets.len() as i64));
 
     let t = Instant::now();
-    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway)?;
+    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway, walking_speed_mps)?;
     // Only sum entries that are actually milliseconds — every "count."-
     // prefixed entry in seed_corridor.sub_timings is a raw count (paths,
     // stops, whatever), not a duration, and summing those in here is what
@@ -396,6 +409,7 @@ pub fn resolve_corridor(
         debug_seed_paths: seed_corridor.seed_paths,
         seed_path_pattern_pks: seed_corridor.path_pattern_pks,
         seed_path_scores: seed_corridor.path_scores,
+        seed_path_edges: seed_corridor.path_edges,
         debug_seed_path_depths: seed_corridor.path_depths,
         debug_bfs_levels: seed_corridor.level_frontiers,
         debug_corridor_boundary: seed_corridor.corridor_boundaries,

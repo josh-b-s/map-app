@@ -68,6 +68,11 @@ pub struct SeedPathCorridorResult {
     /// what resolve_corridor/loader.rs use to build the margin-based
     /// alternative to freq_raptor's narrowing.
     pub path_scores: Vec<f64>,
+    /// Per-hop pattern_pk for the matching entry in `seed_paths` — see
+    /// `SeedPathResult::path_edges` in seed_bfs.rs. What the verifier
+    /// uses to check real boardability, since `path_pattern_pks` alone
+    /// doesn't say which hop rode which pattern.
+    pub path_edges: Vec<Vec<Option<i64>>>,
     /// Depth (relative to the shortest meet) of the matching entry in
     /// `seed_paths` — see `SeedPathResult::path_depths` in seed_bfs.rs.
     pub path_depths: Vec<u32>,
@@ -100,6 +105,7 @@ pub fn compute_seed_path_corridor(
     destination: LatLon,
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
+    walking_speed_mps: f64,
 ) -> rusqlite::Result<SeedPathCorridorResult> {
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
 
@@ -120,7 +126,7 @@ pub fn compute_seed_path_corridor(
     }
 
     let t = Instant::now();
-    let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops);
+    let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops, walking_speed_mps);
     let walk_radius = walk_radius_stop_pks(candidates, origin, destination);
     sub_timings.push(("materialize".to_string(), t.elapsed().as_millis() as i64));
 
@@ -136,7 +142,7 @@ pub fn compute_seed_path_corridor(
     if seed.paths.is_empty() {
         return Ok(SeedPathCorridorResult {
             pattern_pks: HashSet::new(), walk_radius_stop_pks: walk_radius, seed_path_count: 0,
-            seed_paths: Vec::new(), path_pattern_pks: Vec::new(), path_scores: Vec::new(), path_depths: Vec::new(), level_frontiers: seed.level_frontiers,
+            seed_paths: Vec::new(), path_pattern_pks: Vec::new(), path_scores: Vec::new(), path_edges: Vec::new(), path_depths: Vec::new(), level_frontiers: seed.level_frontiers,
             corridor_boundaries: Vec::new(), core_stop_pks: HashSet::new(), sub_timings,
         });
     }
@@ -208,7 +214,7 @@ pub fn compute_seed_path_corridor(
 
     Ok(SeedPathCorridorResult {
         pattern_pks, walk_radius_stop_pks: walk_radius, seed_path_count: seed.paths.len(),
-        seed_paths: seed.paths, path_pattern_pks, path_scores: seed.path_scores, path_depths: seed.path_depths, level_frontiers: seed.level_frontiers,
+        seed_paths: seed.paths, path_pattern_pks, path_scores: seed.path_scores, path_edges: seed.path_edges, path_depths: seed.path_depths, level_frontiers: seed.level_frontiers,
         corridor_boundaries: Vec::new(), core_stop_pks: filtered_core_stop_pks, sub_timings,
     })
 }

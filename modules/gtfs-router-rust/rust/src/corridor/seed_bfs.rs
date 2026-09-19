@@ -53,7 +53,7 @@ use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     MAX_SEED_PATHS, RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT, SEED_PATH_MARGIN_FLOOR_SEC,
-    SEED_PATH_MARGIN_RELATIVE_PCT,
+    SEED_PATH_MARGIN_RELATIVE_PCT, SEED_PATH_MARGIN_REFERENCE_PERCENTILE, percentile,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
@@ -88,6 +88,14 @@ pub struct SeedPathResult {
     /// candidate trips directly (see `ENABLE_SEED_PATH_MARGIN`), not just
     /// the meeting nodes that produced them.
     pub path_scores: Vec<f64>,
+    /// Per-hop pattern_pk for the matching entry in `paths`, aligned the
+    /// same way `score_seed_path`'s `edges` argument is: length is
+    /// `paths[i].len() - 1`, `Some(pattern_pk)` for a transit hop, `None`
+    /// for a walk hop. This is what a genuine boardability check needs
+    /// (real trip_pk on real stop_times rows) that `path_pattern_pks`
+    /// alone can't give, since that field only keeps the distinct pattern
+    /// set, not which hop rode which pattern.
+    pub path_edges: Vec<Vec<Option<i64>>>,
     /// `paths.len()` BEFORE the `ENABLE_SEED_PATH_MARGIN` filter (equal
     /// to `paths.len()` when that toggle is off, since nothing gets cut).
     /// Logged so the actual pre-filter candidate volume is visible on
@@ -234,6 +242,7 @@ fn walk_closure(
     level_of: &mut FxHashMap<i64, u32>,
     parents_of: &mut FxHashMap<i64, FxHashSet<ParentEdge>>,
     level: u32,
+    max_walk_distance_m: f64,
 ) -> FxHashSet<i64> {
     // Iterate a snapshot of the keys we started with — `start_frontier`
     // itself is about to grow in the loop below.
@@ -242,6 +251,11 @@ fn walk_closure(
         let Some(edges) = graph.adjacency.get(&key) else { continue };
         for e in edges {
             if e.kind != EdgeKind::Walk { continue; }
+            // The graph itself only enforces a generous build-time
+            // ceiling (WALK_EDGE_THRESHOLD_M) — this is the real,
+            // caller-speed-scaled cutoff (see transfer_radius_m), applied
+            // per request rather than baked into the persisted graph.
+            if e.distance_m > max_walk_distance_m { continue; }
             match level_of.get(&e.to) {
                 None => {
                     level_of.insert(e.to, level);
@@ -559,13 +573,14 @@ fn score_seed_path(
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
     stops: &StopsCache,
+    walking_speed_mps: f64,
 ) -> f64 {
     if path.is_empty() { return f64::MAX; }
     let Some(first_row) = stops.get(path[0]) else { return f64::MAX };
     let mut total = haversine_meters(
         origin_point,
         LatLon { lat: first_row.stop_lat, lon: first_row.stop_lon },
-    ) / RANK_MEETS_WALKING_SPEED_MPS;
+    ) / walking_speed_mps;
 
     // Same "a boarding happens whenever this edge rides a pattern the
     // arriving path wasn't already on" rule real_time_from_root uses —
@@ -582,7 +597,7 @@ fn score_seed_path(
                 (Some(cp), Some(cn)) if cn >= cp => (cn - cp) as f64,
                 _ => haversine_meters(from_ll, to_ll) / ASSUMED_TRANSIT_SPEED_MPS,
             },
-            None => haversine_meters(from_ll, to_ll) / RANK_MEETS_WALKING_SPEED_MPS,
+            None => haversine_meters(from_ll, to_ll) / walking_speed_mps,
         };
 
         let wait_cost = match via_pattern {
@@ -601,7 +616,7 @@ fn score_seed_path(
     total += haversine_meters(
         destination_point,
         LatLon { lat: last_row.stop_lat, lon: last_row.stop_lon },
-    ) / RANK_MEETS_WALKING_SPEED_MPS;
+    ) / walking_speed_mps;
 
     total
 }
@@ -788,6 +803,7 @@ pub fn run_seed_bfs(
     max_transfers: u32,
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
+    max_walk_distance_m: f64,
 ) -> SeedBfsRun {
     let max_levels = level_cap_for(max_transfers);
     let origin_set: FxHashSet<i64> = origin_pks.iter().copied().collect();
@@ -852,7 +868,7 @@ pub fn run_seed_bfs(
         };
 
         if expand_forward {
-            let boardable = walk_closure(graph, transit_frontier_fwd, &mut level_of_fwd, &mut parents_of_fwd, level_fwd);
+            let boardable = walk_closure(graph, transit_frontier_fwd, &mut level_of_fwd, &mut parents_of_fwd, level_fwd, max_walk_distance_m);
             level_frontiers.push((SearchDir::Forward, boardable.iter().copied().collect()));
             note_meets(&boardable, &level_of_fwd, &level_of_bwd, &mut meeting_nodes, &mut first_meet_total_level);
 
@@ -878,7 +894,7 @@ pub fn run_seed_bfs(
             level_fwd += 1;
             transit_frontier_fwd = next;
         } else {
-            let boardable = walk_closure(graph, transit_frontier_bwd, &mut level_of_bwd, &mut parents_of_bwd, level_bwd);
+            let boardable = walk_closure(graph, transit_frontier_bwd, &mut level_of_bwd, &mut parents_of_bwd, level_bwd, max_walk_distance_m);
             level_frontiers.push((SearchDir::Backward, boardable.iter().copied().collect()));
             note_meets(&boardable, &level_of_bwd, &level_of_fwd, &mut meeting_nodes, &mut first_meet_total_level);
 
@@ -962,12 +978,14 @@ pub fn materialize_seed_paths(
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
     stops: &StopsCache,
+    walking_speed_mps: f64,
 ) -> SeedPathResult {
     if run.ordered_meets.is_empty() {
         return SeedPathResult {
             paths: Vec::new(),
             path_pattern_pks: Vec::new(),
             path_scores: Vec::new(),
+            path_edges: Vec::new(),
             path_count_before_margin: 0,
             core_stop_pks: FxHashSet::default(),
             core_stop_pks_by_depth: Vec::new(),
@@ -1115,6 +1133,7 @@ pub fn materialize_seed_paths(
     let mut path_pattern_pks: Vec<Vec<i64>> = Vec::new();
     let mut path_depths: Vec<u32> = Vec::new();
     let mut path_scores: Vec<f64> = Vec::new();
+    let mut path_edges: Vec<Vec<Option<i64>>> = Vec::new();
     for &(m, combined) in batch {
         // Depth relative to the shortest meet, same computation `rank_meets`
         // uses for bucketing — kept here per-path (not just per-meet) so a
@@ -1163,11 +1182,12 @@ pub fn materialize_seed_paths(
                 if seen_paths.insert(key) {
                     let mut edges = fedges.clone();
                     edges.extend_from_slice(bedges);
-                    let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops);
+                    let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops, walking_speed_mps);
                     paths.push(full);
                     path_pattern_pks.push(sig);
                     path_depths.push(depth);
                     path_scores.push(score);
+                    path_edges.push(edges);
                 }
             }
         }
@@ -1176,7 +1196,7 @@ pub fn materialize_seed_paths(
     let path_count_before_margin = paths.len();
     if ENABLE_SEED_PATH_MARGIN {
         // Global margin filter by whole-trip estimated duration — same
-        // max(FLOOR, best*PCT) shape as every other margin filter in this
+        // max(FLOOR, ref*PCT) shape as every other margin filter in this
         // crate (see margin_threshold's doc), applied here to whole
         // ASSEMBLED PATHS rather than individual meeting nodes. This is
         // the real selection mechanism in this mode — the per-meet
@@ -1184,10 +1204,17 @@ pub fn materialize_seed_paths(
         // ENABLE_SEED_PATH_MARGIN is on, so every meet's paths reach this
         // point and get judged on their own real assembled-path score,
         // not on whichever meet happened to produce them.
-        let best_score = path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
-        if best_score < f64::MAX {
-            let margin = margin_threshold(best_score, SEED_PATH_MARGIN_FLOOR_SEC, SEED_PATH_MARGIN_RELATIVE_PCT);
-            let threshold = best_score + margin;
+        //
+        // The margin is measured from SEED_PATH_MARGIN_REFERENCE_PERCENTILE
+        // of the scored candidates, not the single fastest one — see that
+        // constant's doc for why anchoring on the best score (a sample of
+        // one, itself just an average-headway estimate) is too fragile a
+        // cutoff for deciding which candidates the verifier ever gets to
+        // try.
+        let reference_score = percentile(&path_scores, SEED_PATH_MARGIN_REFERENCE_PERCENTILE);
+        if reference_score < f64::MAX {
+            let margin = margin_threshold(reference_score, SEED_PATH_MARGIN_FLOOR_SEC, SEED_PATH_MARGIN_RELATIVE_PCT);
+            let threshold = reference_score + margin;
             // Same fail-open reasoning as every other f64::MAX sentinel in
             // this file: a path that couldn't be scored gets kept, not
             // silently dropped, since "couldn't score it" isn't evidence
@@ -1200,6 +1227,7 @@ pub fn materialize_seed_paths(
             path_pattern_pks = order.iter().map(|&i| path_pattern_pks[i].clone()).collect();
             path_depths = order.iter().map(|&i| path_depths[i]).collect();
             path_scores = order.iter().map(|&i| path_scores[i]).collect();
+            path_edges = order.iter().map(|&i| path_edges[i].clone()).collect();
         }
         // best_score >= f64::MAX means nothing here was scoreable at all —
         // same fail-open reasoning, keep everything rather than filter
@@ -1210,6 +1238,7 @@ pub fn materialize_seed_paths(
         paths,
         path_pattern_pks,
         path_scores,
+        path_edges,
         path_count_before_margin,
         core_stop_pks,
         core_stop_pks_by_depth,
@@ -1235,7 +1264,9 @@ pub fn find_seed_paths(
     max_transfers: u32,
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
+    max_walk_distance_m: f64,
+    walking_speed_mps: f64,
 ) -> SeedPathResult {
-    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway);
-    materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops)
+    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway, max_walk_distance_m);
+    materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops, walking_speed_mps)
 }
