@@ -32,10 +32,9 @@ use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::{CoarseGraph, EdgeKind};
 use crate::repo::{PatternHeadwayCache, PatternHopsCache, PatternStopRow, StopsCache};
 use crate::settings::{
-    transfer_radius_m, margin_threshold, ASSUMED_TRANSIT_SPEED_MPS, ENABLE_FREQ_GRAPH_MARGIN_PRUNE,
+    margin_threshold, ASSUMED_TRANSIT_SPEED_MPS, ENABLE_FREQ_GRAPH_MARGIN_PRUNE,
     FREQ_GRAPH_MARGIN_FLOOR_SEC, FREQ_GRAPH_MARGIN_RELATIVE_PCT, FREQ_GRAPH_MAX_ROUNDS,
     FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
-    ORIGIN_DEST_WALK_RADIUS_M,
 };
 
 type StopPk = i64;
@@ -153,6 +152,7 @@ pub fn narrow_candidates(
     destination: LatLon,
     depart_sec_of_day: i64,
     walking_speed_mps: f64,
+    max_walk_distance_m: f64,
 ) -> Option<FreqNarrowResult> {
     let profiles = build_pattern_profiles(candidate_pattern_pks, pattern_stop_rows, hops, stops);
     if profiles.is_empty() { return None; }
@@ -166,21 +166,20 @@ pub fn narrow_candidates(
         }
     }
 
-    let xfer_radius = transfer_radius_m(walking_speed_mps);
+    let xfer_radius = max_walk_distance_m;
 
     let mut tau: HashMap<StopPk, i64> = HashMap::new();
     let mut parent: HashMap<StopPk, ParentInfo> = HashMap::new();
 
-    // ── Seed from origin: every allowed corridor stop within walking
-    // radius of the origin point, same radius resolve_corridor already
-    // uses for seed stops (ORIGIN_DEST_WALK_RADIUS_M) — consistent with
-    // what the real search will also consider reachable from a standing
-    // start.
+    // ── Seed from origin: every allowed corridor stop within the
+    // caller's max_walk_distance_m of the origin point — same value
+    // resolve_corridor uses for seed stops, consistent with what the
+    // real search will also consider reachable from a standing start.
     let mut marked: HashSet<StopPk> = HashSet::new();
     for &stop_pk in allowed_stop_pks {
         let Some(s) = stops.get(stop_pk) else { continue };
         let d = haversine_meters(origin, LatLon { lat: s.stop_lat, lon: s.stop_lon });
-        if d > ORIGIN_DEST_WALK_RADIUS_M { continue; }
+        if d > max_walk_distance_m { continue; }
         let arr = depart_sec_of_day + walk_time_sec(d, walking_speed_mps);
         tau.insert(stop_pk, arr);
         parent.insert(stop_pk, ParentInfo::OriginWalk);
@@ -287,7 +286,7 @@ pub fn narrow_candidates(
         let Some(&tau_s) = tau.get(&stop_pk) else { continue };
         let Some(s) = stops.get(stop_pk) else { continue };
         let d = haversine_meters(destination, LatLon { lat: s.stop_lat, lon: s.stop_lon });
-        if d > ORIGIN_DEST_WALK_RADIUS_M { continue; }
+        if d > max_walk_distance_m { continue; }
         let arr = tau_s + walk_time_sec(d, walking_speed_mps);
         if arr < best_arrival { best_arrival = arr; }
     }
@@ -335,8 +334,8 @@ pub fn narrow_candidates(
     // resolve_corridor's own seed-path stops being kept unconditionally.
     for &stop_pk in allowed_stop_pks {
         let Some(s) = stops.get(stop_pk) else { continue };
-        let near_origin = haversine_meters(origin, LatLon { lat: s.stop_lat, lon: s.stop_lon }) <= ORIGIN_DEST_WALK_RADIUS_M;
-        let near_dest = haversine_meters(destination, LatLon { lat: s.stop_lat, lon: s.stop_lon }) <= ORIGIN_DEST_WALK_RADIUS_M;
+        let near_origin = haversine_meters(origin, LatLon { lat: s.stop_lat, lon: s.stop_lon }) <= max_walk_distance_m;
+        let near_dest = haversine_meters(destination, LatLon { lat: s.stop_lat, lon: s.stop_lon }) <= max_walk_distance_m;
         if !near_origin && !near_dest { continue; }
         narrowed_stops.insert(stop_pk);
         if let Some(entries) = patterns_by_stop.get(&stop_pk) {

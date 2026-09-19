@@ -141,6 +141,10 @@ export async function computeGtfsRouteNative(
     destination: LatLng,
     departureTime: Date = new Date(),
     walkingSpeedMps: number = 1.4, // WALK_SPEED_MPS.NORMAL
+    // TODO: not yet exposed to callers/UI — hardcoded until the front end
+    // has a real walk-tolerance control to wire through. Mirrors
+    // DEFAULT_MAX_WALK_DISTANCE_M in settings.rs (1.4 m/s * 20 min).
+    maxWalkDistanceM: number = 1.4 * 20 * 60,
     debugMode: boolean = false,
 ): Promise<GtfsRouteResult> {
     const eng = getEngine(DB_PATH);
@@ -162,6 +166,7 @@ export async function computeGtfsRouteNative(
             toGtfsDateString(tomorrow),
             tomorrow.getDay(),
             walkingSpeedMps,
+            maxWalkDistanceM,
             collector?.sink ?? undefined, // pass the plain-object `sink`, not the collector wrapper — see debugSinkCollector.ts's header note on classes vs plain-object callback interfaces. undefined (not null) confirmed correct for the None case from the generated binding's FfiConverterOptional.
         );
 

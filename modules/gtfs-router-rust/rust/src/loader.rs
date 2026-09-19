@@ -235,6 +235,7 @@ pub fn load_gtfs_index_for_trip(
     tomorrow_date: &str,
     tomorrow_dow: u8,
     walking_speed_mps: f64,
+    max_walk_distance_m: f64,
     force_window_sec: Option<i64>,
 ) -> rusqlite::Result<GtfsIndex> {
     let t_total = Instant::now();
@@ -330,7 +331,7 @@ pub fn load_gtfs_index_for_trip(
     };
     let (resolved, allowed_stop_pks, candidate_pattern_pks, active_trip_pks, pattern_keys_with_active_trip, trip_pk_to_pattern) = loop {
         let t = Instant::now();
-        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway, walking_speed_mps)?;
+        let resolved = resolve_corridor(conn, stops, patterns, graph, corridor_cache, bfs_cache, origin, destination, batch_size, pattern_cumulative, headway, walking_speed_mps, max_walk_distance_m)?;
         mark!(t, "corridor_resolution");
         for (label, ms) in &resolved.sub_timings {
             timings.push((format!("corridor.{label}"), *ms));
@@ -421,7 +422,7 @@ pub fn load_gtfs_index_for_trip(
             let t = Instant::now();
             let r = freq_raptor::narrow_candidates(
                 &resolved.pattern_pks, &full_allowed_stop_pks, &resolved.pattern_stop_rows,
-                hops, headway, graph, stops, origin, destination, depart_sec_of_day, walking_speed_mps,
+                hops, headway, graph, stops, origin, destination, depart_sec_of_day, walking_speed_mps, max_walk_distance_m,
             );
             mark!(t, "freq_raptor_narrow");
             timings.push(("freq_raptor.applied".to_string(), r.is_some() as i64));

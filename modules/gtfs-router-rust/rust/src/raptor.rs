@@ -23,7 +23,7 @@ use crate::geo::{haversine_meters, LatLon};
 use crate::loader::GtfsIndex;
 use crate::repo::StopsCache;
 use crate::settings::{
-    transfer_radius_m, ASSUMED_TRANSIT_SPEED_MPS, BEST_MARKED_CAP, MAX_ROUNDS, NEARBY_STOPS,
+    DEFAULT_MAX_WALK_DISTANCE_M, ASSUMED_TRANSIT_SPEED_MPS, BEST_MARKED_CAP, MAX_ROUNDS, NEARBY_STOPS,
 };
 
 pub type StopPk = i64;
@@ -136,12 +136,17 @@ fn earliest_departure_index(entries: &[std::rc::Rc<crate::loader::StopTimeEntry>
 
 pub struct RaptorOptions {
     pub walking_speed_mps: f64,
+    /// Universal caller-supplied max tolerable walk distance — governs
+    /// mid-journey transfer radius here, BFS seeding and the
+    /// origin/destination walk radius in corridor/resolver.rs and
+    /// corridor/tagging.rs. See settings.rs module header.
+    pub max_walk_distance_m: f64,
     pub max_rounds: u32,
 }
 
 impl Default for RaptorOptions {
     fn default() -> Self {
-        Self { walking_speed_mps: 1.4, max_rounds: MAX_ROUNDS }
+        Self { walking_speed_mps: 1.4, max_walk_distance_m: DEFAULT_MAX_WALK_DISTANCE_M, max_rounds: MAX_ROUNDS }
     }
 }
 
@@ -172,7 +177,7 @@ pub fn run_search(
     mut on_round: Option<&mut dyn FnMut(u32, &[StopPk])>,
     mut on_route_check: Option<&mut dyn FnMut(u32, &[StopPk], Option<&str>, Option<&str>)>,
 ) -> Result<Vec<Journey>, String> {
-    let xfer_radius = transfer_radius_m(opts.walking_speed_mps);
+    let xfer_radius = opts.max_walk_distance_m;
 
     let corridor_stops: Vec<StopPk> = index.allowed_stop_pks.iter().copied().collect();
 

@@ -22,7 +22,6 @@ use crate::geo::cross_track_distance_m;
 use crate::repo::{get_pattern_pks_for_stops, PatternCumulativeCache, PatternHeadwayCache, StopsCache};
 use crate::settings::{
     CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX_PER_BUCKET, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
-    ORIGIN_DEST_WALK_RADIUS_M,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -43,12 +42,12 @@ pub struct CorridorBoundary {
     pub right: Vec<LatLon>,
 }
 
-fn walk_radius_stop_pks(candidates: &[CorridorCandidate], origin: LatLon, destination: LatLon) -> HashSet<i64> {
+fn walk_radius_stop_pks(candidates: &[CorridorCandidate], origin: LatLon, destination: LatLon, max_walk_distance_m: f64) -> HashSet<i64> {
     let mut out = HashSet::new();
     for c in candidates {
         let p = LatLon { lat: c.lat, lon: c.lon };
-        if haversine_meters(origin, p) <= ORIGIN_DEST_WALK_RADIUS_M { out.insert(c.stop_pk); }
-        if haversine_meters(destination, p) <= ORIGIN_DEST_WALK_RADIUS_M { out.insert(c.stop_pk); }
+        if haversine_meters(origin, p) <= max_walk_distance_m { out.insert(c.stop_pk); }
+        if haversine_meters(destination, p) <= max_walk_distance_m { out.insert(c.stop_pk); }
     }
     out
 }
@@ -106,6 +105,7 @@ pub fn compute_seed_path_corridor(
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
     walking_speed_mps: f64,
+    max_walk_distance_m: f64,
 ) -> rusqlite::Result<SeedPathCorridorResult> {
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
 
@@ -127,7 +127,7 @@ pub fn compute_seed_path_corridor(
 
     let t = Instant::now();
     let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops, walking_speed_mps);
-    let walk_radius = walk_radius_stop_pks(candidates, origin, destination);
+    let walk_radius = walk_radius_stop_pks(candidates, origin, destination, max_walk_distance_m);
     sub_timings.push(("materialize".to_string(), t.elapsed().as_millis() as i64));
 
     // Pre-truncation candidate volume — see path_count_before_margin's doc

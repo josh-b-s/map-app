@@ -52,7 +52,7 @@ use std::collections::HashSet;
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
-    MAX_SEED_PATHS, RANK_MEETS_WALKING_SPEED_MPS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT, SEED_PATH_MARGIN_FLOOR_SEC,
+    MAX_SEED_PATHS, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT, SEED_PATH_MARGIN_FLOOR_SEC,
     SEED_PATH_MARGIN_RELATIVE_PCT, SEED_PATH_MARGIN_REFERENCE_PERCENTILE, percentile,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
@@ -253,7 +253,7 @@ fn walk_closure(
             if e.kind != EdgeKind::Walk { continue; }
             // The graph itself only enforces a generous build-time
             // ceiling (WALK_EDGE_THRESHOLD_M) — this is the real,
-            // caller-speed-scaled cutoff (see transfer_radius_m), applied
+            // caller-supplied cutoff (max_walk_distance_m), applied
             // per request rather than baked into the persisted graph.
             if e.distance_m > max_walk_distance_m { continue; }
             match level_of.get(&e.to) {
@@ -441,8 +441,8 @@ fn backtrack_to_dest(
 /// `ASSUMED_TRANSIT_SPEED_MPS` when either endpoint has no cumulative-time
 /// data, same "don't treat a data gap as a free hop" reasoning used
 /// everywhere else this fallback appears (import.rs, freq_raptor.rs). A
-/// walk edge (`via_pattern = None`) uses straight-line distance at
-/// `RANK_MEETS_WALKING_SPEED_MPS` — real `distance_m` is available on the
+/// walk edge (`via_pattern = None`) uses straight-line distance at the
+/// caller's `walking_speed_mps` — real `distance_m` is available on the
 /// matching `CoarseEdge`, but finding that specific edge back out of the
 /// adjacency list per hop is more work than just recomputing haversine
 /// here, and the fallback path already does exactly that anyway.
@@ -473,6 +473,7 @@ fn real_time_from_root(
     headway: &PatternHeadwayCache,
     stops: &StopsCache,
     memo: &mut FxHashMap<i64, (f64, Option<i64>)>,
+    walking_speed_mps: f64,
 ) -> (f64, Option<i64>) {
     if let Some(&v) = memo.get(&node) { return v; }
 
@@ -486,7 +487,7 @@ fn real_time_from_root(
         // real boarding from here still gets its own wait charged below.
         let v: (f64, Option<i64>) = match stops.get(node) {
             None => (f64::MAX, None), // can't locate — treat as maximally far, same as the old version's None arm, rather than vanish the candidate outright
-            Some(row) => (haversine_meters(root_point, LatLon { lat: row.stop_lat, lon: row.stop_lon }) / RANK_MEETS_WALKING_SPEED_MPS, None),
+            Some(row) => (haversine_meters(root_point, LatLon { lat: row.stop_lat, lon: row.stop_lon }) / walking_speed_mps, None),
         };
         memo.insert(node, v);
         return v;
@@ -512,7 +513,7 @@ fn real_time_from_root(
     let mut best = f64::MAX;
     let mut best_pattern: Option<i64> = None;
     for &(p, via_pattern) in parents {
-        let (t_p, p_arrival_pattern) = real_time_from_root(p, parents_of, root_set, root_point, cumulative, headway, stops, memo);
+        let (t_p, p_arrival_pattern) = real_time_from_root(p, parents_of, root_set, root_point, cumulative, headway, stops, memo, walking_speed_mps);
         if t_p >= f64::MAX { continue; }
         let Some(p_row) = stops.get(p) else { continue };
         let p_ll = LatLon { lat: p_row.stop_lat, lon: p_row.stop_lon };
@@ -525,7 +526,7 @@ fn real_time_from_root(
                 };
                 (ride, Some(pattern_pk))
             }
-            None => (haversine_meters(p_ll, node_ll) / RANK_MEETS_WALKING_SPEED_MPS, None),
+            None => (haversine_meters(p_ll, node_ll) / walking_speed_mps, None),
         };
 
         // A boarding happens whenever this edge rides a pattern the
@@ -680,6 +681,7 @@ fn rank_meets(
     dest_set: &FxHashSet<i64>,
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
+    walking_speed_mps: f64,
 ) -> (Vec<(i64, u32)>, Vec<usize>, FxHashMap<i64, f64>) {
     // Shared across EVERY candidate scored in this whole call, both
     // buckets included — see real_time_from_root's doc for why this is
@@ -694,8 +696,8 @@ fn rank_meets(
 
     let mut sort_by_real_time = |bucket: &mut Vec<(i64, u32)>, scores: &mut FxHashMap<i64, f64>| {
         bucket.sort_by_cached_key(|&(node, _)| {
-            let (t_fwd, _) = real_time_from_root(node, parents_of_fwd, origin_set, origin, cumulative, headway, stops, &mut memo_fwd);
-            let (t_bwd, _) = real_time_from_root(node, parents_of_bwd, dest_set, destination, cumulative, headway, stops, &mut memo_bwd);
+            let (t_fwd, _) = real_time_from_root(node, parents_of_fwd, origin_set, origin, cumulative, headway, stops, &mut memo_fwd, walking_speed_mps);
+            let (t_bwd, _) = real_time_from_root(node, parents_of_bwd, dest_set, destination, cumulative, headway, stops, &mut memo_bwd, walking_speed_mps);
             let score = if t_fwd >= f64::MAX || t_bwd >= f64::MAX { f64::MAX } else { t_fwd + t_bwd };
             scores.insert(node, score);
             (score.to_bits(), node)
@@ -804,6 +806,7 @@ pub fn run_seed_bfs(
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
     max_walk_distance_m: f64,
+    walking_speed_mps: f64,
 ) -> SeedBfsRun {
     let max_levels = level_cap_for(max_transfers);
     let origin_set: FxHashSet<i64> = origin_pks.iter().copied().collect();
@@ -937,6 +940,7 @@ pub fn run_seed_bfs(
     let (ordered_meets, bucket_sizes_before, meet_scores) = rank_meets(
         ordered_meets, origin, destination, stops, first_meet_total_level,
         &parents_of_fwd, &parents_of_bwd, &origin_set, &dest_set, cumulative, headway,
+        walking_speed_mps,
     );
 
     SeedBfsRun {
@@ -1267,6 +1271,6 @@ pub fn find_seed_paths(
     max_walk_distance_m: f64,
     walking_speed_mps: f64,
 ) -> SeedPathResult {
-    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway, max_walk_distance_m);
+    let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway, max_walk_distance_m, walking_speed_mps);
     materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops, walking_speed_mps)
 }

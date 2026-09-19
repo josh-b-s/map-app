@@ -1,13 +1,27 @@
 //! settings.rs — port of services/gtfs/shared/routingSettings.ts.
 //!
-//! See that file's header comment for how these interact (SEED_RADIUS_M vs
-//! WALK_EDGE_THRESHOLD_M vs ORIGIN_DEST_WALK_RADIUS_M vs
-//! MAX_TRANSFER_WALK_SEC — four different "how far would someone walk"
-//! radii serving four different purposes). Kept 1:1 with the TS values;
-//! change both sides together if you ever tune one.
+//! Walk-distance handling: there is exactly ONE caller-supplied distance —
+//! `max_walk_distance_m`, threaded in from the front end through
+//! RaptorOptions / resolve_corridor / run_seed_bfs — and it now governs
+//! every "how far would this caller walk" decision: mid-journey transfers
+//! (raptor.rs/freq_raptor.rs xfer_radius), BFS seed-stop selection
+//! (corridor/resolver.rs's `nearest_for_seed`), and the origin/destination
+//! walk-radius stop set (corridor/tagging.rs's `walk_radius_stop_pks`).
+//! Previously these were four independently-tuned constants/derivations
+//! (SEED_RADIUS_M, ORIGIN_DEST_WALK_RADIUS_M, and a speed-derived
+//! transfer_radius_m) that could disagree with each other and with what
+//! the caller actually asked for — e.g. a stop within the caller's real
+//! walk tolerance but outside the fixed 900m/1000m seeding radii was
+//! structurally unreachable no matter how far the caller was willing to
+//! walk. `walking_speed_mps` is still separate and still caller-supplied —
+//! it's only used to convert a distance into a duration (for scoring,
+//! filtering, and verification), never to decide how far is "too far" to
+//! walk. `WALK_EDGE_THRESHOLD_M` remains the one exception: it's a
+//! build-time graph ceiling, not a per-request cutoff — see its own
+//! comment below for why it has to stay independent, and MUST be kept
+//! >= the largest `max_walk_distance_m` the front end will ever send.
 
 // ── Seeding (corridor/resolver.rs) ──────────────────────────────────────
-pub const SEED_RADIUS_M: f64 = 1000.0;
 pub const MIN_SEED_STOPS: usize = 4;
 pub const MAX_SEED_STOPS: usize = 40;
 
@@ -29,37 +43,47 @@ pub const MAX_RTREE_RADIUS_M: f64 = 32_000.0;
 // ── Coarse topology graph (graph/coarse.rs) ─────────────────────────────
 /// Build-time CEILING on which stop pairs even get a walk edge — not the
 /// effective per-search cutoff. The graph is built once (persisted, see
-/// graph/store.rs) and reused across every request regardless of walking
-/// speed, so it has to be wide enough to cover the widest transfer any
-/// caller could reasonably need: `transfer_radius_m` at a fast walker (2.0
-/// m/s over MAX_TRANSFER_WALK_SEC) is 2400m, so this stays comfortably
-/// above that. The actual per-request limit is applied later, in
-/// seed_bfs.rs's `walk_closure`, against each edge's real `distance_m`
-/// using `transfer_radius_m(walking_speed_mps)` — a genuine caller-speed-
-/// scaled distance, unlike this constant. Used to be the effective cutoff
-/// itself (450m) before that per-request filter existed, which meant a
-/// journey needing a wider transfer than 450m was structurally
-/// unreachable no matter how fast the walker was — see graph/coarse.rs's
+/// graph/store.rs) and reused across every request regardless of the
+/// caller's walk tolerance, so it has to be wide enough to cover the
+/// widest `max_walk_distance_m` any caller could reasonably send — this
+/// stays comfortably above that ceiling. The actual per-request limit is
+/// applied later, in seed_bfs.rs's `walk_closure`, against each edge's
+/// real `distance_m` using the caller's own `max_walk_distance_m`
+/// directly — no derivation, no speed math. Used to be the effective
+/// cutoff itself (450m) before that per-request filter existed, which
+/// meant a journey needing a wider transfer than 450m was structurally
+/// unreachable no matter the caller's tolerance — see graph/coarse.rs's
 /// GRID_CELL_DEG constant, replaced by a `grid_cell_deg()` function that
 /// derives from this value, so raising this doesn't silently break the
-/// neighbor scan.
+/// neighbor scan. If the front end is ever allowed to send a
+/// `max_walk_distance_m` larger than this, raise this constant to match —
+/// otherwise those requests silently get capped back down to whatever the
+/// graph actually has edges for, with no error.
 pub const WALK_EDGE_THRESHOLD_M: f64 = 2_500.0;
 
 /// Cache-key granularity for the per-request max walk distance (see
 /// corridor/resolver.rs's `cache_key`). Bucketing avoids a fresh
-/// corridor/BFS cache entry for every tiny float difference in walking
-/// speed while still giving genuinely different walking abilities (e.g. a
-/// wheelchair user vs. a fast walker) their own correctly-filtered
-/// candidate set.
+/// corridor/BFS cache entry for every tiny float difference in the
+/// caller's walk tolerance while still giving genuinely different walk
+/// abilities (e.g. a wheelchair user vs. a fast runner) their own
+/// correctly-filtered candidate set.
 pub const WALK_DISTANCE_CACHE_BUCKET_M: f64 = 250.0;
 
 pub fn bucket_walk_distance_m(m: f64) -> i64 {
     ((m / WALK_DISTANCE_CACHE_BUCKET_M).round() as i64) * WALK_DISTANCE_CACHE_BUCKET_M as i64
 }
 
+/// Fallback `max_walk_distance_m` for callers that don't supply one (see
+/// `RaptorOptions::default`) — a "typical pedestrian" 20-minute walk at
+/// 1.4 m/s. Not used once a real caller value is threaded in; every
+/// production caller should be supplying `max_walk_distance_m` directly
+/// rather than relying on this.
+pub const DEFAULT_MAX_WALK_DISTANCE_M: f64 = 1.4 * MAX_TRANSFER_WALK_SEC;
+
 
 // ── Corridor tagging (corridor/tagging.rs) ──────────────────────────────
-pub const ORIGIN_DEST_WALK_RADIUS_M: f64 = 900.0;
+// (ORIGIN_DEST_WALK_RADIUS_M removed — walk_radius_stop_pks now takes the
+// caller's max_walk_distance_m directly, see module header comment.)
 
 /// Replaces the old geometric CORRIDOR_STOP_PROXIMITY_FILTER (taper-buffer
 /// distance-to-segment math against seed-path polylines). The corridor
@@ -254,19 +278,19 @@ pub const FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC: i64 = 20 * 60;
 pub const FREQ_GRAPH_MAX_ROUNDS: u32 = 6;
 
 // ── rank_meets real-time scoring (seed_bfs.rs) ───────────────────────────
-/// Fixed walking speed used ONLY for scoring the origin/destination "last
-/// mile" leg in rank_meets's real-time score — deliberately NOT the
-/// caller's actual per-search `walking_speed_mps` (RaptorOptions'). Two
-/// reasons: (1) `SeedBfsCache`/`CorridorCache` are keyed independent of
-/// walking speed — if ranking depended on the real per-search value, every
-/// distinct walking speed would need its own cache entry for what's
-/// otherwise the same corridor; (2) this score only needs to be
-/// DIRECTIONALLY better than straight-line distance, not exactly correct —
-/// it's picking which candidates are even worth materializing, not
-/// producing a rider-facing duration. Same 1.4 m/s as RaptorOptions'
-/// own Default (raptor.rs) — not a coincidence, just reusing the same
-/// "typical pedestrian" baseline for consistency.
-pub const RANK_MEETS_WALKING_SPEED_MPS: f64 = 1.4;
+/// rank_meets's real-time score for the origin/destination "last mile" leg
+/// (real_time_from_root's base case, and its walk-edge branch) uses the
+/// caller's actual per-search `walking_speed_mps` (RaptorOptions'), not a
+/// fixed baseline. This used to be a hardcoded 1.4 m/s specifically to
+/// avoid `SeedBfsCache`/`CorridorCache` needing a cache entry per distinct
+/// walking speed — but both caches are already keyed on
+/// `bucket_walk_distance_m(max_walk_distance_m)` (see `cache_key` in
+/// resolver.rs), and `max_walk_distance_m` is now the caller's own direct,
+/// independent input (see module header above) rather than derived from
+/// speed — so a runner and a walker already land in different cache
+/// buckets whenever they supply different `max_walk_distance_m` values,
+/// same as before. Single on-device caller (no cross-request contention),
+/// so the extra bucket spread this can add is not a concern here.
 
 /// Margin applied when `materialize_seed_paths` selects which meeting
 /// nodes in a `batch_size`-capped slice actually get backtracked into
@@ -397,6 +421,3 @@ pub fn level_cap_for(max_transfers: u32) -> u32 {
     max_transfers.max(1) + 1
 }
 
-pub fn transfer_radius_m(walking_speed_mps: f64) -> f64 {
-    walking_speed_mps * MAX_TRANSFER_WALK_SEC
-}

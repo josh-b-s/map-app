@@ -432,6 +432,7 @@ impl GtfsRouterEngine {
         tomorrow_date: String,
         tomorrow_dow: u8,
         walking_speed_mps: f64,
+        max_walk_distance_m: f64,
         debug: Option<Arc<dyn DebugSink>>,
     ) -> Result<RouteResult, RouterError> {
         let conn_guard = self.conn.lock().unwrap();
@@ -450,7 +451,7 @@ impl GtfsRouterEngine {
             &mut corridor_cache, &mut bfs_cache,
             &self.active_services_cache,
             origin_ll, dest_ll, depart_sec_of_day as i64,
-            &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, None,
+            &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, max_walk_distance_m, None,
         )?;
 
         if index.no_service_found {
@@ -489,7 +490,7 @@ impl GtfsRouterEngine {
                     &mut corridor_cache, &mut bfs_cache,
                     &self.active_services_cache,
                     origin_ll, dest_ll, depart_sec_of_day as i64,
-                    &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, Some(10 * 3600),
+                    &today_date, today_dow, &tomorrow_date, tomorrow_dow, walking_speed_mps, max_walk_distance_m, Some(10 * 3600),
                 )?;
                 if index.no_service_found { return Err(RouterError::NoServiceFound); }
                 let t_retry = Instant::now();

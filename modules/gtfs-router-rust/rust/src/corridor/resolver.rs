@@ -15,8 +15,8 @@ use crate::repo::{get_pattern_stops_for_patterns, get_route_ids_for_stops, neare
 use crate::corridor::tagging::{compute_seed_path_corridor, CorridorBoundary, CorridorCandidate};
 use crate::corridor::seed_bfs::{run_seed_bfs, SearchDir, SeedBfsRun};
 use crate::settings::{
-    bucket_walk_distance_m, transfer_radius_m, MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_SEED_STOPS,
-    ORIGIN_DEST_WALK_RADIUS_M, SEED_RADIUS_M, STOP_SEQUENCE_MARGIN,
+    bucket_walk_distance_m, MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_SEED_STOPS,
+    STOP_SEQUENCE_MARGIN,
 };
 
 pub struct ResolvedCorridor {
@@ -138,7 +138,7 @@ impl SeedBfsCache {
     }
 }
 
-/// Selects BFS seed stops within SEED_RADIUS_M of `center`, skipping a stop
+/// Selects BFS seed stops within `max_walk_distance_m` of `center`, skipping a stop
 /// if every route serving it is already covered by a closer seed already
 /// picked, so the seed budget goes toward genuinely different lines. Falls
 /// back to the nearest MIN_SEED_STOPS (dedup still applied) if the radius
@@ -158,8 +158,9 @@ fn nearest_for_seed(
     stops: &StopsCache,
     center: LatLon,
     patterns: &PatternsCache,
+    max_walk_distance_m: f64,
 ) -> rusqlite::Result<Vec<i64>> {
-    let mut radius_m = SEED_RADIUS_M;
+    let mut radius_m = max_walk_distance_m;
     let mut candidate_pks: Vec<i64> = Vec::new();
     loop {
         let (min_lat, max_lat, min_lon, max_lon) = bbox_scaled(center, radius_m, COORD_SCALE);
@@ -182,7 +183,7 @@ fn nearest_for_seed(
     };
     ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-    let mut within_radius: Vec<(&StopRow, f64)> = ranked.iter().filter(|(_, d)| *d <= SEED_RADIUS_M).cloned().collect();
+    let mut within_radius: Vec<(&StopRow, f64)> = ranked.iter().filter(|(_, d)| *d <= max_walk_distance_m).cloned().collect();
     if within_radius.len() < MIN_SEED_STOPS {
         within_radius = ranked.iter().take(MIN_SEED_STOPS).cloned().collect();
     }
@@ -219,7 +220,7 @@ fn nearest_for_seed(
     Ok(selected.into_iter().map(|s| s.stop_pk).collect())
 }
 
-/// Candidate stops within `ORIGIN_DEST_WALK_RADIUS_M` of `center`, via a
+/// Candidate stops within the caller's `max_walk_distance_m` of `center`, via a
 /// single stops_rtree bbox query rather than scanning every stop in the
 /// network. Unlike `nearest_for_seed`, there's no progressive widening or
 /// MIN-count floor here: a bbox with genuinely zero stops within walking
@@ -231,8 +232,9 @@ fn walk_radius_candidates(
     conn: &Connection,
     stops: &StopsCache,
     center: LatLon,
+    max_walk_distance_m: f64,
 ) -> rusqlite::Result<Vec<CorridorCandidate>> {
-    let (min_lat, max_lat, min_lon, max_lon) = bbox_scaled(center, ORIGIN_DEST_WALK_RADIUS_M, COORD_SCALE);
+    let (min_lat, max_lat, min_lon, max_lon) = bbox_scaled(center, max_walk_distance_m, COORD_SCALE);
     let pks = nearest_stop_pks_in_bbox(conn, min_lat, max_lat, min_lon, max_lon)?;
     Ok(pks.iter()
         .filter_map(|&pk| stops.get(pk))
@@ -303,14 +305,13 @@ pub fn resolve_corridor(
     cumulative: &PatternCumulativeCache,
     headway: &PatternHeadwayCache,
     walking_speed_mps: f64,
+    max_walk_distance_m: f64,
 ) -> rusqlite::Result<Arc<ResolvedCorridor>> {
-    // Real, caller-speed-scaled transfer/walk-edge distance — see
-    // transfer_radius_m's doc and WALK_EDGE_THRESHOLD_M's updated one.
-    // Baked into the cache key (bucketed) so a materially different
-    // walking ability gets its own correctly-filtered corridor instead of
-    // silently reusing whichever speed happened to populate the cache
-    // first.
-    let max_walk_distance_m = transfer_radius_m(walking_speed_mps);
+    // Universal, caller-supplied max walk distance — see settings.rs
+    // module header. Baked into the cache key (bucketed) so a materially
+    // different walk tolerance gets its own correctly-filtered corridor
+    // instead of silently reusing whichever value happened to populate the
+    // cache first.
     let bfs_key = cache_key(origin, destination, MAX_TRANSFERS, max_walk_distance_m);
     let key = format!("{bfs_key}|batch={batch_size}");
     if let Some(cached) = cache.get(&key) {
@@ -325,7 +326,7 @@ pub fn resolve_corridor(
     // stop can appear in both the origin and destination box (e.g. a short
     // trip), so dedupe by stop_pk.
     let mut candidates_by_pk: HashMap<i64, CorridorCandidate> = HashMap::new();
-    for c in walk_radius_candidates(conn, stops, origin)?.into_iter().chain(walk_radius_candidates(conn, stops, destination)?) {
+    for c in walk_radius_candidates(conn, stops, origin, max_walk_distance_m)?.into_iter().chain(walk_radius_candidates(conn, stops, destination, max_walk_distance_m)?) {
         candidates_by_pk.entry(c.stop_pk).or_insert(c);
     }
     let candidates: Vec<CorridorCandidate> = candidates_by_pk.into_values().collect();
@@ -335,8 +336,8 @@ pub fn resolve_corridor(
     // Sequential, not concurrent — mirrors the TS version's own note about
     // a single shared SQLite connection; here it's simply because rusqlite
     // Connection isn't Sync-shareable without its own locking anyway.
-    let origin_seed_pks = nearest_for_seed(conn, stops, origin, patterns)?;
-    let dest_seed_pks = nearest_for_seed(conn, stops, destination, patterns)?;
+    let origin_seed_pks = nearest_for_seed(conn, stops, origin, patterns, max_walk_distance_m)?;
+    let dest_seed_pks = nearest_for_seed(conn, stops, destination, patterns, max_walk_distance_m)?;
     sub_timings.push(("nearest_for_seed_x2".to_string(), t.elapsed().as_millis() as i64));
 
     // BFS itself — cached WITHOUT batch_size (see SeedBfsCache doc), so a
@@ -348,7 +349,7 @@ pub fn resolve_corridor(
     let run: Arc<SeedBfsRun> = if let Some(hit) = bfs_cache.get(&bfs_key) {
         hit
     } else {
-        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative, headway, max_walk_distance_m));
+        let run = Arc::new(run_seed_bfs(graph, origin, destination, stops, &origin_seed_pks, &dest_seed_pks, MAX_TRANSFERS, cumulative, headway, max_walk_distance_m, walking_speed_mps));
         bfs_cache.insert(bfs_key.clone(), run.clone());
         run
     };
@@ -360,7 +361,7 @@ pub fn resolve_corridor(
     sub_timings.push(("count.seed_bfs_meets_total".to_string(), run.ordered_meets.len() as i64));
 
     let t = Instant::now();
-    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway, walking_speed_mps)?;
+    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway, walking_speed_mps, max_walk_distance_m)?;
     // Only sum entries that are actually milliseconds — every "count."-
     // prefixed entry in seed_corridor.sub_timings is a raw count (paths,
     // stops, whatever), not a duration, and summing those in here is what

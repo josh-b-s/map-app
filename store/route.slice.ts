@@ -27,7 +27,10 @@ export const computeRoute = createAsyncThunk<
 >('route/compute', async ({ origin, destination, debugMode = false, departureTime, walkingSpeedMps }, { rejectWithValue, dispatch }) => {
     try {
         const result = USE_NATIVE_ROUTER
-            ? await computeGtfsRouteNative(origin, destination, departureTime, walkingSpeedMps, debugMode)
+            // maxWalkDistanceM (undefined -> computeGtfsRouteNative's own
+            // hardcoded default) not yet exposed on this thunk's args — see
+            // TODO in gtfsRouterNative.ts.
+            ? await computeGtfsRouteNative(origin, destination, departureTime, walkingSpeedMps, undefined, debugMode)
             : await computeGtfsRoute(origin, destination, departureTime, walkingSpeedMps, debugMode);
         // Dispatched here (inside the thunk) rather than via route.slice's own
         // extraReducers, since debug data belongs in debug.slice, not route
