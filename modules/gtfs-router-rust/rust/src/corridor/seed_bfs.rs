@@ -52,7 +52,7 @@ use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
-    SEED_PATH_MARGIN_REFERENCE_PERCENTILE, percentile,
+    MAX_SEED_CANDIDATE_PATHS, EXPAND_THROUGH_TOUCHED_NODES, USE_EDGE_CORRIDOR,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
@@ -198,6 +198,80 @@ pub struct SeedBfsRun {
     /// without the caller having to re-thread them through separately.
     pub(crate) origin_point: LatLon,
     pub(crate) destination_point: LatLon,
+    /// Structural corridor over ALL graph edges within the level budget —
+    /// see `compute_edge_corridor`. Cached with the run.
+    pub edge_corridor: EdgeCorridor,
+}
+
+/// Every edge (transit or walk) that could lie on a route within
+/// `first_meet + SAFETY_MARGIN_LEVELS` transit hops, independent of which
+/// whole paths happened to be enumerated/scored/capped.
+#[derive(Default, Clone)]
+pub struct EdgeCorridor {
+    /// pattern_pk -> (best slack over qualifying edges, qualifying-edge count,
+    /// endpoints of those edges). Slack = extra transit levels beyond the
+    /// first meet (0 = as few rides as the best route).
+    pub patterns: FxHashMap<i64, (u32, u32, Vec<i64>)>,
+    /// Endpoints of qualifying WALK edges (both directions).
+    pub walk_stop_pks: FxHashSet<i64>,
+    pub edges_checked: usize,
+    pub edges_kept: usize,
+    pub elapsed_ms: i64,
+}
+
+fn compute_edge_corridor(
+    graph: &CoarseGraph,
+    level_of_fwd: &FxHashMap<i64, u32>,
+    level_of_bwd: &FxHashMap<i64, u32>,
+    first_meet: i64,
+    limit: i64,
+    max_walk_distance_m: f64,
+) -> EdgeCorridor {
+    let t = Instant::now();
+    let mut out = EdgeCorridor::default();
+    // A side that never reached a node has, by BFS, a level strictly above
+    // everything it did reach: use that as the (optimistic) lower bound.
+    let fwd_unreached = level_of_fwd.values().copied().max().unwrap_or(0) as i64 + 1;
+    let bwd_unreached = level_of_bwd.values().copied().max().unwrap_or(0) as i64 + 1;
+
+    let tails = level_of_fwd.keys().copied()
+        .chain(level_of_bwd.keys().copied().filter(|k| !level_of_fwd.contains_key(k)));
+    for u in tails {
+        let Some(edges) = graph.adjacency.get(&u) else { continue };
+        let a = level_of_fwd.get(&u).map(|&l| l as i64).unwrap_or(fwd_unreached);
+        for e in edges {
+            let hop: i64 = match e.kind {
+                EdgeKind::Transit => 1,
+                EdgeKind::Walk => {
+                    if e.distance_m > max_walk_distance_m { continue; }
+                    0
+                }
+            };
+            out.edges_checked += 1;
+            let b = level_of_bwd.get(&e.to).map(|&l| l as i64).unwrap_or(bwd_unreached);
+            let total = a + hop + b;
+            if total > limit { continue; }
+            out.edges_kept += 1;
+            let slack = (total - first_meet).max(0) as u32;
+            match e.kind {
+                EdgeKind::Walk => {
+                    out.walk_stop_pks.insert(u);
+                    out.walk_stop_pks.insert(e.to);
+                }
+                EdgeKind::Transit => {
+                    if let Some(p) = e.via_pattern {
+                        let entry = out.patterns.entry(p).or_insert((slack, 0, Vec::new()));
+                        entry.0 = entry.0.min(slack);
+                        entry.1 += 1;
+                        entry.2.push(u);
+                        entry.2.push(e.to);
+                    }
+                }
+            }
+        }
+    }
+    out.elapsed_ms = t.elapsed().as_millis() as i64;
+    out
 }
 
 /// Union of every ancestor of every node in `starts`, walked through
@@ -908,11 +982,14 @@ pub fn run_seed_bfs(
             // unaffected. walk_closure/note_meets above still ran on the
             // full boardable set — this only trims what goes on to board a
             // real line.
-            let expandable: FxHashSet<i64> = boardable.iter()
-                .filter(|k| !level_of_bwd.contains_key(k))
-                .copied()
-                .collect();
-            let next = transit_hop_forward(graph, &expandable, &mut level_of_fwd, &mut parents_of_fwd, level_fwd);
+            let filtered: FxHashSet<i64>;
+            let expandable: &FxHashSet<i64> = if EXPAND_THROUGH_TOUCHED_NODES {
+                &boardable
+            } else {
+                filtered = boardable.iter().filter(|k| !level_of_bwd.contains_key(k)).copied().collect();
+                &filtered
+            };
+            let next = transit_hop_forward(graph, expandable, &mut level_of_fwd, &mut parents_of_fwd, level_fwd);
             note_meets(&next, &level_of_fwd, &level_of_bwd, &mut meeting_nodes, &mut first_meet_total_level);
 
             level_fwd += 1;
@@ -923,11 +1000,14 @@ pub fn run_seed_bfs(
             note_meets(&boardable, &level_of_bwd, &level_of_fwd, &mut meeting_nodes, &mut first_meet_total_level);
 
             // Mirror of the forward-side skip above.
-            let expandable: FxHashSet<i64> = boardable.iter()
-                .filter(|k| !level_of_fwd.contains_key(k))
-                .copied()
-                .collect();
-            let next = transit_hop_backward(graph, &expandable, &mut level_of_bwd, &mut parents_of_bwd, level_bwd);
+            let filtered: FxHashSet<i64>;
+            let expandable: &FxHashSet<i64> = if EXPAND_THROUGH_TOUCHED_NODES {
+                &boardable
+            } else {
+                filtered = boardable.iter().filter(|k| !level_of_fwd.contains_key(k)).copied().collect();
+                &filtered
+            };
+            let next = transit_hop_backward(graph, expandable, &mut level_of_bwd, &mut parents_of_bwd, level_bwd);
             note_meets(&next, &level_of_bwd, &level_of_fwd, &mut meeting_nodes, &mut first_meet_total_level);
 
             level_bwd += 1;
@@ -949,10 +1029,17 @@ pub fn run_seed_bfs(
             bucket_sizes_before: Vec::new(),
             origin_point: origin,
             destination_point: destination,
+            edge_corridor: EdgeCorridor::default(),
         };
     }
 
     let max_collect_combined_level = first_meet_total_level + SAFETY_MARGIN_LEVELS as i64;
+
+    let edge_corridor = if USE_EDGE_CORRIDOR {
+        compute_edge_corridor(graph, &level_of_fwd, &level_of_bwd, first_meet_total_level, max_collect_combined_level, max_walk_distance_m)
+    } else {
+        EdgeCorridor::default()
+    };
 
     let mut ordered_meets: Vec<(i64, u32)> = meeting_nodes.into_iter()
         .filter(|&(_, combined)| combined as i64 <= max_collect_combined_level)
@@ -977,6 +1064,7 @@ pub fn run_seed_bfs(
         bucket_sizes_before,
         origin_point: origin,
         destination_point: destination,
+        edge_corridor,
     }
 }
 
@@ -1268,71 +1356,48 @@ pub fn materialize_seed_paths(
     let assemble_ms = t_assemble.elapsed().as_millis() as i64;
 
     let path_count_before_margin = paths.len();
-    if ENABLE_SEED_PATH_MARGIN {
-        // Global margin filter by whole-trip estimated duration — same
-        // max(FLOOR, ref*PCT) shape as every other margin filter in this
-        // crate (see margin_threshold's doc), applied here to whole
-        // ASSEMBLED PATHS rather than individual meeting nodes. This is
-        // the real selection mechanism in this mode — the per-meet
-        // margin/top-K filter above is bypassed entirely when
-        // ENABLE_SEED_PATH_MARGIN is on, so every meet's paths reach this
-        // point and get judged on their own real assembled-path score,
-        // not on whichever meet happened to produce them.
-        //
-        // The margin is measured from SEED_PATH_MARGIN_REFERENCE_PERCENTILE
-        // of the scored candidates, not the single fastest one — see that
-        // constant's doc for why anchoring on the best score (a sample of
-        // one, itself just an average-headway estimate) is too fragile a
-        // cutoff for deciding which candidates the verifier ever gets to
-        // try.
-        let reference_score = percentile(&path_scores, SEED_PATH_MARGIN_REFERENCE_PERCENTILE);
-        if reference_score < f64::MAX {
-            // No margin on top: keep exactly the fastest
-            // SEED_PATH_MARGIN_REFERENCE_PERCENTILE (25%) of scored paths.
-            let threshold = reference_score;
-            // Same fail-open reasoning as every other f64::MAX sentinel in
-            // this file: a path that couldn't be scored gets kept, not
-            // silently dropped, since "couldn't score it" isn't evidence
-            // it's a bad path.
-            let mut order: Vec<usize> = (0..paths.len())
-                .filter(|&i| path_scores[i] <= threshold || path_scores[i] >= f64::MAX)
-                .collect();
-            order.sort_by(|&a, &b| path_scores[a].partial_cmp(&path_scores[b]).unwrap_or(std::cmp::Ordering::Equal));
-            paths = order.iter().map(|&i| paths[i].clone()).collect();
-            path_pattern_pks = order.iter().map(|&i| path_pattern_pks[i].clone()).collect();
-            path_depths = order.iter().map(|&i| path_depths[i]).collect();
-            path_scores = order.iter().map(|&i| path_scores[i]).collect();
-            path_edges = order.iter().map(|&i| path_edges[i].clone()).collect();
-            path_sig = order.iter().map(|&i| path_sig[i].clone()).collect();
-        }
-        // best_score >= f64::MAX means nothing here was scoreable at all —
-        // same fail-open reasoning, keep everything rather than filter
-        // against a threshold that can't mean anything.
-    }
-
-    // ── Per-pattern-sequence cap ─────────────────────────────────────────
-    // Runs AFTER the top-25% score filter above so that filter still ranks
-    // the full deduped field. Keeps the best few distinct-stop paths per
-    // ordered pattern sequence (a few alternative transfer/boarding stops
-    // survive; platform fanout doesn't).
-    let count_after_margin = paths.len();
-    if MAX_PATHS_PER_PATTERN_SEQUENCE > 0 && !paths.is_empty() {
+    // ── Candidate selection ──────────────────────────────────────────────
+    // 1. Per-pattern-sequence cap: best few distinct-stop paths per ordered
+    //    pattern sequence, so near-duplicates (platform fanout) don't eat
+    //    the top-N slots below. Also leaves everything sorted best-score
+    //    first (unscoreable f64::MAX sentinels last).
+    let count_before_cap = paths.len();
+    {
         let mut order: Vec<usize> = (0..paths.len()).collect();
         order.sort_by(|&a, &b| path_scores[a].partial_cmp(&path_scores[b]).unwrap_or(std::cmp::Ordering::Equal));
-        let mut per_sig: FxHashMap<&Vec<i64>, usize> = FxHashMap::default();
         let mut keep: Vec<usize> = Vec::with_capacity(order.len());
-        for &i in &order {
-            let c = per_sig.entry(&path_sig[i]).or_insert(0);
-            if *c < MAX_PATHS_PER_PATTERN_SEQUENCE { *c += 1; keep.push(i); }
+        if MAX_PATHS_PER_PATTERN_SEQUENCE > 0 {
+            let mut per_sig: FxHashMap<&Vec<i64>, usize> = FxHashMap::default();
+            for &i in &order {
+                let c = per_sig.entry(&path_sig[i]).or_insert(0);
+                if *c < MAX_PATHS_PER_PATTERN_SEQUENCE { *c += 1; keep.push(i); }
+            }
+        } else {
+            keep = order;
         }
-        drop(per_sig);
         paths = keep.iter().map(|&i| paths[i].clone()).collect();
         path_pattern_pks = keep.iter().map(|&i| path_pattern_pks[i].clone()).collect();
         path_depths = keep.iter().map(|&i| path_depths[i]).collect();
         path_scores = keep.iter().map(|&i| path_scores[i]).collect();
         path_edges = keep.iter().map(|&i| path_edges[i].clone()).collect();
     }
-    let dropped_by_cap = (count_after_margin - paths.len()) as i64;
+    let dropped_by_cap = (count_before_cap - paths.len()) as i64;
+
+    // 2. Top-N by estimated whole-trip duration. The list is already
+    //    deduplicated (variants merged, platform fanout capped), so the N
+    //    best distinct candidates comfortably cover the good options
+    //    without a percentile of a field whose size varies wildly per
+    //    search. Unscoreable paths sort last, so they only survive if there
+    //    are fewer than N scoreable ones (same fail-open as before).
+    let count_before_topn = paths.len();
+    if ENABLE_SEED_PATH_MARGIN && MAX_SEED_CANDIDATE_PATHS > 0 && paths.len() > MAX_SEED_CANDIDATE_PATHS {
+        paths.truncate(MAX_SEED_CANDIDATE_PATHS);
+        path_pattern_pks.truncate(MAX_SEED_CANDIDATE_PATHS);
+        path_depths.truncate(MAX_SEED_CANDIDATE_PATHS);
+        path_scores.truncate(MAX_SEED_CANDIDATE_PATHS);
+        path_edges.truncate(MAX_SEED_CANDIDATE_PATHS);
+    }
+    let dropped_by_topn = (count_before_topn - paths.len()) as i64;
 
     let stats: Vec<(String, i64)> = vec![
         ("count.paths_combos_examined".to_string(), combos_examined),
@@ -1342,6 +1407,7 @@ pub fn materialize_seed_paths(
         ("count.paths_variant_rescored".to_string(), variant_rescored),
         ("count.paths_skipped_sig_fanout".to_string(), skipped_sig_fanout),
         ("count.paths_dropped_by_sig_cap".to_string(), dropped_by_cap),
+        ("count.paths_dropped_by_topn".to_string(), dropped_by_topn),
         ("count.paths_final".to_string(), paths.len() as i64),
         ("ms.paths_backtrack".to_string(), (t_backtrack_us / 1000) as i64),
         ("ms.paths_score".to_string(), (t_score_us / 1000) as i64),
@@ -1384,4 +1450,105 @@ pub fn find_seed_paths(
 ) -> SeedPathResult {
     let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway, max_walk_distance_m, walking_speed_mps);
     materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops, walking_speed_mps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::coarse::{CoarseEdge, CoarseGraph, EdgeKind};
+    use crate::repo::StopRow;
+    use std::collections::HashMap;
+
+    fn stop(pk: i64, lat: f64, lon: f64) -> StopRow {
+        StopRow { stop_pk: pk, stop_id: pk.to_string(), stop_name: format!("s{pk}"), stop_lat: lat, stop_lon: lon, agency: 1 }
+    }
+    fn transit(to: i64, pattern: i64) -> CoarseEdge {
+        CoarseEdge { to, kind: EdgeKind::Transit, cost: 1.0, distance_m: 0.0, via_pattern: Some(pattern) }
+    }
+
+    /// Destination sits within walking distance of A (line L1) and B (line
+    /// L2). L1 and L2 only meet at T, far from the destination, so the
+    /// 2-ride journey S0 -L1-> T -L2-> B exists alongside the direct
+    /// 1-ride S0 -L1-> A. The direct meet must not stop the BFS from also
+    /// finding the through-T alternative (it's within SAFETY_MARGIN_LEVELS).
+    #[test]
+    fn alternative_through_a_touched_node_is_found() {
+        let (s0, t, a, b, o2, o2n, o3, o3n) = (1, 2, 3, 4, 5, 6, 7, 8);
+        let stops = StopsCache::for_test(vec![
+            stop(s0, 0.000, 0.000), stop(t, 0.010, 0.000), stop(a, 0.020, 0.000), stop(b, 0.020, 0.020),
+            stop(o2, 0.000, 0.030), stop(o2n, 0.000, 0.040), stop(o3, 0.000, 0.050), stop(o3n, 0.000, 0.060),
+        ]);
+        let mut adj: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        adj.insert(s0, vec![transit(t, 10), transit(a, 10)]);
+        adj.insert(t, vec![transit(a, 10), transit(b, 20)]);
+        adj.insert(o2, vec![transit(o2n, 30)]);
+        adj.insert(o3, vec![transit(o3n, 40)]);
+        let graph = CoarseGraph::new(adj);
+
+        // Extra origin stops on unrelated lines make the forward frontier
+        // larger than the backward one, so the backward side expands first
+        // and reaches S0 before the forward side has expanded from it.
+        let run = run_seed_bfs(
+            &graph,
+            LatLon { lat: 0.0, lon: 0.0 },
+            LatLon { lat: 0.02, lon: 0.01 },
+            &stops,
+            &[s0, o2, o3],
+            &[a, b],
+            5,
+            &PatternCumulativeCache::empty_for_test(),
+            &PatternHeadwayCache::empty_for_test(),
+            1000.0,
+            1.3,
+        );
+        let res = materialize_seed_paths(
+            &run, 50,
+            &PatternCumulativeCache::empty_for_test(),
+            &PatternHeadwayCache::empty_for_test(),
+            &stops, 1.3,
+        );
+        let has_direct = res.paths.iter().any(|p| p == &vec![s0, a]);
+        let has_via_t = res.paths.iter().any(|p| p == &vec![s0, t, b]);
+        assert!(has_direct, "direct 1-ride path missing: {:?}", res.paths);
+        assert!(has_via_t, "S0 -L1-> T -L2-> B alternative missing: {:?}", res.paths);
+    }
+
+    /// X and Y are 1.4 km apart (inside the max walk distance) AND a short
+    /// bus runs X -> Y. The BFS records only the walk (free, and Y keeps its
+    /// first-discovered level), so the bus pattern is on no seed path. The
+    /// edge corridor must still surface it so the final search can choose
+    /// the ride when it beats the walk on time.
+    #[test]
+    fn optional_ride_between_walkable_stops_is_in_edge_corridor() {
+        let (x, y) = (1, 2);
+        let stops = StopsCache::for_test(vec![stop(x, 0.0, 0.0), stop(y, 0.0, 0.0126)]);
+        let walk = |to: i64| CoarseEdge { to, kind: EdgeKind::Walk, cost: 0.5, distance_m: 1400.0, via_pattern: None };
+        let mut adj: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        adj.insert(x, vec![walk(y), transit(y, 50)]);
+        adj.insert(y, vec![walk(x)]);
+        let graph = CoarseGraph::new(adj);
+
+        let run = run_seed_bfs(
+            &graph,
+            LatLon { lat: 0.0, lon: 0.0 },
+            LatLon { lat: 0.0, lon: 0.0126 },
+            &stops, &[x], &[y], 5,
+            &PatternCumulativeCache::empty_for_test(),
+            &PatternHeadwayCache::empty_for_test(),
+            2000.0, 1.3,
+        );
+        let res = materialize_seed_paths(
+            &run, 50,
+            &PatternCumulativeCache::empty_for_test(),
+            &PatternHeadwayCache::empty_for_test(),
+            &stops, 1.3,
+        );
+        let on_a_path = res.path_pattern_pks.iter().any(|p| p.contains(&50));
+        assert!(!on_a_path, "premise changed: bus pattern is now on a seed path");
+        assert!(
+            run.edge_corridor.patterns.contains_key(&50),
+            "short optional ride X->Y missing from edge corridor: {:?}",
+            run.edge_corridor.patterns.keys().collect::<Vec<_>>()
+        );
+    }
 }

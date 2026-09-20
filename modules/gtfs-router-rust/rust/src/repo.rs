@@ -552,3 +552,22 @@ pub fn get_shape_points(
     }
     Ok(result)
 }
+
+#[cfg(test)]
+impl StopsCache {
+    pub fn for_test(rows: Vec<StopRow>) -> Self {
+        let max = rows.iter().map(|r| r.stop_pk).max().unwrap_or(0) as usize;
+        let mut by_pk: Vec<Option<StopRow>> = (0..=max).map(|_| None).collect();
+        let count = rows.len();
+        for r in rows { let i = r.stop_pk as usize; by_pk[i] = Some(r); }
+        StopsCache { by_pk, count }
+    }
+}
+#[cfg(test)]
+impl PatternCumulativeCache {
+    pub fn empty_for_test() -> Self { PatternCumulativeCache { by_pattern_stop: HashMap::new() } }
+}
+#[cfg(test)]
+impl PatternHeadwayCache {
+    pub fn empty_for_test() -> Self { PatternHeadwayCache { by_pattern: HashMap::new() } }
+}

@@ -674,14 +674,12 @@ impl GtfsRouterEngine {
         // have missed the true best journey outright (wrong pattern
         // excluded), not just returned a slower one.
         {
-            // Same cutoff seed_bfs.rs's path filter uses: the fastest 25% of scored paths, no margin.
-            let threshold = settings::percentile(&index.seed_path_scores, settings::SEED_PATH_MARGIN_REFERENCE_PERCENTILE);
-            if threshold < f64::MAX {
+            // index.seed_path_* is already the FINAL kept candidate set
+            // (deduped, capped, top-N), so its pattern union is exactly
+            // the pattern set the loader narrowed to.
+            {
                 let mut kept_patterns: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                for (i, pats) in index.seed_path_pattern_pks.iter().enumerate() {
-                    let s = index.seed_path_scores.get(i).copied().unwrap_or(f64::MAX);
-                    if s <= threshold || s >= f64::MAX { kept_patterns.extend(pats.iter().copied()); }
-                }
+                for pats in index.seed_path_pattern_pks.iter() { kept_patterns.extend(pats.iter().copied()); }
                 // One aggregate entry, not one per journey — was pushing a
                 // separate identically-labeled TimingEntry per journey
                 // (17 journeys => 17 duplicate "...missing_patterns=Nms"

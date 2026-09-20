@@ -59,7 +59,7 @@ use crate::settings::{
     INITIAL_WINDOW_MAX_SEC, INITIAL_WINDOW_MIN_SEC, WINDOW_BOARD_BUFFER_SEC,
     WINDOW_DISTANCE_BUFFER_SEC, WINDOW_DISTANCE_SCALE_SEC_PER_KM, WINDOW_WIDENING_STAGES_SEC,
     ENABLE_DURATION_BASED_WINDOW, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT,
-    DURATION_WINDOW_MAX_SEC, WINDOW_DURATION_REFERENCE_PERCENTILE, margin_threshold, percentile,
+    DURATION_WINDOW_MAX_SEC, margin_threshold,
 };
 
 const DOW_COLUMNS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -372,6 +372,12 @@ pub fn load_gtfs_index_for_trip(
             // with debug_seed_paths.
             let mut pattern_pks: HashSet<i64> = HashSet::new();
             for pats in &resolved.seed_path_pattern_pks { pattern_pks.extend(pats.iter().copied()); }
+            // Plus the edge-based corridor's patterns (structural, not tied to
+            // which whole paths survived scoring/caps) — e.g. an optional short
+            // ride between two stops that are also within walking distance.
+            let before_edge = pattern_pks.len();
+            pattern_pks.extend(resolved.edge_corridor_pattern_pks.iter().copied());
+            timings.push(("count.edge_corridor_patterns_added".to_string(), (pattern_pks.len() - before_edge) as i64));
             // Deliberately NOT narrowed to the literal stops in the
             // margin-kept `paths` — those are a handful of discrete
             // backtracked stop SEQUENCES, not every stop the surviving
@@ -582,8 +588,13 @@ pub fn load_gtfs_index_for_trip(
     // estimate). Falls back to the distance heuristic only when no
     // duration estimate is available at all.
     let duration_based_window_sec: Option<f64> = if ENABLE_DURATION_BASED_WINDOW {
-        let ref_score = percentile(&resolved.seed_path_scores, WINDOW_DURATION_REFERENCE_PERCENTILE);
-        if ref_score < f64::MAX {
+        // Reference = the SLOWEST scoreable kept candidate (unscoreable
+        // f64::MAX sentinels ignored), so the window is wide enough for
+        // every candidate the search may still use; margin added on top.
+        let ref_score = resolved.seed_path_scores.iter().copied()
+            .filter(|&s| s < f64::MAX)
+            .fold(f64::MIN, f64::max);
+        if ref_score > f64::MIN {
             let margin = margin_threshold(ref_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
             Some((ref_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC))
         } else {

@@ -186,9 +186,6 @@ pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 /// can only help query latency relative to today's behavior, never
 /// regress a query the estimate doesn't cover.
 pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
-/// Percentile of the seed-path scores used as the window's reference duration
-/// (0.25 = the 25th-percentile / "top 25% fastest" path, not the single best).
-pub const WINDOW_DURATION_REFERENCE_PERCENTILE: f64 = 0.25;
 pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
 pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.5;
 /// Separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC — that one
@@ -354,6 +351,46 @@ pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 /// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 
+/// Edge-based corridor (seed_bfs.rs `compute_edge_corridor`). After the
+/// bidirectional BFS, ANY graph edge u->v (transit or walk) is kept when
+/// `fwd_level(u) + hop + bwd_level(v) <= first_meet + SAFETY_MARGIN_LEVELS`
+/// (hop = 1 for a ride, 0 for a walk; a side that hasn't reached a node
+/// contributes its exhausted-frontier lower bound). Its patterns are then
+/// loaded alongside the kept seed paths' patterns. This is what lets an
+/// optional short ride between two stops that are ALSO within walking
+/// distance survive: the BFS only records the walk (walking is free, and a
+/// stop keeps its first-discovered level), so the ride's pattern was never on
+/// any path and never loaded. It also covers alternative transfer points and
+/// touched-node alternatives with one rule instead of special cases.
+pub const USE_EDGE_CORRIDOR: bool = true;
+
+/// Upper bound on patterns added by the edge corridor (ranked by best
+/// slack, then by how many qualifying edges use the pattern). Bounds the
+/// extra timetable rows fetched; the kept seed paths' own patterns are
+/// always loaded on top of this.
+pub const MAX_EDGE_CORRIDOR_EXTRA_PATTERNS: usize = 300;
+
+/// When one BFS side reaches a stop the OTHER side has already reached (a
+/// "touched" stop), should it still expand transit hops from it?
+///  - true  = yes. The touched stop is one meeting point, but a different
+///            line boarded there can still lead to a valid alternative
+///            within SAFETY_MARGIN_LEVELS (e.g. destination near two
+///            stations on two lines that only interchange far away: the
+///            direct line meets first, but "ride L1 to the interchange,
+///            switch to L2" starts at the very stop that was touched).
+///  - false = old behaviour: touched stops were treated as finished,
+///            which silently dropped those alternatives (see the
+///            `alternative_through_a_touched_node_is_found` test).
+/// The loop's total-level bound (first meet + margin) still limits cost.
+pub const EXPAND_THROUGH_TOUCHED_NODES: bool = true;
+
+/// How many of the best (lowest estimated whole-trip duration) candidate
+/// seed paths survive selection. Applied AFTER dedup and the per-sequence
+/// cap, so these are N genuinely distinct candidates. 0 = keep all.
+/// (The timetable window is sized from the SLOWEST of these — see
+/// loader.rs — so this also bounds how wide that window gets.)
+pub const MAX_SEED_CANDIDATE_PATHS: usize = 50;
+
 /// Final search step over the loaded GtfsIndex:
 ///  - true  = RAPTOR (raptor.rs) explores every trip/transfer combination
 ///            inside the loaded corridor + window, so it finds the real
@@ -398,7 +435,6 @@ pub const MAX_ASSEMBLED_PER_PATTERN_SEQUENCE: usize = 16;
 /// candidate whose average-case estimate happened to look unrealistically
 /// good, while still only drawing the line among the genuinely fast
 /// candidates rather than the whole field.
-pub const SEED_PATH_MARGIN_REFERENCE_PERCENTILE: f64 = 0.25;
 
 // ── RAPTOR round tuning ──────────────────────────────────────────────────
 pub const MAX_ROUNDS: u32 = 5;
