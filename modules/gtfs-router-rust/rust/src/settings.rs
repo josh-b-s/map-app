@@ -354,6 +354,16 @@ pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 /// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 
+/// Max journeys handed across the FFI bridge to JS. The verifier can
+/// verify hundreds of candidate paths; only the Pareto-optimal ones
+/// (arrival / walking / transfers) are worth shipping, and each carries
+/// full polylines that JS then stores and renders.
+pub const MAX_RETURNED_JOURNEYS: usize = 8;
+
+/// Douglas-Peucker tolerance (metres) applied to every returned polyline.
+/// GTFS shapes are often far denser than a phone map can show.
+pub const RETURNED_POLYLINE_TOLERANCE_M: f64 = 8.0;
+
 /// Max distinct-stop candidate paths kept per ORDERED pattern sequence,
 /// after the top-25% score filter (best-scoring kept). Bounds the
 /// walk-closure platform fanout (several boardable stops of one line at the

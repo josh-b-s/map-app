@@ -38,7 +38,8 @@
 import {getDb, isDbReady, DB_PATH} from '../../db/sqliteDb';
 import {getAllStopsCached} from '../core/gtfsRepo';
 import {getCoarseGraph} from '../graph/topologyGraph';
-import {getNativeEngine} from '../router/gtfsRouterNative'; // TODO: verify this path — I'm guessing it lives next to raptorRouter.ts based on the README's file map, adjust to wherever you actually put it
+import {getNativeEngine} from '../router/gtfsRouterNative';
+import {USE_NATIVE_ROUTER} from '../router/routerConfig'; // TODO: verify this path — I'm guessing it lives next to raptorRouter.ts based on the README's file map, adjust to wherever you actually put it
 
 let warmedUp = false;
 
@@ -59,20 +60,20 @@ export async function warmUpGtfsEngine(): Promise<void> {
     }
 
     try {
-        const db = await getDb();
-
-        // Same cached function gtfsLoader.ts calls internally — populates
-        // its module-level stopsCache, not just SQLite's own page cache.
-        const stops = await getAllStopsCached(db);
-        console.log(`[gtfsWarmup] stops cached (${stops.length} rows): ${Date.now() - t0}ms`);
-
-        // The big one: loads (or builds, on a genuinely first-ever run)
-        // the 2M-edge coarse graph and caches it in-memory for the process
-        // lifetime — this is the ~2.1-5s cost seen in profiling. Its own
-        // in-memory `cache`/`buildPromise` guards mean this is a true no-op
-        // for every subsequent call this session, same as stopsCache above.
-        await getCoarseGraph();
-        console.log(`[gtfsWarmup] coarseGraph warmed: ${Date.now() - t0}ms total`);
+        // The TS router's caches (stops table + the 1.16M-edge coarse graph,
+        // ~7-10s and ~136MB of JS heap, all on the JS thread) are ONLY used
+        // by the legacy TS router (gtfsLoader / corridorTagging) and the
+        // debug "compare routers" button. The Rust engine builds and holds
+        // its own graph, so when it's the active router this is pure waste
+        // at launch. Both caches are promise-guarded and lazy, so the
+        // compare button still works — it just pays the cold cost on demand.
+        if (!USE_NATIVE_ROUTER) {
+            const db = await getDb();
+            const stops = await getAllStopsCached(db);
+            console.log(`[gtfsWarmup] stops cached (${stops.length} rows): ${Date.now() - t0}ms`);
+            await getCoarseGraph();
+            console.log(`[gtfsWarmup] coarseGraph warmed: ${Date.now() - t0}ms total`);
+        }
 
         // Rust engine's own warm_up(): opens ITS OWN rusqlite::Connection
         // against the same on-disk file (DB_PATH) — this is not sharing

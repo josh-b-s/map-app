@@ -4,12 +4,11 @@ import { computeGtfsRoute, GtfsRouteResult, GtfsJourney } from '@/services/gtfs/
 import { computeGtfsRouteNative } from '@/services/gtfs/router/gtfsRouterNative';
 import { setDebugData } from './debug.slice';
 import { publishDebugData } from '@/services/gtfs/debug/debugDataStore';
+import { USE_NATIVE_ROUTER } from '@/services/gtfs/router/routerConfig';
 
-// Flip to compare the Rust engine against the existing TS/op-sqlite path —
-// both are called with the exact same args and return the exact same
-// GtfsRouteResult/GtfsJourney shape, so nothing downstream needs to change
-// either way.
-const USE_NATIVE_ROUTER = true;
+// Flip USE_NATIVE_ROUTER (routerConfig.ts) to compare the Rust engine
+// against the existing TS/op-sqlite path — both are called with the exact
+// same args and return the exact same GtfsRouteResult/GtfsJourney shape.
 
 export const computeRoute = createAsyncThunk<
     GtfsRouteResult,
@@ -57,78 +56,21 @@ type State = {
     journeys: GtfsJourney[];
     selectedJourneyIndex: number;
 
-    // The CURRENTLY DISPLAYED journey's fields, flattened for convenience —
-    // this is what the map (index.tsx) reads. Kept in sync with
-    // journeys[selectedJourneyIndex] whenever journeys change or a different
-    // journey is selected, so index.tsx needs no changes.
-    coords: LatLng[];
-    segments: GtfsJourney['segments'];
-    legs: GtfsJourney['legs'];
-    routeName?: string;
-    routeType?: number;
-    routeColor?: string;
-    routeTextColor?: string;
-    originStopName?: string;
-    destStopName?: string;
-    transferStopName?: string;
-    totalDurationMin?: number;
-    totalWalkingMeters?: number;
-    transferCount?: number;
-    departureTime?: string;
-    arrivalTime?: string;
+    // NOTE: the displayed journey is NOT copied into flat state fields any
+    // more (that held every polyline twice in the store, and Immer froze /
+    // RTK's dev middleware walked both copies). Read it with the
+    // `selectDisplayedJourney` selector below — journeys[selectedJourneyIndex].
 
     loading: boolean;
     error?: string | null;
 };
 
-const emptyDisplayFields = {
-    coords: [] as LatLng[],
-    segments: [] as GtfsJourney['segments'],
-    legs: [] as GtfsJourney['legs'],
-    routeName: undefined,
-    routeType: undefined,
-    routeColor: undefined,
-    routeTextColor: undefined,
-    originStopName: undefined,
-    destStopName: undefined,
-    transferStopName: undefined,
-    totalDurationMin: undefined,
-    totalWalkingMeters: undefined,
-    transferCount: undefined,
-    departureTime: undefined,
-    arrivalTime: undefined,
-};
-
 const initialState: State = {
     journeys: [],
     selectedJourneyIndex: 0,
-    ...emptyDisplayFields,
     loading: false,
     error: null,
 };
-
-/** Copies a journey's fields into the flat "currently displayed" state slots. */
-function applyJourneyToState(state: State, journey: GtfsJourney | undefined) {
-    if (!journey) {
-        Object.assign(state, emptyDisplayFields);
-        return;
-    }
-    state.coords = journey.coords;
-    state.segments = journey.segments;
-    state.legs = journey.legs;
-    state.routeName = journey.routeName;
-    state.routeType = journey.routeType;
-    state.routeColor = journey.routeColor;
-    state.routeTextColor = journey.routeTextColor;
-    state.originStopName = journey.originStopName;
-    state.destStopName = journey.destStopName;
-    state.transferStopName = journey.transferStopName;
-    state.totalDurationMin = journey.totalDurationMin;
-    state.totalWalkingMeters = journey.totalWalkingMeters;
-    state.transferCount = journey.transferCount;
-    state.departureTime = journey.departureTime;
-    state.arrivalTime = journey.arrivalTime;
-}
 
 const slice = createSlice({
     name: 'route',
@@ -138,7 +80,6 @@ const slice = createSlice({
         setRoute(state, action: PayloadAction<GtfsRouteResult>) {
             state.journeys = action.payload.journeys;
             state.selectedJourneyIndex = 0;
-            applyJourneyToState(state, action.payload.journeys[0]);
             state.loading = false;
             state.error = null;
         },
@@ -148,12 +89,10 @@ const slice = createSlice({
             const idx = action.payload;
             if (idx < 0 || idx >= state.journeys.length) return;
             state.selectedJourneyIndex = idx;
-            applyJourneyToState(state, state.journeys[idx]);
         },
         clearRoute(state) {
             state.journeys = [];
             state.selectedJourneyIndex = 0;
-            Object.assign(state, emptyDisplayFields);
             state.error = null;
         },
     },
@@ -167,7 +106,6 @@ const slice = createSlice({
                 s.loading = false;
                 s.journeys = a.payload.journeys;
                 s.selectedJourneyIndex = 0;
-                applyJourneyToState(s, a.payload.journeys[0]);
             })
             .addCase(computeRoute.rejected, (s, a) => {
                 s.loading = false;
@@ -177,4 +115,9 @@ const slice = createSlice({
 });
 
 export const { setRoute, selectJourney, clearRoute } = slice.actions;
+
+/** The journey currently shown on the map (reference-stable: it's the same
+ *  object stored in `journeys`, so useSelector doesn't re-render on it). */
+export const selectDisplayedJourney = (s: { route: State }): GtfsJourney | undefined =>
+    s.route.journeys[s.route.selectedJourneyIndex];
 export default slice.reducer;

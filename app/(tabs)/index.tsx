@@ -14,7 +14,11 @@ import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 import DebugMapOverlay from '@/components/DebugMapOverlay';
 import DebugControls from '@/components/DebugControls';
 import {MAP_STYLE_DARK} from '@/constants/themes';
+import {selectDisplayedJourney} from '@/store/route.slice';
 import {useGoToUserLocation} from '../../hooks/goToUserLocation';
+
+const EMPTY_COORDS: LatLng[] = [];
+const EMPTY_SEGMENTS: NonNullable<ReturnType<typeof selectDisplayedJourney>>['segments'] = [];
 
 export default function Index() {
     const mapRef = useRef<MapView>(null);
@@ -23,9 +27,12 @@ export default function Index() {
     const {colorScheme} = useColorScheme();
 
     const userLocation = useSelector((s: RootState) => s.location.userLocation);
-    const routeCoords = useSelector((s: RootState) => s.route.coords);
-    const routeSegments = useSelector((s: RootState) => s.route.segments);
-    const routeColor = useSelector((s: RootState) => s.route.routeColor);
+    const displayedJourney = useSelector(selectDisplayedJourney);
+    // Module-level empties keep these reference-stable when there's no
+    // journey (the fit-to-route effect depends on routeCoords' identity).
+    const routeCoords = displayedJourney?.coords ?? EMPTY_COORDS;
+    const routeSegments = displayedJourney?.segments ?? EMPTY_SEGMENTS;
+    const routeColor = displayedJourney?.routeColor;
     const routeLoading = useSelector((s: RootState) => s.route.loading);
     const selectedPlace = useSelector((s: RootState) => s.search.selected);
     const debugEnabled = useSelector((s: RootState) => s.debug.enabled);

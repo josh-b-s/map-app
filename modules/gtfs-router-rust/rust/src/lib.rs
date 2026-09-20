@@ -626,9 +626,19 @@ impl GtfsRouterEngine {
         // but it's the same "cheap because it's only the handful of
         // patterns THIS journey set rides, not the whole feed" shape as the
         // debug version — see resolve_journey_shapes below.
+        // Trim to the Pareto-optimal handful BEFORE the expensive work:
+        // shape loading (SQL rows for every shape those journeys ride),
+        // polyline building, and the FFI/JS cost of everything returned.
+        // Previously EVERY verified candidate went through all of that.
+        let journeys_verified = journeys.len() as i64;
+        let t_select = Instant::now();
+        let mut journeys = select_journeys(journeys);
+        let select_ms = t_select.elapsed().as_millis() as i64;
+        let journeys_returned = journeys.len() as i64;
+
         let t_shape_resolve = Instant::now();
-        let mut journeys = journeys;
         resolve_journey_shapes(&mut journeys, conn, &state.patterns, &state.shapes_index);
+        simplify_journey_polylines(&mut journeys);
         let shape_resolve_ms = t_shape_resolve.elapsed().as_millis() as i64;
 
         let mut timings: Vec<TimingEntry> = index.timings.iter()
@@ -637,6 +647,9 @@ impl GtfsRouterEngine {
         timings.push(TimingEntry { label: "raptor_search".to_string(), ms: raptor_ms });
         timings.push(TimingEntry { label: "debug_emit".to_string(), ms: debug_emit_ms });
         timings.push(TimingEntry { label: "journey_shape_resolve".to_string(), ms: shape_resolve_ms });
+        timings.push(TimingEntry { label: "count.journeys_verified".to_string(), ms: journeys_verified });
+        timings.push(TimingEntry { label: "count.journeys_returned".to_string(), ms: journeys_returned });
+        timings.push(TimingEntry { label: "journey_select".to_string(), ms: select_ms });
         // count.forced_wide_window_retry=1 means the narrow, distance-based
         // first attempt found NO route at all (raptor::run_search's own
         // Err — empty candidate set, not just an empty window) and this
@@ -693,6 +706,107 @@ impl GtfsRouterEngine {
     }
 }
 
+/// Journeys worth showing: drops duplicate routes, keeps only the
+/// Pareto-optimal set over (arrival minute, walking in 100 m buckets,
+/// transfers), always including the best journey per criterion (fastest /
+/// least walking / fewest transfers — the three UI tabs), then fills up to
+/// MAX_RETURNED_JOURNEYS in arrival order. Result is sorted by arrival.
+fn select_journeys(mut journeys: Vec<raptor::Journey>) -> Vec<raptor::Journey> {
+    journeys.sort_by_key(|j| j.arrival_time_sec);
+
+    // Identical leg sequences (same routes between the same stops) are the
+    // same journey to the user.
+    let mut seen: std::collections::HashSet<Vec<(String, String, String)>> = std::collections::HashSet::new();
+    journeys.retain(|j| seen.insert(
+        j.legs.iter().map(|l| (l.route_name.clone(), l.origin_stop_name.clone(), l.dest_stop_name.clone())).collect()
+    ));
+
+    let key = |j: &raptor::Journey| (j.arrival_time_sec / 60, j.total_walking_meters / 100, j.transfer_count);
+    let keys: Vec<(i64, i64, i64)> = journeys.iter().map(key).collect();
+    let dominates = |a: &(i64, i64, i64), b: &(i64, i64, i64)| {
+        a.0 <= b.0 && a.1 <= b.1 && a.2 <= b.2 && (a.0 < b.0 || a.1 < b.1 || a.2 < b.2)
+    };
+    let mut pareto: Vec<usize> = (0..journeys.len())
+        .filter(|&i| !(0..journeys.len()).any(|k| k != i && dominates(&keys[k], &keys[i])))
+        .collect();
+    pareto.sort_by_key(|&i| journeys[i].arrival_time_sec);
+
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut pick = |i: Option<usize>| { if let Some(i) = i { if !chosen.contains(&i) { chosen.push(i); } } };
+    pick(pareto.iter().copied().min_by_key(|&i| (journeys[i].arrival_time_sec, journeys[i].total_walking_meters)));
+    pick(pareto.iter().copied().min_by_key(|&i| (journeys[i].total_walking_meters, journeys[i].arrival_time_sec)));
+    pick(pareto.iter().copied().min_by_key(|&i| (journeys[i].transfer_count, journeys[i].arrival_time_sec)));
+    for &i in &pareto {
+        if chosen.len() >= settings::MAX_RETURNED_JOURNEYS { break; }
+        if !chosen.contains(&i) { chosen.push(i); }
+    }
+    chosen.sort_by_key(|&i| journeys[i].arrival_time_sec);
+
+    let mut slots: Vec<Option<raptor::Journey>> = journeys.into_iter().map(Some).collect();
+    chosen.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// Douglas-Peucker in a local equirectangular metre frame. Keeps both
+/// endpoints; `tol_m` is the max perpendicular deviation allowed.
+fn simplify_polyline(pts: &[geo::LatLon], tol_m: f64) -> Vec<geo::LatLon> {
+    let n = pts.len();
+    if n <= 2 { return pts.to_vec(); }
+    let kx = 111_320.0 * pts[0].lat.to_radians().cos();
+    let ky = 110_540.0;
+    let xy: Vec<(f64, f64)> = pts.iter().map(|p| (p.lon * kx, p.lat * ky)).collect();
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 { continue; }
+        let (ax, ay) = xy[a];
+        let (bx, by) = xy[b];
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let mut best = 0.0f64;
+        let mut idx = a;
+        for i in (a + 1)..b {
+            let (px, py) = xy[i];
+            let d = if len2 == 0.0 {
+                ((px - ax).powi(2) + (py - ay).powi(2)).sqrt()
+            } else {
+                let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+                ((px - (ax + t * dx)).powi(2) + (py - (ay + t * dy)).powi(2)).sqrt()
+            };
+            if d > best { best = d; idx = i; }
+        }
+        if best > tol_m {
+            keep[idx] = true;
+            stack.push((a, idx));
+            stack.push((idx, b));
+        }
+    }
+    pts.iter().zip(keep).filter_map(|(p, k)| if k { Some(p.clone()) } else { None }).collect()
+}
+
+/// Simplifies every returned segment polyline, then rebuilds each
+/// journey's whole-route `coords` from them so the two stay consistent.
+fn simplify_journey_polylines(journeys: &mut [raptor::Journey]) {
+    for j in journeys.iter_mut() {
+        for seg in j.segments.iter_mut() {
+            if seg.coords.len() > 2 {
+                seg.coords = simplify_polyline(&seg.coords, settings::RETURNED_POLYLINE_TOLERANCE_M);
+            }
+        }
+        let mut coords: Vec<geo::LatLon> = Vec::new();
+        for seg in &j.segments {
+            match (coords.last(), seg.coords.first()) {
+                (Some(a), Some(b)) if (a.lat - b.lat).abs() < 1e-9 && (a.lon - b.lon).abs() < 1e-9 => {
+                    coords.extend(seg.coords.iter().skip(1).cloned());
+                }
+                _ => coords.extend(seg.coords.iter().cloned()),
+            }
+        }
+        if !coords.is_empty() { j.coords = coords; }
+    }
+}
+
 /// Nearest point in `shape` (by index) to `target` — used to project a stop
 /// onto its pattern's GTFS shape polyline so a seed-path edge can be
 /// trimmed to the real ridden portion instead of drawn as a straight line.
@@ -721,21 +835,75 @@ fn shaped_edge_coords(
     patterns: &repo::PatternsCache,
     shape_points: &HashMap<(i64, String), Vec<(f64, f64)>>,
 ) -> Vec<LatLng> {
-    let straight = vec![from_ll, to_ll];
-    let Some(meta) = patterns.get(pattern_pk) else { return straight };
-    let Some(shape_id) = &meta.shape_id else { return straight };
-    let Some(shape) = shape_points.get(&(meta.agency, shape_id.clone())) else { return straight };
-    if shape.len() < 2 { return straight; }
+    shaped_edge_coords_checked(from_ll, to_ll, pattern_pk, patterns, shape_points)
+        .unwrap_or_else(|| vec![from_ll, to_ll])
+}
 
-    let from_ll_geo = geo::LatLon { lat: from_ll.latitude, lon: from_ll.longitude };
-    let to_ll_geo = geo::LatLon { lat: to_ll.latitude, lon: to_ll.longitude };
-    let (Some(i0), Some(i1)) = (nearest_shape_index(shape, from_ll_geo), nearest_shape_index(shape, to_ll_geo)) else { return straight };
-    if i0 == i1 { return straight; }
+/// Direction-aware projection of `from`/`to` onto a shape: picks
+/// (i0, i1) with i0 < i1 minimizing dist(from, shape[i0]) + dist(to,
+/// shape[i1]). Plain "nearest point to each end" is wrong for shapes that
+/// loop or run out-and-back (both stops can sit near BOTH ends of the
+/// shape), and would return the whole shape as the "ridden" slice. GTFS
+/// shapes follow trip direction, so restricting to i0 < i1 fixes that.
+fn project_forward(shape: &[(f64, f64)], from: geo::LatLon, to: geo::LatLon) -> Option<(usize, usize)> {
+    let mut best_i0 = 0usize;
+    let mut best_d0 = f64::MAX;
+    let mut best: Option<(f64, usize, usize)> = None;
+    for (j, &(lat, lon)) in shape.iter().enumerate() {
+        let p = geo::LatLon { lat, lon };
+        let d0 = haversine_meters(from, p);
+        if d0 < best_d0 { best_d0 = d0; best_i0 = j; }
+        let cost = best_d0 + haversine_meters(to, p);
+        if best.map_or(true, |(c, _, _)| cost < c) { best = Some((cost, best_i0, j)); }
+    }
+    best.and_then(|(_, i0, i1)| if i1 > i0 { Some((i0, i1)) } else { None })
+}
+
+/// Like `shaped_edge_coords` but returns None (instead of a straight line)
+/// when there's no usable shape OR the trimmed slice is implausibly long
+/// for the hop (a wrong/looping shape, e.g. a slice hundreds of km long
+/// for a 10 km bus hop). Callers that already hold real geometry
+/// (resolve_journey_shapes: the pattern's own stop-to-stop polyline) keep
+/// it on None rather than overwriting it with a straight line.
+fn shaped_edge_coords_checked(
+    from_ll: LatLng,
+    to_ll: LatLng,
+    pattern_pk: i64,
+    patterns: &repo::PatternsCache,
+    shape_points: &HashMap<(i64, String), Vec<(f64, f64)>>,
+) -> Option<Vec<LatLng>> {
+    let meta = patterns.get(pattern_pk)?;
+    let shape_id = meta.shape_id.as_ref()?;
+    let shape = shape_points.get(&(meta.agency, shape_id.clone()))?;
+    if shape.len() < 2 { return None; }
+
+    let from_geo = geo::LatLon { lat: from_ll.latitude, lon: from_ll.longitude };
+    let to_geo = geo::LatLon { lat: to_ll.latitude, lon: to_ll.longitude };
+    let (i0, i1) = match project_forward(shape, from_geo, to_geo) {
+        Some(pair) => pair,
+        None => {
+            let a = nearest_shape_index(shape, from_geo)?;
+            let b = nearest_shape_index(shape, to_geo)?;
+            if a == b { return None; }
+            (a, b)
+        }
+    };
 
     let (lo, hi) = (i0.min(i1), i0.max(i1));
     let mut slice: Vec<LatLng> = shape[lo..=hi].iter().map(|&(lat, lon)| LatLng { latitude: lat, longitude: lon }).collect();
-    if i0 > i1 { slice.reverse(); } // keep from->to direction regardless of the shape's own point order
-    slice
+    if i0 > i1 { slice.reverse(); }
+
+    // Sanity: a real ridden slice is a small multiple of the straight-line
+    // distance between the two stops.
+    let straight = haversine_meters(from_geo, to_geo);
+    let slice_len: f64 = slice.windows(2)
+        .map(|w| haversine_meters(
+            geo::LatLon { lat: w[0].latitude, lon: w[0].longitude },
+            geo::LatLon { lat: w[1].latitude, lon: w[1].longitude },
+        ))
+        .sum();
+    if slice_len > straight * 4.0 + 1500.0 { return None; }
+    Some(slice)
 }
 
 /// Replaces each transit segment's straight stop-to-stop `coords` with the
@@ -780,9 +948,12 @@ fn resolve_journey_shapes(
             if seg.coords.len() < 2 { continue };
             let from_ll: LatLng = (*seg.coords.first().unwrap()).into();
             let to_ll: LatLng = (*seg.coords.last().unwrap()).into();
-            let shaped = shaped_edge_coords(from_ll, to_ll, pk, patterns, &shape_points);
-            if shaped.len() >= 2 {
-                seg.coords = shaped.into_iter().map(geo::LatLon::from).collect();
+            // None => no usable/plausible shape: KEEP the segment's existing
+            // stop-to-stop polyline rather than overwriting it.
+            if let Some(shaped) = shaped_edge_coords_checked(from_ll, to_ll, pk, patterns, &shape_points) {
+                if shaped.len() >= 2 {
+                    seg.coords = shaped.into_iter().map(geo::LatLon::from).collect();
+                }
             }
         }
 
