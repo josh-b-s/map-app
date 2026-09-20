@@ -20,6 +20,7 @@ import type {
     WALK_SPEED_MPS,
 } from './raptorRouter';
 import { createDebugSinkCollector } from '../debug/debugSinkCollector';
+import { formatTimings } from './formatTimings';
 import { DB_PATH } from '@/services/db/sqliteDb';
 
 const { GtfsRouterEngine } = gtfsRouterRust.gtfs_router;
@@ -188,10 +189,15 @@ export async function computeGtfsRouteNative(
         // (loader.rs's per-stage Instant timers + compute_route's own
         // raptor_search timer). "total" is loader.rs's load time only;
         // raptor_search is a separate top-level entry, not summed into it.
-        console.log(
-            '[gtfsRouterNative] stage timings: ' +
-            result.timings.map(t => `${t.label}=${t.ms}ms`).join(' | ')
-        );
+        // Logging must never fail a route: fall back to the raw one-line format.
+        try {
+            console.log(formatTimings(result.timings));
+        } catch (logErr) {
+            console.log(
+                '[gtfsRouterNative] stage timings: ' +
+                result.timings.map(t => `${t.label}=${t.ms}`).join(' | ')
+            );
+        }
 
         return {
             journeys: result.journeys.map(toJourney),

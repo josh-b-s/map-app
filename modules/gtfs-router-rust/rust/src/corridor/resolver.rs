@@ -16,7 +16,7 @@ use crate::corridor::tagging::{compute_seed_path_corridor, CorridorBoundary, Cor
 use crate::corridor::seed_bfs::{run_seed_bfs, SearchDir, SeedBfsRun};
 use crate::settings::{
     bucket_walk_distance_m, MAX_RTREE_RADIUS_M, MAX_SEED_STOPS, MAX_TRANSFERS, MIN_SEED_STOPS,
-    STOP_SEQUENCE_MARGIN, MAX_EDGE_CORRIDOR_EXTRA_PATTERNS,
+    STOP_SEQUENCE_MARGIN, EDGE_CORRIDOR_POOL_PATTERNS,
 };
 
 pub struct ResolvedCorridor {
@@ -48,6 +48,14 @@ pub struct ResolvedCorridor {
     /// budget, ranked and capped. Loaded IN ADDITION to the kept seed paths'
     /// patterns (loader.rs unions them).
     pub edge_corridor_pattern_pks: Vec<i64>,
+    /// Board/alight stops per pooled edge-corridor pattern (same keys as
+    /// `edge_corridor_pattern_pks`), so the loader can rebuild the fetch
+    /// stop set for whichever subset of the pool it ends up loading.
+    pub edge_corridor_stops_by_pattern: HashMap<i64, Vec<i64>>,
+    /// Board/alight stops of the SELECTED edge-corridor patterns' qualifying
+    /// edges. The loader always fetches these even when it narrows the
+    /// fetch stops to the loaded patterns' stops.
+    pub edge_corridor_stop_pks: Vec<i64>,
     /// Whole-trip estimated score for the matching entry in
     /// `debug_seed_paths` — see `SeedPathResult::path_scores`.
     pub seed_path_scores: Vec<f64>,
@@ -424,19 +432,24 @@ pub fn resolve_corridor(
         .collect();
     edge_ranked.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
     let edge_total = edge_ranked.len() as i64;
-    edge_ranked.truncate(MAX_EDGE_CORRIDOR_EXTRA_PATTERNS);
+    edge_ranked.truncate(EDGE_CORRIDOR_POOL_PATTERNS);
     let edge_corridor_pattern_pks: Vec<i64> = edge_ranked.iter().map(|&(p, _, _)| p).collect();
+    let mut edge_corridor_stop_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut edge_corridor_stops_by_pattern: HashMap<i64, Vec<i64>> = HashMap::new();
     for &(p, _, _) in &edge_ranked {
         if let Some((_, _, stops_of)) = run.edge_corridor.patterns.get(&p) {
             allowed_stop_pks.extend(stops_of.iter().copied());
+            edge_corridor_stop_set.extend(stops_of.iter().copied());
+            edge_corridor_stops_by_pattern.insert(p, stops_of.iter().copied().collect());
         }
     }
+    let edge_corridor_stop_pks: Vec<i64> = edge_corridor_stop_set.into_iter().collect();
     allowed_stop_pks.extend(run.edge_corridor.walk_stop_pks.iter().copied());
     sub_timings.push(("edge_corridor_compute".to_string(), run.edge_corridor.elapsed_ms));
     sub_timings.push(("count.edge_corridor_edges_checked".to_string(), run.edge_corridor.edges_checked as i64));
     sub_timings.push(("count.edge_corridor_edges_kept".to_string(), run.edge_corridor.edges_kept as i64));
     sub_timings.push(("count.edge_corridor_patterns_total".to_string(), edge_total));
-    sub_timings.push(("count.edge_corridor_patterns_selected".to_string(), edge_corridor_pattern_pks.len() as i64));
+    sub_timings.push(("count.edge_corridor_patterns_pooled".to_string(), edge_corridor_pattern_pks.len() as i64));
 
     let result = ResolvedCorridor {
         pattern_pks: seed_corridor.pattern_pks,
@@ -447,6 +460,8 @@ pub fn resolve_corridor(
         debug_seed_paths: seed_corridor.seed_paths,
         seed_path_pattern_pks: seed_corridor.path_pattern_pks,
         edge_corridor_pattern_pks,
+        edge_corridor_stops_by_pattern,
+        edge_corridor_stop_pks,
         seed_path_scores: seed_corridor.path_scores,
         seed_path_edges: seed_corridor.path_edges,
         debug_seed_path_depths: seed_corridor.path_depths,

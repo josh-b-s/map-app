@@ -297,6 +297,10 @@ pub struct GtfsRouterEngine {
     /// `warm_up` returns; `Mutex` rather than needing `&mut self` since
     /// `warm_up` itself only takes `&self`.
     last_warmup_timings: Mutex<Vec<(String, i64)>>,
+    /// Path of the DB opened by the last warm_up — the background
+    /// timetable prewarm opens its own read-only connection to it.
+    db_path: Mutex<Option<String>>,
+    prewarm_started: std::sync::atomic::AtomicBool,
 }
 
 #[uniffi::export]
@@ -310,7 +314,37 @@ impl GtfsRouterEngine {
             bfs_cache: Mutex::new(corridor::resolver::SeedBfsCache::new()),
             active_services_cache: Mutex::new(None),
             last_warmup_timings: Mutex::new(Vec::new()),
+            db_path: Mutex::new(None),
+            prewarm_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Fire-and-forget: pre-reads the stop_times pages a search departing
+    /// near `depart_sec_of_day` will touch, on a background thread with its
+    /// own read-only connection (WAL readers don't block the search
+    /// connection). Purely warms the OS page cache — the first search after
+    /// launch was ~2.4x slower per fetched row than the second. Call once
+    /// after `warm_up` resolves; repeat calls are no-ops.
+    pub fn prewarm_timetable(&self, depart_sec_of_day: i32) {
+        if !settings::PREWARM_TIMETABLE { return; }
+        let Some(path) = self.db_path.lock().unwrap().clone() else { return };
+        if self.prewarm_started.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+        let lo = (depart_sec_of_day as i64 - settings::WINDOW_BOARD_BUFFER_SEC).max(0);
+        let hi = depart_sec_of_day as i64 + settings::PREWARM_WINDOW_SEC;
+        let _ = std::thread::Builder::new().name("gtfs-router-prewarm".to_string()).spawn(move || {
+            let Ok(conn) = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
+            let _ = conn.execute_batch("PRAGMA mmap_size = 268435456; PRAGMA cache_size = -8192;");
+            // Same access pattern as the real fetch (per-stop seek + time
+            // range), so exactly the pages a search will need get touched.
+            // SUM over a non-key column forces the row payload to be read.
+            let _ = conn.query_row(
+                "SELECT COALESCE(SUM(arrival_sec), 0) FROM stop_times \
+                 WHERE stop_pk IN (SELECT stop_pk FROM stops) \
+                 AND departure_sec BETWEEN ?1 AND ?2",
+                [lo, hi],
+                |r| r.get::<_, i64>(0),
+            );
+        });
     }
 
     /// Stage timings for the most recently completed `warm_up` call —
@@ -355,6 +389,8 @@ impl GtfsRouterEngine {
         }
 
         let t = Instant::now();
+        *self.db_path.lock().unwrap() = Some(db_path.clone());
+        self.prewarm_started.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut conn = Connection::open(&db_path)?;
         mark!(t, "open_connection");
 

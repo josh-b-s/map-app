@@ -187,7 +187,7 @@ pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 /// regress a query the estimate doesn't cover.
 pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
 pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
-pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.5;
+pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.25;
 /// Separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC — that one
 /// was sized for the distance heuristic's much cruder estimate; a
 /// multi-transfer journey's real duration (walk+ride+wait across every
@@ -351,6 +351,31 @@ pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 /// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 
+/// The stop_times fetch does one time-range lookup per corridor stop, and
+/// each lookup reads EVERY trip's departures at that stop before the trip
+/// filter runs. The allowed-stop set used to be the whole corridor (4.5-9.5k
+/// stops) although only ~1.4-4.8k of them ever had a candidate trip. true =
+/// fetch only stops that lie on a loaded (narrowed) pattern, plus the edge
+/// corridor's endpoints.
+pub const NARROW_FETCH_STOPS_TO_PATTERNS: bool = true;
+
+/// After warm-up JS calls `prewarm_timetable(now)`; a background thread
+/// reads the stop_times pages a search near that time will need through its
+/// own read-only connection, so the OS page cache is hot before the first
+/// search (the first search was ~2.4x slower per row than the second).
+pub const PREWARM_TIMETABLE: bool = true;
+/// How far past `now` to pre-read (seconds).
+pub const PREWARM_WINDOW_SEC: i64 = 4 * 3600;
+
+/// Whole-path enumeration (seed_bfs.rs `materialize_seed_paths`) only feeds
+/// the window sizing, the verifier fallback and the debug view now — the
+/// edge corridor + RAPTOR decide what is loaded and searched. Its cost is
+/// meets x (fwd half-paths x bwd half-paths), which exploded (1.1M
+/// combinations / 5 s in one search), so it is bounded to the best meets
+/// (by estimated duration) and a few half-paths per meet. 0 = unbounded.
+pub const MAX_ENUMERATED_MEETS: usize = 40;
+pub const MAX_HALF_PATHS_PER_MEET: usize = 8;
+
 /// Edge-based corridor (seed_bfs.rs `compute_edge_corridor`). After the
 /// bidirectional BFS, ANY graph edge u->v (transit or walk) is kept when
 /// `fwd_level(u) + hop + bwd_level(v) <= first_meet + SAFETY_MARGIN_LEVELS`
@@ -364,11 +389,48 @@ pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 /// touched-node alternatives with one rule instead of special cases.
 pub const USE_EDGE_CORRIDOR: bool = true;
 
-/// Upper bound on patterns added by the edge corridor (ranked by best
+/// Upper bound on edge-corridor patterns actually LOADED (ranked by best
 /// slack, then by how many qualifying edges use the pattern). Bounds the
-/// extra timetable rows fetched; the kept seed paths' own patterns are
-/// always loaded on top of this.
-pub const MAX_EDGE_CORRIDOR_EXTRA_PATTERNS: usize = 300;
+/// extra timetable rows fetched. Applied in loader.rs AFTER the pool below
+/// has been filtered down to patterns that can actually run for this
+/// search, so the slots go to patterns with service instead of being
+/// spent on ones that never run today / in the search window.
+pub const MAX_EDGE_CORRIDOR_EXTRA_PATTERNS: usize = 200;
+
+/// How many top-ranked edge-corridor patterns resolve_corridor hands to the
+/// loader as a candidate pool (the corridor is cached per origin/destination
+/// and is time-independent, so the time/day filtering happens in the loader).
+/// Must be >= MAX_EDGE_CORRIDOR_EXTRA_PATTERNS; the surplus is the headroom
+/// the filters below can refill from.
+pub const EDGE_CORRIDOR_POOL_PATTERNS: usize = 300;
+
+/// true = before applying MAX_EDGE_CORRIDOR_EXTRA_PATTERNS, drop pool
+/// patterns with no active trip today (exact; from the same trips query the
+/// loader already runs) and, if ENABLE_HEADWAY_WINDOW_FILTER, patterns the
+/// import-time pattern_headway table says don't run in the search window.
+/// false = old behaviour (plain top-N by rank).
+pub const FILTER_EDGE_POOL_BY_ACTIVITY: bool = true;
+
+/// Uses pattern_headway's time buckets (night/off-peak/peak) to drop edge
+/// patterns that have rows only in buckets outside the search window. A
+/// pattern with NO headway rows at all is kept (unknown != not running).
+/// Relies on the importer writing a row for every bucket a pattern has at
+/// least one trip in (repo.rs documents NULL headway for <2 trips, i.e. the
+/// row still exists) — switch off if a search ever misses a service you
+/// know runs.
+pub const ENABLE_HEADWAY_WINDOW_FILTER: bool = true;
+
+/// The bucket check looks this far BEFORE the window start too, because a
+/// trip is bucketed at import time (by its start), and may reach the
+/// corridor stops well after it started.
+pub const HEADWAY_WINDOW_LOOKBACK_SEC: i64 = 3 * 3600;
+
+/// After the loaded pattern set is final, fetch stop_times only for stops
+/// served by a loaded pattern that has an active trip today (previously the
+/// stop set was built before the active-trip lookup, so stops of patterns
+/// with no service today still cost a wasted time-range seek each).
+/// Only takes effect together with NARROW_FETCH_STOPS_TO_PATTERNS.
+pub const NARROW_FETCH_STOPS_TO_ACTIVE_PATTERNS: bool = true;
 
 /// When one BFS side reaches a stop the OTHER side has already reached (a
 /// "touched" stop), should it still expand transit hops from it?
@@ -389,7 +451,7 @@ pub const EXPAND_THROUGH_TOUCHED_NODES: bool = true;
 /// cap, so these are N genuinely distinct candidates. 0 = keep all.
 /// (The timetable window is sized from the SLOWEST of these — see
 /// loader.rs — so this also bounds how wide that window gets.)
-pub const MAX_SEED_CANDIDATE_PATHS: usize = 50;
+pub const MAX_SEED_CANDIDATE_PATHS: usize = 30;
 
 /// Final search step over the loaded GtfsIndex:
 ///  - true  = RAPTOR (raptor.rs) explores every trip/transfer combination

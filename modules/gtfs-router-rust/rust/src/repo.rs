@@ -465,6 +465,24 @@ pub struct PatternHeadwayCache {
 }
 
 impl PatternHeadwayCache {
+    /// Does the import-time table say this pattern has service in any time
+    /// bucket touched by [lo_sec, hi_sec] (seconds since midnight; may be
+    /// negative or > 86400)? `None` = no rows at all for the pattern, i.e.
+    /// unknown — callers must fail open, never treat it as "not running".
+    pub fn runs_in_window(&self, pattern_pk: i64, lo_sec: i64, hi_sec: i64) -> Option<bool> {
+        let rows = self.by_pattern.get(&pattern_pk)?;
+        if rows.is_empty() { return None; }
+        // Buckets are whole-hour aligned (see time_bucket_for), so stepping
+        // hourly from the floor of `lo_sec` visits every bucket the window touches.
+        let mut t = lo_sec - lo_sec.rem_euclid(3600);
+        while t <= hi_sec {
+            let b = time_bucket_for(t);
+            if rows.iter().any(|(bucket, _)| *bucket == b) { return Some(true); }
+            t += 3600;
+        }
+        Some(false)
+    }
+
     /// Headway for this pattern in whichever bucket `at_sec` (seconds
     /// since midnight, possibly > 86400 for an after-midnight estimate)
     /// falls into. `None` covers BOTH "no row at all for this
@@ -570,4 +588,41 @@ impl PatternCumulativeCache {
 #[cfg(test)]
 impl PatternHeadwayCache {
     pub fn empty_for_test() -> Self { PatternHeadwayCache { by_pattern: HashMap::new() } }
+}
+
+#[cfg(test)]
+mod headway_window_tests {
+    use super::*;
+
+    fn cache(rows: Vec<(i64, Vec<(i64, Option<i64>)>)>) -> PatternHeadwayCache {
+        PatternHeadwayCache { by_pattern: rows.into_iter().collect() }
+    }
+
+    #[test]
+    fn unknown_pattern_is_none() {
+        let c = cache(vec![]);
+        assert_eq!(c.runs_in_window(1, 9 * 3600, 12 * 3600), None);
+    }
+
+    #[test]
+    fn peak_only_pattern_is_not_in_midday_window() {
+        // bucket 2 = peak (7-9, 15-19). Window 10:00-14:00 touches only off-peak (1).
+        let c = cache(vec![(1, vec![(2, Some(600))])]);
+        assert_eq!(c.runs_in_window(1, 10 * 3600, 14 * 3600), Some(false));
+    }
+
+    #[test]
+    fn window_touching_the_bucket_is_kept() {
+        let c = cache(vec![(1, vec![(2, None)])]); // NULL headway row still counts
+        assert_eq!(c.runs_in_window(1, 13 * 3600, 16 * 3600), Some(true)); // reaches 15:00 peak
+    }
+
+    #[test]
+    fn night_pattern_after_midnight_and_negative_lo() {
+        let c = cache(vec![(1, vec![(0, Some(1800))])]);
+        // 23:30 -> 26:00 (02:00 next day) is night
+        assert_eq!(c.runs_in_window(1, 23 * 3600 + 1800, 26 * 3600), Some(true));
+        // a lookback that goes negative must not panic and must still see night hours
+        assert_eq!(c.runs_in_window(1, -3600, 3600), Some(true));
+    }
 }

@@ -88,8 +88,17 @@ export async function warmUpGtfsEngine(): Promise<void> {
         // it's cheap to skip if unused and keeps this file oblivious to
         // which path route.slice.ts is currently set to.
         try {
-            await getNativeEngine(DB_PATH); // warms up + records warmedUpPath so the first real search's own getEngine(DB_PATH) call is a no-op
+            const nativeEngine = await getNativeEngine(DB_PATH); // warms up + records warmedUpPath so the first real search's own getEngine(DB_PATH) call is a no-op
             console.log(`[gtfsWarmup] native engine warmed: ${Date.now() - t0}ms total`);
+            // Fire-and-forget: a Rust background thread pre-reads the stop_times pages a
+            // search departing about now will need, so the FIRST search isn't a cold-cache
+            // one. Returns immediately; never blocks the JS thread.
+            try {
+                const now = new Date();
+                nativeEngine.prewarmTimetable(now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds());
+            } catch (prewarmErr) {
+                console.warn('[gtfsWarmup] timetable prewarm failed (non-fatal):', prewarmErr);
+            }
         } catch (nativeErr) {
             // Non-fatal on its own — if the native path isn't in use this
             // session, this failing shouldn't affect the TS path at all.

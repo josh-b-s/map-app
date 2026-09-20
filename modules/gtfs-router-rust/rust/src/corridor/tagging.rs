@@ -122,7 +122,7 @@ pub fn compute_seed_path_corridor(
     // by a deep-but-plentiful one (e.g. dozens of bus siblings), rather than
     // only ever seeing the merged total.
     for (depth, &before) in run.bucket_sizes_before.iter().enumerate() {
-        sub_timings.push((format!("seed_bucket{depth}_before"), before as i64));
+        sub_timings.push((format!("count.seed_bucket{depth}_before"), before as i64));
     }
 
     let t = Instant::now();
@@ -137,7 +137,7 @@ pub fn compute_seed_path_corridor(
     sub_timings.push(("count.seed_paths_after_margin".to_string(), seed.paths.len() as i64));
 
     for (depth, &count) in seed.after_counts.iter().enumerate() {
-        sub_timings.push((format!("seed_bucket{depth}_after"), count as i64));
+        sub_timings.push((format!("count.seed_bucket{depth}_after"), count as i64));
     }
 
     if seed.paths.is_empty() {

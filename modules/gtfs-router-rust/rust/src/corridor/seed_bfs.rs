@@ -53,6 +53,7 @@ use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
     MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
     MAX_SEED_CANDIDATE_PATHS, EXPAND_THROUGH_TOUCHED_NODES, USE_EDGE_CORRIDOR,
+    MAX_ENUMERATED_MEETS, MAX_HALF_PATHS_PER_MEET,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
     SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
 };
@@ -1231,6 +1232,16 @@ pub fn materialize_seed_paths(
         core_stop_pks_by_depth.push(this_depth);
     }
 
+    // Bound enumeration to the best meets by estimated duration. core_stop_pks
+    // above still come from ALL meets in `batch`; only path assembly is capped.
+    let meets_available = batch.len() as i64;
+    let mut enum_batch: Vec<(i64, u32)> = batch.to_vec();
+    if MAX_ENUMERATED_MEETS > 0 && enum_batch.len() > MAX_ENUMERATED_MEETS {
+        enum_batch.sort_by_cached_key(|&(node, _)| run.meet_scores.get(&node).copied().unwrap_or(f64::MAX).to_bits());
+        enum_batch.truncate(MAX_ENUMERATED_MEETS);
+    }
+    let half_path_cap = if MAX_HALF_PATHS_PER_MEET > 0 { MAX_HALF_PATHS_PER_MEET } else { MAX_SEED_PATHS };
+
     let t_assemble = Instant::now();
     let mut t_backtrack_us: u128 = 0;
     let mut t_score_us: u128 = 0;
@@ -1253,7 +1264,7 @@ pub fn materialize_seed_paths(
     let mut path_depths: Vec<u32> = Vec::new();
     let mut path_scores: Vec<f64> = Vec::new();
     let mut path_edges: Vec<Vec<Option<i64>>> = Vec::new();
-    for &(m, combined) in batch {
+    for &(m, combined) in &enum_batch {
         let depth = (combined as i64 - run.first_meet_total_level).max(0) as u32;
 
         let t_bt = Instant::now();
@@ -1263,7 +1274,7 @@ pub fn materialize_seed_paths(
             let mut pattern_so_far = Vec::new();
             let mut edges_so_far = Vec::new();
             let mut in_path = FxHashSet::default();
-            backtrack_to_origin(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.origin_set, &run.parents_of_fwd, &mut fwd_paths, MAX_SEED_PATHS);
+            backtrack_to_origin(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.origin_set, &run.parents_of_fwd, &mut fwd_paths, half_path_cap);
         }
         let mut bwd_paths: Vec<HalfPath> = Vec::new();
         {
@@ -1271,7 +1282,7 @@ pub fn materialize_seed_paths(
             let mut pattern_so_far = Vec::new();
             let mut edges_so_far = Vec::new();
             let mut in_path = FxHashSet::default();
-            backtrack_to_dest(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.dest_set, &run.parents_of_bwd, &mut bwd_paths, MAX_SEED_PATHS);
+            backtrack_to_dest(m, &mut path_so_far, &mut pattern_so_far, &mut edges_so_far, &mut in_path, &run.dest_set, &run.parents_of_bwd, &mut bwd_paths, half_path_cap);
         }
         t_backtrack_us += t_bt.elapsed().as_micros();
 
@@ -1400,6 +1411,8 @@ pub fn materialize_seed_paths(
     let dropped_by_topn = (count_before_topn - paths.len()) as i64;
 
     let stats: Vec<(String, i64)> = vec![
+        ("count.paths_meets_available".to_string(), meets_available),
+        ("count.paths_meets_enumerated".to_string(), enum_batch.len() as i64),
         ("count.paths_combos_examined".to_string(), combos_examined),
         ("count.paths_unique_assembled".to_string(), path_count_before_margin as i64),
         ("count.paths_dup_cross_meet".to_string(), dup_cross_meet),
