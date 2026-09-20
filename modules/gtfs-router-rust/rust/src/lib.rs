@@ -564,7 +564,7 @@ impl GtfsRouterEngine {
         // verifier.rs's header for why the old McRAPTOR scan is gone.
         let t_raptor = Instant::now();
         let mut pending_failed_attempt_timings: Vec<TimingEntry> = Vec::new();
-        let result = verifier::verify_seed_paths(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps);
+        let result = search_journeys(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps, max_walk_distance_m);
         let mut raptor_ms = t_raptor.elapsed().as_millis() as i64;
 
         let journeys = match result {
@@ -592,7 +592,7 @@ impl GtfsRouterEngine {
                 )?;
                 if index.no_service_found { return Err(RouterError::NoServiceFound); }
                 let t_retry = Instant::now();
-                let retried = verifier::verify_seed_paths(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps)
+                let retried = search_journeys(&index, &state.stops, origin_ll, dest_ll, depart_sec_of_day as i64, walking_speed_mps, max_walk_distance_m)
                     .map_err(RouterError::NoRoute)?;
                 // Retry's own load + search time gets appended as separate
                 // timing entries below rather than overwriting the first
@@ -704,6 +704,30 @@ impl GtfsRouterEngine {
 
         Ok(RouteResult { journeys: journeys.into_iter().map(journey_to_ffi).collect(), timings })
     }
+}
+
+/// Final search over the loaded index — see settings::USE_RAPTOR_SEARCH.
+/// RAPTOR first (finds the true best journeys within the loaded corridor);
+/// if it errors or finds nothing, fall back to verifying the BFS seed
+/// paths so a RAPTOR-specific gap doesn't turn into a spurious NoRoute.
+fn search_journeys(
+    index: &loader::GtfsIndex,
+    stops: &repo::StopsCache,
+    origin: geo::LatLon,
+    destination: geo::LatLon,
+    depart_sec_of_day: i64,
+    walking_speed_mps: f64,
+    max_walk_distance_m: f64,
+) -> Result<Vec<raptor::Journey>, String> {
+    if settings::USE_RAPTOR_SEARCH {
+        let opts = raptor::RaptorOptions { walking_speed_mps, max_walk_distance_m, max_rounds: settings::MAX_ROUNDS };
+        match raptor::run_search(index, stops, origin, destination, depart_sec_of_day, &opts, None, None) {
+            Ok(j) if !j.is_empty() => return Ok(j),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    verifier::verify_seed_paths(index, stops, origin, destination, depart_sec_of_day, walking_speed_mps)
 }
 
 /// Journeys worth showing: drops duplicate routes, keeps only the

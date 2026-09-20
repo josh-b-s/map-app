@@ -354,6 +354,18 @@ pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 /// constant.
 pub const ENABLE_SEED_PATH_MARGIN: bool = true;
 
+/// Final search step over the loaded GtfsIndex:
+///  - true  = RAPTOR (raptor.rs) explores every trip/transfer combination
+///            inside the loaded corridor + window, so it finds the real
+///            earliest-arrival / Pareto journeys even when the best one
+///            wasn't among the BFS seed paths. verifier.rs is kept as a
+///            fallback if RAPTOR errors or finds nothing.
+///  - false = verifier.rs only: just checks that the BFS seed paths are
+///            boardable (fastest, but can only return what BFS proposed).
+/// Either way the corridor/window loading (seed BFS, top-25% filter)
+/// still decides which patterns and stops are available to the search.
+pub const USE_RAPTOR_SEARCH: bool = true;
+
 /// Max journeys handed across the FFI bridge to JS. The verifier can
 /// verify hundreds of candidate paths; only the Pareto-optimal ones
 /// (arrival / walking / transfers) are worth shipping, and each carries
