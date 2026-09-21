@@ -162,6 +162,42 @@ function formatBlock(entries: NumTiming[]): string[] {
         out.push(...wrapItems(windows.map(w => `${w.label.replace(/^window\./, '').replace(/_sec$/, '')} ${fmtSec(w.ms)}`), '    '));
     }
 
+    // ── corridor strategy comparison (pulled out of counts so it reads as one block) ──
+    const takeCount = (label: string): number | undefined => {
+        const i = counts.findIndex(c => c.label === label);
+        if (i < 0) return undefined;
+        return counts.splice(i, 1)[0].ms;
+    };
+    const tcPatterns = takeCount('count.timecorr_patterns');
+    const tcOnly = takeCount('count.timecorr_only');
+    const edgeOnly = takeCount('count.edgecorr_only');
+    const overlap = takeCount('count.timecorr_edgecorr_overlap');
+    const used = takeCount('count.journey_patterns_used');
+    const missEdge = takeCount('count.journey_patterns_missing_from_seed_plus_edge');
+    const missTime = takeCount('count.journey_patterns_missing_from_seed_plus_time');
+    const missBoth = takeCount('count.journey_patterns_missing_from_both');
+    const tcUnavailable = takeCount('count.timecorr_unavailable');
+    if (tcUnavailable) {
+        out.push(section('time corridor'), '    unavailable (no stops in walking range or destination unreachable in estimate)');
+    } else if (tcPatterns !== undefined) {
+        out.push(section('corridor comparison (patterns)'));
+        out.push(...wrapItems([
+            `time ${fmtInt(tcPatterns)}`,
+            `BFS edge ${fmtInt((edgeOnly ?? 0) + (overlap ?? 0))}`,
+            `overlap ${fmtInt(overlap ?? 0)}`,
+            `time-only ${fmtInt(tcOnly ?? 0)}`,
+            `edge-only ${fmtInt(edgeOnly ?? 0)}`,
+        ], '    '));
+        if (used !== undefined) {
+            out.push(...wrapItems([
+                `journey used ${fmtInt(used)}`,
+                `missing from seed+edge ${fmtInt(missEdge ?? 0)}`,
+                `missing from seed+time ${fmtInt(missTime ?? 0)}`,
+                `missing from both ${fmtInt(missBoth ?? 0)}`,
+            ], '    '));
+        }
+    }
+
     // ── counts, grouped so the corridor funnel reads together ──
     const corridorCounts = counts.filter(c => c.label.startsWith('corridor.count.'));
     const loadCounts = counts.filter(c => !c.label.startsWith('corridor.count.'));

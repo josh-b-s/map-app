@@ -51,7 +51,7 @@
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
     level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
-    MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
+    MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, DEDUP_SEQUENCES_BY_ROUTE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
     MAX_SEED_CANDIDATE_PATHS, EXPAND_THROUGH_TOUCHED_NODES, USE_EDGE_CORRIDOR,
     MAX_ENUMERATED_MEETS, MAX_HALF_PATHS_PER_MEET,
     ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
@@ -60,7 +60,7 @@ use crate::settings::{
 use crate::fxhash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::Hasher;
 use std::time::Instant;
-use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, StopsCache};
+use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternsCache, StopsCache};
 use crate::geo::{haversine_meters, LatLon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +431,80 @@ fn shape_codes<I: Iterator<Item = Option<i64>>>(edges: I) -> impl Iterator<Item 
         prev = e;
         c
     })
+}
+
+// ── Ride-sequence signature ──────────────────────────────────────────────
+// A candidate's "sequence" is the ordered list of lines/patterns ridden, with
+// consecutive hops on the same line collapsed into one ride. It is hashed with
+// a polynomial rolling hash, H(seq) = fold(acc * B + e(x)), which has the
+// property H(f ++ b) = H(f) * B^|b| + H(b): so the sequence hash of a
+// forward-half + backward-half combination is one multiply-add from two
+// per-half values computed ONCE per half path, instead of re-hashing the whole
+// pattern list for each of the (possibly millions of) combinations.
+
+const SIG_BASE: u64 = 0x9E37_79B9_7F4A_7C15; // odd
+
+#[inline]
+fn sig_elem(x: i64) -> u64 {
+    // splitmix64 finalizer
+    let mut z = (x as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn pow_base(n: usize) -> u64 {
+    let mut r = 1u64;
+    let mut b = SIG_BASE;
+    let mut e = n;
+    while e > 0 {
+        if e & 1 == 1 { r = r.wrapping_mul(b); }
+        b = b.wrapping_mul(b);
+        e >>= 1;
+    }
+    r
+}
+
+/// `lines` with consecutive duplicates removed.
+fn collapse_lines(lines: impl Iterator<Item = i64>) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    for l in lines {
+        if out.last() != Some(&l) { out.push(l); }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct SigPart {
+    h_full: u64,
+    /// Hash of the collapsed sequence WITHOUT its first element (used when the
+    /// forward half's last ride is the backward half's first ride).
+    h_tail: u64,
+    first: i64,
+    last: i64,
+    len: usize,
+}
+
+fn sig_part(lines: impl Iterator<Item = i64>) -> SigPart {
+    let c = collapse_lines(lines);
+    let hash = |s: &[i64]| s.iter().fold(0u64, |acc, &x| acc.wrapping_mul(SIG_BASE).wrapping_add(sig_elem(x)));
+    if c.is_empty() {
+        return SigPart { h_full: 0, h_tail: 0, first: i64::MIN, last: i64::MIN, len: 0 };
+    }
+    SigPart { h_full: hash(&c), h_tail: hash(&c[1..]), first: c[0], last: *c.last().unwrap(), len: c.len() }
+}
+
+/// Hash of collapse(f ++ b), without materialising it.
+#[inline]
+fn combine_sig(f: &SigPart, b: &SigPart) -> u64 {
+    if f.len == 0 { return b.h_full; }
+    if b.len == 0 { return f.h_full; }
+    if f.last == b.first {
+        f.h_full.wrapping_mul(pow_base(b.len - 1)).wrapping_add(b.h_tail)
+    } else {
+        f.h_full.wrapping_mul(pow_base(b.len)).wrapping_add(b.h_full)
+    }
 }
 
 fn backtrack_to_origin(
@@ -1093,6 +1167,7 @@ pub fn materialize_seed_paths(
     headway: &PatternHeadwayCache,
     stops: &StopsCache,
     walking_speed_mps: f64,
+    patterns: Option<&PatternsCache>,
 ) -> SeedPathResult {
     if run.ordered_meets.is_empty() {
         return SeedPathResult {
@@ -1264,6 +1339,14 @@ pub fn materialize_seed_paths(
     let mut path_depths: Vec<u32> = Vec::new();
     let mut path_scores: Vec<f64> = Vec::new();
     let mut path_edges: Vec<Vec<Option<i64>>> = Vec::new();
+    // Which "line" a pattern counts as for the sequence caps (see
+    // DEDUP_SEQUENCES_BY_ROUTE): its route when we have pattern metadata, else the pattern itself.
+    let line_of = |p: i64| -> i64 {
+        match patterns {
+            Some(pc) if DEDUP_SEQUENCES_BY_ROUTE => pc.line_key(p),
+            _ => p,
+        }
+    };
     for &(m, combined) in &enum_batch {
         let depth = (combined as i64 - run.first_meet_total_level).max(0) as u32;
 
@@ -1289,9 +1372,25 @@ pub fn materialize_seed_paths(
         if fwd_paths.is_empty() && run.origin_set.contains(&m) { fwd_paths.push((vec![m], vec![], vec![])); }
         if bwd_paths.is_empty() && run.dest_set.contains(&m) { bwd_paths.push((vec![m], vec![], vec![])); }
 
-        for (fp, fpat, fedges) in &fwd_paths {
-            for (bp, bpat, bedges) in &bwd_paths {
+        // Sequence signature of each half, computed once (not once per combination).
+        let fwd_parts: Vec<SigPart> = fwd_paths.iter().map(|(_, fpat, _)| sig_part(fpat.iter().map(|&p| line_of(p)))).collect();
+        let bwd_parts: Vec<SigPart> = bwd_paths.iter().map(|(_, bpat, _)| sig_part(bpat.iter().map(|&p| line_of(p)))).collect();
+
+        for (fi, (fp, fpat, fedges)) in fwd_paths.iter().enumerate() {
+            for (bi, (bp, bpat, bedges)) in bwd_paths.iter().enumerate() {
                 combos_examined += 1;
+
+                // Fanout guard FIRST: a combination whose ride sequence already has
+                // its quota is dropped for one hash lookup, before any stop-list
+                // hashing, dedup lookup, allocation or scoring.
+                let sig_hash = combine_sig(&fwd_parts[fi], &bwd_parts[bi]);
+                if MAX_ASSEMBLED_PER_PATTERN_SEQUENCE > 0
+                    && sig_counts.get(&sig_hash).copied().unwrap_or(0) >= MAX_ASSEMBLED_PER_PATTERN_SEQUENCE
+                {
+                    skipped_sig_fanout += 1;
+                    continue;
+                }
+
                 let stops_iter = move || fp.iter().chain(bp[1..].iter());
                 let edges_iter = move || fedges.iter().chain(bedges.iter()).copied();
 
@@ -1333,30 +1432,22 @@ pub fn materialize_seed_paths(
                     continue;
                 }
 
-                // New stop list. Bound platform fanout BEFORE paying for
-                // allocation + scoring: many stops of one line reachable at
-                // the same level otherwise multiply into near-identical paths.
-                let mut sh = FxHasher::default();
-                for &p in fpat.iter().chain(bpat.iter()) { sh.write_i64(p); }
-                let sig_hash = sh.finish();
-                let sig_count = sig_counts.entry(sig_hash).or_insert(0);
-                if MAX_ASSEMBLED_PER_PATTERN_SEQUENCE > 0 && *sig_count >= MAX_ASSEMBLED_PER_PATTERN_SEQUENCE {
-                    skipped_sig_fanout += 1;
-                    continue;
-                }
-                *sig_count += 1;
+                // New stop list under a sequence that still has room (checked above).
+                *sig_counts.entry(sig_hash).or_insert(0) += 1;
 
                 let full: Vec<i64> = stops_iter().copied().collect();
                 let edges: Vec<Option<i64>> = edges_iter().collect();
                 let mut sig = fpat.clone();
                 sig.extend_from_slice(bpat);
+                // Exact (collapsed, line-level) sequence for the final per-sequence cap.
+                let sig_lines = collapse_lines(fpat.iter().chain(bpat.iter()).map(|&p| line_of(p)));
                 let t_sc = Instant::now();
                 let score = score_seed_path(&full, &edges, run.origin_point, run.destination_point, cumulative, headway, stops, walking_speed_mps);
                 t_score_us += t_sc.elapsed().as_micros();
 
                 by_key.entry(key_hash).or_default().push(paths.len());
                 paths.push(full);
-                path_sig.push(sig.clone());
+                path_sig.push(sig_lines);
                 path_pattern_pks.push(sig);
                 path_depths.push(depth);
                 path_scores.push(score);
@@ -1462,7 +1553,58 @@ pub fn find_seed_paths(
     walking_speed_mps: f64,
 ) -> SeedPathResult {
     let run = run_seed_bfs(graph, origin, destination, stops, origin_pks, dest_pks, max_transfers, cumulative, headway, max_walk_distance_m, walking_speed_mps);
-    materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops, walking_speed_mps)
+    materialize_seed_paths(&run, TOP_N_SEED_MEETS, cumulative, headway, stops, walking_speed_mps, None)
+}
+
+#[cfg(test)]
+mod sig_tests {
+    use super::*;
+
+    fn direct(f: &[i64], b: &[i64]) -> u64 {
+        let c = collapse_lines(f.iter().chain(b.iter()).copied());
+        c.iter().fold(0u64, |acc, &x| acc.wrapping_mul(SIG_BASE).wrapping_add(sig_elem(x)))
+    }
+    fn rolling(f: &[i64], b: &[i64]) -> u64 {
+        combine_sig(&sig_part(f.iter().copied()), &sig_part(b.iter().copied()))
+    }
+
+    #[test]
+    fn rolling_hash_matches_hashing_the_collapsed_concatenation() {
+        let cases: Vec<(Vec<i64>, Vec<i64>)> = vec![
+            (vec![], vec![]),
+            (vec![1], vec![]),
+            (vec![], vec![2, 3]),
+            (vec![1, 2], vec![3, 4]),
+            (vec![1, 2], vec![2, 3]),          // boundary repeat collapses
+            (vec![1, 1, 2, 2], vec![2, 2, 3]), // repeats inside and across
+            (vec![5, 5, 5], vec![5, 5]),       // all one ride
+            (vec![1, 2, 1], vec![1, 2, 1]),    // non-consecutive repeats stay
+            (vec![7], vec![7]),
+        ];
+        for (f, b) in cases {
+            assert_eq!(rolling(&f, &b), direct(&f, &b), "f={f:?} b={b:?}");
+        }
+    }
+
+    #[test]
+    fn same_rides_split_at_different_points_hash_equal() {
+        // [1,2,3] ridden as (1 | 2,3), (1,2 | 3), (1,2,3 | -) must be one sequence,
+        // whichever meet the forward/backward halves were joined at.
+        let h = direct(&[1, 2, 3], &[]);
+        assert_eq!(rolling(&[1], &[2, 3]), h);
+        assert_eq!(rolling(&[1, 2], &[3]), h);
+        assert_eq!(rolling(&[1, 2, 3], &[]), h);
+        assert_eq!(rolling(&[], &[1, 2, 3]), h);
+        // hops on the same ride count once: [1,1,2] == [1,2]
+        assert_eq!(rolling(&[1, 1], &[2]), direct(&[1, 2], &[]));
+    }
+
+    #[test]
+    fn different_sequences_hash_differently() {
+        assert_ne!(direct(&[1, 2], &[]), direct(&[2, 1], &[]));
+        assert_ne!(direct(&[1, 2], &[]), direct(&[1, 2, 1], &[]));
+        assert_ne!(direct(&[1], &[]), direct(&[2], &[]));
+    }
 }
 
 #[cfg(test)]
@@ -1518,7 +1660,7 @@ mod tests {
             &run, 50,
             &PatternCumulativeCache::empty_for_test(),
             &PatternHeadwayCache::empty_for_test(),
-            &stops, 1.3,
+            &stops, 1.3, None,
         );
         let has_direct = res.paths.iter().any(|p| p == &vec![s0, a]);
         let has_via_t = res.paths.iter().any(|p| p == &vec![s0, t, b]);
@@ -1554,7 +1696,7 @@ mod tests {
             &run, 50,
             &PatternCumulativeCache::empty_for_test(),
             &PatternHeadwayCache::empty_for_test(),
-            &stops, 1.3,
+            &stops, 1.3, None,
         );
         let on_a_path = res.path_pattern_pks.iter().any(|p| p.contains(&50));
         assert!(!on_a_path, "premise changed: bus pattern is now on a seed path");
@@ -1564,4 +1706,40 @@ mod tests {
             run.edge_corridor.patterns.keys().collect::<Vec<_>>()
         );
     }
+    /// One line (pattern 100) whose stops are all mutually connected: the search
+    /// can ride it S0->D directly or hop off/on at intermediate stops, giving
+    /// several different STOP lists that are all the same single ride. Only one
+    /// candidate for that ride sequence may survive assembly, while a genuinely
+    /// different sequence (S0 -200-> M -300-> D) must still come through.
+    #[test]
+    fn same_ride_sequence_yields_one_candidate_but_other_sequences_survive() {
+        let (s0, x1, x2, d, m) = (1, 2, 3, 4, 5);
+        let stops = StopsCache::for_test(vec![
+            stop(s0, 0.000, 0.000), stop(x1, 0.010, 0.000), stop(x2, 0.020, 0.000),
+            stop(d, 0.030, 0.000), stop(m, 0.015, 0.010),
+        ]);
+        let mut adj: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        adj.insert(s0, vec![transit(x1, 100), transit(x2, 100), transit(d, 100), transit(m, 200)]);
+        adj.insert(x1, vec![transit(x2, 100), transit(d, 100)]);
+        adj.insert(x2, vec![transit(d, 100)]);
+        adj.insert(m, vec![transit(d, 300)]);
+        let graph = CoarseGraph::new(adj);
+        let run = run_seed_bfs(
+            &graph,
+            LatLon { lat: 0.0, lon: 0.0 }, LatLon { lat: 0.03, lon: 0.0 },
+            &stops, &[s0], &[d], 5,
+            &PatternCumulativeCache::empty_for_test(), &PatternHeadwayCache::empty_for_test(),
+            1000.0, 1.3,
+        );
+        let res = materialize_seed_paths(
+            &run, 50,
+            &PatternCumulativeCache::empty_for_test(), &PatternHeadwayCache::empty_for_test(),
+            &stops, 1.3, None,
+        );
+        let single_ride: Vec<_> = res.path_pattern_pks.iter().filter(|p| p.iter().all(|&x| x == 100)).collect();
+        assert_eq!(single_ride.len(), 1, "one candidate per ride sequence expected, got paths {:?}", res.paths);
+        let via_m = res.path_pattern_pks.iter().any(|p| p == &vec![200, 300]);
+        assert!(via_m, "the distinct 200->300 sequence must survive: {:?} / {:?}", res.paths, res.path_pattern_pks);
+    }
+
 }

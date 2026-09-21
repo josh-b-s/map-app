@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::corridor::seed_bfs::{materialize_seed_paths, SearchDir, SeedBfsRun};
 use crate::geo::cross_track_distance_m;
-use crate::repo::{get_pattern_pks_for_stops, PatternCumulativeCache, PatternHeadwayCache, StopsCache};
+use crate::repo::{get_pattern_pks_for_stops, PatternCumulativeCache, PatternHeadwayCache, PatternsCache, StopsCache};
 use crate::settings::{
     CROSS_TRACK_KEEP_FRACTION, CROSS_TRACK_KEEP_MAX_PER_BUCKET, CROSS_TRACK_STOP_FILTER_ENABLED, MAX_TRANSFERS,
 };
@@ -106,6 +106,7 @@ pub fn compute_seed_path_corridor(
     headway: &PatternHeadwayCache,
     walking_speed_mps: f64,
     max_walk_distance_m: f64,
+    patterns: Option<&PatternsCache>,
 ) -> rusqlite::Result<SeedPathCorridorResult> {
     let mut sub_timings: Vec<(String, i64)> = Vec::new();
 
@@ -126,7 +127,7 @@ pub fn compute_seed_path_corridor(
     }
 
     let t = Instant::now();
-    let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops, walking_speed_mps);
+    let seed = materialize_seed_paths(run, batch_size, cumulative, headway, stops, walking_speed_mps, patterns);
     let walk_radius = walk_radius_stop_pks(candidates, origin, destination, max_walk_distance_m);
     sub_timings.push(("materialize".to_string(), t.elapsed().as_millis() as i64));
 

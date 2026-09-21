@@ -145,6 +145,23 @@ function toJourney(j: Journey): GtfsJourney {
 }
 
 /**
+ * One-line-per-journey summary for the console, so different settings can be
+ * A/B'd on the result (arrival, duration, transfers) and not just on timings.
+ */
+function summarizeJourneys(journeys: Journey[]): string {
+    if (journeys.length === 0) return '[gtfsRouterNative] journeys: none';
+    const lines = journeys.map((j, i) => {
+        const legs = j.legs.map((l: Leg) => l.routeName).join(' → ');
+        return (
+            `  #${i + 1} ${secToTimeString(j.departureTimeSec)}→${secToTimeString(j.arrivalTimeSec)} · ` +
+            `${Number(j.totalDurationMin)}min · ${Number(j.transferCount)} transfer(s) · ` +
+            `${Number(j.totalWalkingMeters)}m walk · ${legs}`
+        );
+    });
+    return `[gtfsRouterNative] journeys (${journeys.length})` + '\n' + lines.join('\n');
+}
+
+/**
  * Same signature/contract as computeGtfsRoute() in raptorRouter.ts, backed by
  * the Rust RAPTOR engine instead. Uses DB_PATH internally (same file
  * op-sqlite opens) rather than taking a path param, so route.slice.ts's
@@ -189,6 +206,7 @@ export async function computeGtfsRouteNative(
         // (loader.rs's per-stage Instant timers + compute_route's own
         // raptor_search timer). "total" is loader.rs's load time only;
         // raptor_search is a separate top-level entry, not summed into it.
+        try { console.log(summarizeJourneys(result.journeys)); } catch { /* logging only */ }
         // Logging must never fail a route: fall back to the raw one-line format.
         try {
             console.log(formatTimings(result.timings));

@@ -186,6 +186,14 @@ pub const WINDOW_WIDENING_STAGES_SEC: [i64; 2] = [10 * 3600, 20 * 3600];
 /// can only help query latency relative to today's behavior, never
 /// regress a query the estimate doesn't cover.
 pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
+/// Which kept candidate sizes the duration-based window: the Nth-fastest
+/// scoreable one (1 = fastest, 0 = the SLOWEST, the old behaviour). With
+/// one candidate per ride sequence the kept set now includes genuinely bad
+/// sequences, and sizing from the slowest turned a ~3h window into the 8h cap
+/// (slowest candidate 10-13h against real journeys of 1.5-3.5h). In logged
+/// runs the returned journey was never slower than the fastest candidate's
+/// estimate, so a low rank plus the margin below still covers it.
+pub const WINDOW_REF_RANK: usize = 5;
 pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
 pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.25;
 /// Separate, more generous ceiling than INITIAL_WINDOW_MAX_SEC — that one
@@ -373,8 +381,8 @@ pub const PREWARM_WINDOW_SEC: i64 = 4 * 3600;
 /// meets x (fwd half-paths x bwd half-paths), which exploded (1.1M
 /// combinations / 5 s in one search), so it is bounded to the best meets
 /// (by estimated duration) and a few half-paths per meet. 0 = unbounded.
-pub const MAX_ENUMERATED_MEETS: usize = 40;
-pub const MAX_HALF_PATHS_PER_MEET: usize = 8;
+pub const MAX_ENUMERATED_MEETS: usize = 0;
+pub const MAX_HALF_PATHS_PER_MEET: usize = 0;
 
 /// Edge-based corridor (seed_bfs.rs `compute_edge_corridor`). After the
 /// bidirectional BFS, ANY graph edge u->v (transit or walk) is kept when
@@ -395,14 +403,14 @@ pub const USE_EDGE_CORRIDOR: bool = true;
 /// has been filtered down to patterns that can actually run for this
 /// search, so the slots go to patterns with service instead of being
 /// spent on ones that never run today / in the search window.
-pub const MAX_EDGE_CORRIDOR_EXTRA_PATTERNS: usize = 200;
+pub const MAX_EDGE_CORRIDOR_EXTRA_PATTERNS: usize = usize::MAX;
 
 /// How many top-ranked edge-corridor patterns resolve_corridor hands to the
 /// loader as a candidate pool (the corridor is cached per origin/destination
 /// and is time-independent, so the time/day filtering happens in the loader).
 /// Must be >= MAX_EDGE_CORRIDOR_EXTRA_PATTERNS; the surplus is the headroom
 /// the filters below can refill from.
-pub const EDGE_CORRIDOR_POOL_PATTERNS: usize = 300;
+pub const EDGE_CORRIDOR_POOL_PATTERNS: usize = usize::MAX;
 
 /// true = before applying MAX_EDGE_CORRIDOR_EXTRA_PATTERNS, drop pool
 /// patterns with no active trip today (exact; from the same trips query the
@@ -424,6 +432,47 @@ pub const ENABLE_HEADWAY_WINDOW_FILTER: bool = true;
 /// trip is bucketed at import time (by its start), and may reach the
 /// corridor stops well after it started.
 pub const HEADWAY_WINDOW_LOOKBACK_SEC: i64 = 3 * 3600;
+
+// ─── Time-based corridor (network-wide frequency RAPTOR, forward + backward) ──
+//
+// Replaces BFS *hop levels* with estimated *seconds* when deciding which
+// patterns are worth loading: a forward pass from the origin and a backward
+// pass from the destination (both on average hop times + headway/2 waits,
+// per transfer count), then a pattern qualifies if boarding/riding/alighting
+// it lands within a margin of the best estimate FOR ITS LEG COUNT — so a
+// slower direct option and a faster one-transfer option both survive.
+
+/// Compute it every search (cheap, in-memory) and log how it compares with
+/// the BFS edge corridor. Routing is unchanged unless TIME_CORRIDOR_USE_AS_POOL.
+pub const TIME_CORRIDOR_ENABLED: bool = true;
+
+/// true = the time corridor's ranked patterns replace the BFS edge-corridor
+/// pool fed to the loader's active/headway filters and cap. BFS still runs
+/// (seed paths still size the window) — this only swaps the pool.
+pub const TIME_CORRIDOR_USE_AS_POOL: bool = false;
+
+/// Max transit legs the estimate considers (transfers = legs - 1).
+pub const TIME_CORRIDOR_MAX_LEGS: usize = 4;
+
+/// A pattern qualifies when its best via-time is within
+/// max(FLOOR, RELATIVE_PCT * best_duration_for_that_leg_count) of that
+/// leg count's best estimated arrival.
+pub const TIME_CORRIDOR_MARGIN_FLOOR_SEC: i64 = 10 * 60;
+pub const TIME_CORRIDOR_MARGIN_RELATIVE_PCT: f64 = 0.25;
+
+/// Estimate calibration. Logged shadow-mode runs showed the raw estimate
+/// landing at ~74-82% of the duration RAPTOR actually returned (median hop
+/// times exclude dwell/slack; average waits ignore the connection actually
+/// caught). RIDE_SCALE stretches every in-vehicle hop; TRANSFER_PENALTY_SEC
+/// is added per transfer (boarding/alighting at a stop reached by riding).
+/// First-guess values — tune against `count.timecorr_est_pct_of_actual`
+/// in the log, aiming for it to sit near 90-100.
+pub const TIME_CORRIDOR_RIDE_SCALE: f64 = 1.10;
+pub const TIME_CORRIDOR_TRANSFER_PENALTY_SEC: i64 = 180;
+
+/// Stops kept either side of the qualifying board..alight segment when
+/// deciding which stops of a pattern to fetch stop_times for.
+pub const TIME_CORRIDOR_SEGMENT_MARGIN_STOPS: usize = 2;
 
 /// After the loaded pattern set is final, fetch stop_times only for stops
 /// served by a loaded pattern that has an active trip today (previously the
@@ -480,13 +529,29 @@ pub const RETURNED_POLYLINE_TOLERANCE_M: f64 = 8.0;
 /// walk-closure platform fanout (several boardable stops of one line at the
 /// same level) while still keeping a few alternative boarding/transfer
 /// stops, which the old one-path-per-sequence dedup threw away. 0 = no cap.
-pub const MAX_PATHS_PER_PATTERN_SEQUENCE: usize = 3;
+pub const MAX_PATHS_PER_PATTERN_SEQUENCE: usize = 1;
 
 /// Assembly-time guard for the same fanout: once this many distinct-stop
 /// paths exist for one pattern sequence, further ones are skipped BEFORE
 /// allocation/scoring. Must be >= MAX_PATHS_PER_PATTERN_SEQUENCE; larger
 /// gives the scoring-based cap a better pool to pick from. 0 = no guard.
-pub const MAX_ASSEMBLED_PER_PATTERN_SEQUENCE: usize = 16;
+pub const MAX_ASSEMBLED_PER_PATTERN_SEQUENCE: usize = 1;
+
+/// true = the "sequence" the two caps above group by is the ordered list of
+/// ROUTES (lines) ridden, not of patterns, with consecutive hops on the same
+/// line counted as one ride. Express / all-stops / short-turn patterns of one
+/// line then compete for the same slot instead of each getting their own, and
+/// "board one stop later, same line" no longer creates a new sequence.
+/// false = group by exact pattern sequence (still collapsing consecutive
+/// repeats of the same pattern).
+///
+/// The guard now runs BEFORE the stop-list hash/dedup, so a combination whose
+/// sequence is already full is dropped for the price of one integer lookup.
+/// Side effect: an exact-duplicate stop list arriving under a different
+/// pattern/route id is no longer merged into the existing path's pattern
+/// union (`paths_dup_pattern_variant_merged` was 0 in every logged run, since
+/// the coarse graph keeps one pattern per stop pair).
+pub const DEDUP_SEQUENCES_BY_ROUTE: bool = true;
 /// The margin is measured from this percentile of scored candidates, not
 /// the single fastest one. The fastest candidate's score is a sample of
 /// one, built from averaged headway/cumulative-time estimates rather than

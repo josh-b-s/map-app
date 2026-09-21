@@ -174,6 +174,16 @@ pub struct PatternsCache {
 }
 
 impl PatternsCache {
+    /// Stable "which line is this" key for a pattern: its route key when the
+    /// pattern has one, else a unique negative value so a route-less pattern
+    /// never collides with a real route or another pattern.
+    pub fn line_key(&self, pk: i64) -> i64 {
+        match self.get(pk).and_then(|m| m.route_key) {
+            Some(rk) => rk as i64,
+            None => -pk - 1,
+        }
+    }
+
     pub fn get(&self, pk: i64) -> Option<&PatternMeta> {
         if pk < 0 { return None; }
         self.by_pk.get(pk as usize).and_then(|o| o.as_ref())
@@ -588,6 +598,14 @@ impl PatternCumulativeCache {
 #[cfg(test)]
 impl PatternHeadwayCache {
     pub fn empty_for_test() -> Self { PatternHeadwayCache { by_pattern: HashMap::new() } }
+}
+#[cfg(test)]
+impl PatternHopsCache {
+    pub fn empty_for_test() -> Self { PatternHopsCache { by_pattern: HashMap::new() } }
+}
+#[cfg(test)]
+impl PatternHeadwayCache {
+    pub fn from_rows_for_test(by_pattern: HashMap<i64, Vec<(i64, Option<i64>)>>) -> Self { PatternHeadwayCache { by_pattern } }
 }
 
 #[cfg(test)]

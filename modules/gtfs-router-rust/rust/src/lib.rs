@@ -23,6 +23,7 @@ mod loader;
 mod raptor;
 mod verifier;
 mod freq_raptor;
+mod time_corridor;
 mod fxhash;
 
 use std::collections::HashMap;
@@ -274,6 +275,8 @@ struct WarmState {
     /// old per-search version was: rank_meets needs it BEFORE any corridor
     /// has been materialized.
     pattern_cumulative: Arc<repo::PatternCumulativeCache>,
+    /// Network-wide index for the time-based corridor (see time_corridor.rs).
+    time_index: Arc<time_corridor::TimeCorridorIndex>,
 }
 
 #[derive(uniffi::Object)]
@@ -494,6 +497,10 @@ impl GtfsRouterEngine {
         let pattern_cumulative = repo::load_pattern_cumulative(&pattern_stop_rows, &hops, &stops);
         mark!(t, "build_pattern_cumulative");
 
+        let t = Instant::now();
+        let time_index = time_corridor::TimeCorridorIndex::build(&pattern_stop_rows, &hops, &stops);
+        mark!(t, "build_time_corridor_index");
+
         *self.state.write().unwrap() = Some(WarmState {
             stops: Arc::new(stops),
             routes: Arc::new(routes),
@@ -503,6 +510,7 @@ impl GtfsRouterEngine {
             hops: Arc::new(hops),
             headway: Arc::new(headway),
             pattern_cumulative: Arc::new(pattern_cumulative),
+            time_index: Arc::new(time_index),
         });
         *self.conn.lock().unwrap() = Some(conn);
         *self.corridor_cache.lock().unwrap() = corridor::resolver::CorridorCache::new();
@@ -581,7 +589,7 @@ impl GtfsRouterEngine {
         let mut bfs_cache = self.bfs_cache.lock().unwrap();
 
         let mut index = loader::load_gtfs_index_for_trip(
-            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative,
+            conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative, &state.time_index,
             &mut corridor_cache, &mut bfs_cache,
             &self.active_services_cache,
             origin_ll, dest_ll, depart_sec_of_day as i64,
@@ -620,7 +628,7 @@ impl GtfsRouterEngine {
                 // computeGtfsRoute in the TS version: a window wide enough
                 // to find SOME trips but not a later leg's boarding trip.
                 index = loader::load_gtfs_index_for_trip(
-                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative,
+                    conn, &state.stops, &state.patterns, &state.routes, &state.graph, &state.hops, &state.headway, &state.pattern_cumulative, &state.time_index,
                     &mut corridor_cache, &mut bfs_cache,
                     &self.active_services_cache,
                     origin_ll, dest_ll, depart_sec_of_day as i64,
@@ -730,6 +738,63 @@ impl GtfsRouterEngine {
                     let missing = j.used_pattern_pks.iter().filter(|pk| !kept_patterns.contains(pk)).count() as i64;
                     total_missing += missing;
                     if missing > 0 { journeys_with_missing += 1; }
+                }
+                // Which corridor strategy's pool actually contained the patterns
+                // of the journeys RAPTOR returned? (Independent of which pool
+                // was used for routing — both are recorded every search.)
+                {
+                    let edge_pool: std::collections::HashSet<i64> = index.shadow_edge_pool_pks.iter().copied().collect();
+                    let time_pool: std::collections::HashSet<i64> = index.shadow_time_pool_pks.iter().copied().collect();
+                    let (mut used, mut miss_edge, mut miss_time, mut miss_both) = (0i64, 0i64, 0i64, 0i64);
+                    for j in &journeys {
+                        for pk in &j.used_pattern_pks {
+                            used += 1;
+                            let in_seed = kept_patterns.contains(pk);
+                            let in_edge = in_seed || edge_pool.contains(pk);
+                            let in_time = in_seed || time_pool.contains(pk);
+                            if !in_edge { miss_edge += 1; }
+                            if !in_time { miss_time += 1; }
+                            if !in_edge && !in_time { miss_both += 1; }
+                        }
+                    }
+                    // Rank of the worst-placed ridden pattern in each strategy's
+                    // ranked pool (1 = top). Answers "how big would this pool's
+                    // cap need to be to have kept the journey's patterns?" —
+                    // patterns already in the seed set are excluded, and patterns
+                    // absent from a pool don't count here (see the missing counts).
+                    {
+                        let time_order = &index.shadow_time_pool_pks;
+                        let edge_order = &index.shadow_edge_pool_pks;
+                        let (mut worst_time, mut worst_edge) = (0i64, 0i64);
+                        for j in &journeys {
+                            for pk in &j.used_pattern_pks {
+                                if kept_patterns.contains(pk) { continue; }
+                                if let Some(pos) = time_order.iter().position(|x| x == pk) { worst_time = worst_time.max(pos as i64 + 1); }
+                                if let Some(pos) = edge_order.iter().position(|x| x == pk) { worst_edge = worst_edge.max(pos as i64 + 1); }
+                            }
+                        }
+                        timings.push(TimingEntry { label: "count.journey_worst_rank_time".to_string(), ms: worst_time });
+                        timings.push(TimingEntry { label: "count.journey_worst_rank_edge".to_string(), ms: worst_edge });
+                    }
+                    // Calibration: the time corridor's estimate for THIS journey's leg
+                    // count vs how long RAPTOR's fastest journey really takes (both
+                    // measured from the requested departure, so origin wait counts).
+                    if let Some(best) = journeys.iter().min_by_key(|j| j.arrival_time_sec) {
+                        let legs = (best.transfer_count + 1).max(1);
+                        let actual = best.arrival_time_sec - depart_sec_of_day as i64;
+                        let est_label = format!("window.timecorr_best_{}leg_sec", legs);
+                        if let Some((_, est)) = index.timings.iter().find(|(l, _)| *l == est_label) {
+                            if actual > 0 {
+                                timings.push(TimingEntry { label: "window.returned_actual_sec".to_string(), ms: actual });
+                                timings.push(TimingEntry { label: "window.timecorr_est_same_legs_sec".to_string(), ms: *est });
+                                timings.push(TimingEntry { label: "count.timecorr_est_pct_of_actual".to_string(), ms: est * 100 / actual });
+                            }
+                        }
+                    }
+                    timings.push(TimingEntry { label: "count.journey_patterns_used".to_string(), ms: used });
+                    timings.push(TimingEntry { label: "count.journey_patterns_missing_from_seed_plus_edge".to_string(), ms: miss_edge });
+                    timings.push(TimingEntry { label: "count.journey_patterns_missing_from_seed_plus_time".to_string(), ms: miss_time });
+                    timings.push(TimingEntry { label: "count.journey_patterns_missing_from_both".to_string(), ms: miss_both });
                 }
                 timings.push(TimingEntry { label: "count.seed_path_completeness_missing_patterns".to_string(), ms: total_missing });
                 timings.push(TimingEntry { label: "count.seed_path_completeness_affected_journeys".to_string(), ms: journeys_with_missing });

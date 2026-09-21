@@ -312,13 +312,10 @@ fn trim_pattern_stops_by_sequence(
 pub fn resolve_corridor(
     conn: &Connection,
     stops: &StopsCache,
-    // Formerly threaded through to nearest_for_seed for route-level seed
-    // dedup — now unused here, since get_pattern_pks_for_stops (used by
-    // nearest_for_seed) queries pattern_pk directly and no longer needs
-    // PatternsCache's route_key lookup. Kept in the signature rather than
-    // removed so this stays a purely additive change for loader.rs's
-    // existing call site.
-    _patterns: &PatternsCache,
+    // Used by seed-path assembly to group candidate paths by the ROUTES they
+    // ride (DEDUP_SEQUENCES_BY_ROUTE). (nearest_for_seed no longer needs it —
+    // get_pattern_pks_for_stops queries pattern_pk directly.)
+    patterns: &PatternsCache,
     graph: &CoarseGraph,
     cache: &mut CorridorCache,
     bfs_cache: &mut SeedBfsCache,
@@ -384,7 +381,7 @@ pub fn resolve_corridor(
     sub_timings.push(("count.seed_bfs_meets_total".to_string(), run.ordered_meets.len() as i64));
 
     let t = Instant::now();
-    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway, walking_speed_mps, max_walk_distance_m)?;
+    let seed_corridor = compute_seed_path_corridor(conn, stops, &run, batch_size, &candidates, origin, destination, cumulative, headway, walking_speed_mps, max_walk_distance_m, Some(patterns))?;
     // Only sum entries that are actually milliseconds — every "count."-
     // prefixed entry in seed_corridor.sub_timings is a raw count (paths,
     // stops, whatever), not a duration, and summing those in here is what

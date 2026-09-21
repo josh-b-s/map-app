@@ -52,6 +52,7 @@ use crate::graph::coarse::CoarseGraph;
 use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternHopsCache, PatternsCache, RoutesCache, StopsCache};
 use crate::corridor::resolver::{resolve_corridor, CorridorCache, SeedBfsCache};
 use crate::freq_raptor;
+use crate::time_corridor::{self, TimeCorridorIndex};
 use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, FREQ_GRAPH_MIN_CANDIDATE_PATTERNS, ENABLE_SEED_PATH_MARGIN};
 use crate::corridor::tagging::CorridorBoundary;
 use crate::corridor::seed_bfs::SearchDir;
@@ -64,6 +65,21 @@ use crate::settings::{
 
 const DOW_COLUMNS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
+/// The candidate score the duration-based window is sized from: the
+/// WINDOW_REF_RANK-th fastest scoreable one (0 = slowest). `None` when no
+/// candidate is scoreable.
+fn window_ref_score(seed_path_scores: &[f64]) -> Option<f64> {
+    let mut v: Vec<f64> = seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).collect();
+    if v.is_empty() { return None; }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = if crate::settings::WINDOW_REF_RANK == 0 {
+        v.len() - 1
+    } else {
+        (crate::settings::WINDOW_REF_RANK - 1).min(v.len() - 1)
+    };
+    Some(v[idx])
+}
+
 /// Same initial-window estimate step 6 uses (duration-based when the seed
 /// paths are scoreable, else distance-based), needed EARLIER to decide which
 /// edge-corridor patterns can run in the search window. Kept separate from
@@ -73,8 +89,7 @@ fn estimate_window_sec(seed_path_scores: &[f64], straight_line_m: f64) -> f64 {
     let distance_scaled_sec = (straight_line_m / 1000.0) * WINDOW_DISTANCE_SCALE_SEC_PER_KM + WINDOW_DISTANCE_BUFFER_SEC;
     let distance_based = distance_scaled_sec.max(INITIAL_WINDOW_MIN_SEC).min(INITIAL_WINDOW_MAX_SEC);
     if ENABLE_DURATION_BASED_WINDOW {
-        let ref_score = seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MIN, f64::max);
-        if ref_score > f64::MIN {
+        if let Some(ref_score) = window_ref_score(seed_path_scores) {
             let margin = margin_threshold(ref_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
             return (ref_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC);
         }
@@ -148,6 +163,11 @@ pub struct GtfsIndex {
     /// against real stop_times to confirm a candidate is genuinely
     /// boardable, in place of a full McRAPTOR scan.
     pub seed_path_edges: Vec<Vec<Option<i64>>>,
+    /// Pattern pools each corridor strategy proposed for this search (BFS edge
+    /// corridor / time corridor), kept so lib.rs can measure which pool
+    /// actually contained the patterns of the journey RAPTOR returned.
+    pub shadow_edge_pool_pks: Vec<i64>,
+    pub shadow_time_pool_pks: Vec<i64>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
     /// own console.log breakdown.
@@ -159,7 +179,8 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
         no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary,
-        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(), timings,
+        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(),
+        shadow_edge_pool_pks: Vec::new(), shadow_time_pool_pks: Vec::new(), timings,
     }
 }
 
@@ -242,6 +263,7 @@ pub fn load_gtfs_index_for_trip(
     hops: &PatternHopsCache,
     headway: &PatternHeadwayCache,
     pattern_cumulative: &PatternCumulativeCache,
+    time_index: &TimeCorridorIndex,
     corridor_cache: &mut CorridorCache,
     bfs_cache: &mut SeedBfsCache,
     active_services_cache: &Mutex<Option<ActiveServicesCacheEntry>>,
@@ -322,6 +344,30 @@ pub fn load_gtfs_index_for_trip(
     };
     mark!(t, "active_services");
 
+    // ── Time corridor (network-wide, estimated seconds) ─────────────────
+    // Independent of the BFS corridor and of the retry loop below, so it is
+    // computed once. In shadow mode it only feeds comparison logging; with
+    // TIME_CORRIDOR_USE_AS_POOL it replaces the BFS edge-corridor pool.
+    let time_result: Option<time_corridor::TimeCorridorResult> = if crate::settings::TIME_CORRIDOR_ENABLED {
+        let tc = time_corridor::compute(
+            time_index, graph, stops, headway, origin, destination,
+            depart_sec_of_day, walking_speed_mps, max_walk_distance_m,
+        );
+        if let Some(r) = &tc {
+            timings.push(("time_corridor".to_string(), r.elapsed_ms));
+            for (phase, ms) in &r.phase_ms { timings.push((format!("time_corridor.{phase}"), *ms)); }
+            timings.push(("count.timecorr_patterns".to_string(), r.ranked.len() as i64));
+            for (i, arr) in r.best_arrival_by_legs.iter().enumerate() {
+                if let Some(a) = arr {
+                    timings.push((format!("window.timecorr_best_{}leg_sec", i + 1), (a - depart_sec_of_day).max(0)));
+                }
+            }
+        } else {
+            timings.push(("count.timecorr_unavailable".to_string(), 1));
+        }
+        tc
+    } else { None };
+
     // ── Corridor -> candidate patterns -> trips actually running today ──
     // Retried with a bigger seed-meet batch if a batch comes back with no
     // pattern that has an active trip at all. BFS itself only ever runs
@@ -381,6 +427,31 @@ pub fn load_gtfs_index_for_trip(
         // consumer below — the active-trip lookup, the cheap
         // fallback-to-full, all the timings/logging — is shared code,
         // unaware of which strategy actually produced it.
+        // Pool of "edge-style" patterns handed to the narrowing below: the BFS
+        // edge corridor by default, or the time corridor's ranked patterns
+        // when TIME_CORRIDOR_USE_AS_POOL is on and it produced a result.
+        let use_time_pool = crate::settings::TIME_CORRIDOR_USE_AS_POOL && time_result.is_some();
+        let (pool_pks, pool_stops_by_pattern, pool_stop_union): (Vec<i64>, &HashMap<i64, Vec<i64>>, Vec<i64>) =
+            match (&time_result, use_time_pool) {
+                (Some(tc), true) => (
+                    tc.ranked.iter().map(|p| p.pattern_pk).collect(),
+                    &tc.stops_by_pattern,
+                    tc.stops_by_pattern.values().flatten().copied().collect::<HashSet<i64>>().into_iter().collect(),
+                ),
+                _ => (
+                    resolved.edge_corridor_pattern_pks.clone(),
+                    &resolved.edge_corridor_stops_by_pattern,
+                    resolved.edge_corridor_stop_pks.iter().copied().collect(),
+                ),
+            };
+        if let Some(tc) = &time_result {
+            let edge_set: HashSet<i64> = resolved.edge_corridor_pattern_pks.iter().copied().collect();
+            let time_set: HashSet<i64> = tc.ranked.iter().map(|p| p.pattern_pk).collect();
+            let overlap = edge_set.intersection(&time_set).count() as i64;
+            timings.push(("count.timecorr_only".to_string(), time_set.len() as i64 - overlap));
+            timings.push(("count.edgecorr_only".to_string(), edge_set.len() as i64 - overlap));
+            timings.push(("count.timecorr_edgecorr_overlap".to_string(), overlap));
+        }
         let freq_narrow: Option<freq_raptor::FreqNarrowResult> = if ENABLE_SEED_PATH_MARGIN {
             // Union of patterns/stops across every margin-kept whole
             // candidate trip (resolve_corridor/materialize_seed_paths
@@ -394,7 +465,7 @@ pub fn load_gtfs_index_for_trip(
             // which whole paths survived scoring/caps) — e.g. an optional short
             // ride between two stops that are also within walking distance.
             let before_edge = pattern_pks.len();
-            pattern_pks.extend(resolved.edge_corridor_pattern_pks.iter().copied());
+            pattern_pks.extend(pool_pks.iter().copied());
             timings.push(("count.edge_corridor_patterns_added".to_string(), (pattern_pks.len() - before_edge) as i64));
             // Deliberately NOT narrowed to the literal stops in the
             // margin-kept `paths` — those are a handful of discrete
@@ -419,7 +490,7 @@ pub fn load_gtfs_index_for_trip(
                         s.insert(r.stop_pk);
                     }
                 }
-                s.extend(resolved.edge_corridor_stop_pks.iter().copied());
+                s.extend(pool_stop_union.iter().copied());
                 timings.push(("count.fetch_stops_before_narrowing".to_string(), full_allowed_stop_pks.len() as i64));
                 s
             } else {
@@ -534,7 +605,7 @@ pub fn load_gtfs_index_for_trip(
 
                     let mut taken: usize = 0;
                     let (mut dropped_inactive, mut dropped_headway, mut dropped_cap) = (0i64, 0i64, 0i64);
-                    for &pk in &resolved.edge_corridor_pattern_pks {
+                    for &pk in &pool_pks {
                         if !p.contains(&pk) { dropped_inactive += 1; continue; }
                         if seed_patterns.contains(&pk) { taken += 1; continue; } // already in `keep`
                         if crate::settings::ENABLE_HEADWAY_WINDOW_FILTER
@@ -568,9 +639,9 @@ pub fn load_gtfs_index_for_trip(
                                     s.insert(r.stop_pk);
                                 }
                             }
-                            for pk in &resolved.edge_corridor_pattern_pks {
+                            for pk in &pool_pks {
                                 if !keep.contains(pk) { continue; }
-                                if let Some(v) = resolved.edge_corridor_stops_by_pattern.get(pk) { s.extend(v.iter().copied()); }
+                                if let Some(v) = pool_stops_by_pattern.get(pk) { s.extend(v.iter().copied()); }
                             }
                             if !s.is_empty() { fetch_stops = s; }
                         }
@@ -633,7 +704,7 @@ pub fn load_gtfs_index_for_trip(
     // Reuse resolver's already-fetched rows when available (normal
     // seed-path-derived path); only re-query on the bbox-fallback path.
     let t = Instant::now();
-    let pattern_stop_rows: Vec<crate::repo::PatternStopRow> = if !resolved.pattern_stop_rows.is_empty() {
+    let mut pattern_stop_rows: Vec<crate::repo::PatternStopRow> = if !resolved.pattern_stop_rows.is_empty() {
         resolved.pattern_stop_rows.iter()
             .filter(|r| pattern_keys_with_active_trip.contains(&r.pattern_pk))
             .cloned()
@@ -641,6 +712,13 @@ pub fn load_gtfs_index_for_trip(
     } else {
         crate::repo::get_pattern_stops_for_patterns(conn, &patterns_running_today)?
     };
+    // Patterns picked outside the BFS corridor (time-corridor pool) have no
+    // rows in resolver's set — fill them from the resident index, no SQL.
+    if !resolved.pattern_stop_rows.is_empty() {
+        let have: HashSet<i64> = pattern_stop_rows.iter().map(|r| r.pattern_pk).collect();
+        let missing: Vec<i64> = patterns_running_today.iter().copied().filter(|pk| !have.contains(pk)).collect();
+        if !missing.is_empty() { pattern_stop_rows.extend(time_index.rows_for_patterns(&missing)); }
+    }
 
     let mut pattern_stops: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     for r in &pattern_stop_rows {
@@ -690,20 +768,19 @@ pub fn load_gtfs_index_for_trip(
     // estimate). Falls back to the distance heuristic only when no
     // duration estimate is available at all.
     let duration_based_window_sec: Option<f64> = if ENABLE_DURATION_BASED_WINDOW {
-        // Reference = the SLOWEST scoreable kept candidate (unscoreable
-        // f64::MAX sentinels ignored), so the window is wide enough for
-        // every candidate the search may still use; margin added on top.
-        let ref_score = resolved.seed_path_scores.iter().copied()
-            .filter(|&s| s < f64::MAX)
-            .fold(f64::MIN, f64::max);
-        if ref_score > f64::MIN {
+        // Reference = the WINDOW_REF_RANK-th fastest scoreable kept candidate
+        // (unscoreable f64::MAX sentinels ignored; rank 0 = the slowest);
+        // margin added on top. See WINDOW_REF_RANK for why it isn't the slowest.
+        if let Some(ref_score) = window_ref_score(&resolved.seed_path_scores) {
             let margin = margin_threshold(ref_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
             // Diagnostics (seconds, not counts): how far the slowest kept candidate
             // sits from the fastest is what stretches the window and the stop_times
             // fetch, so log both ends to tune MAX_SEED_CANDIDATE_PATHS from real data.
             let best_ref = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
             timings.push(("window.best_candidate_sec".to_string(), best_ref.round() as i64));
-            timings.push(("window.slowest_candidate_sec".to_string(), ref_score.round() as i64));
+            let slowest = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MIN, f64::max);
+            timings.push(("window.slowest_candidate_sec".to_string(), slowest.round() as i64));
+            timings.push(("window.ref_candidate_sec".to_string(), ref_score.round() as i64));
             Some((ref_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC))
         } else {
             None
@@ -865,6 +942,8 @@ pub fn load_gtfs_index_for_trip(
             debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
             seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
             seed_path_edges: resolved.seed_path_edges.clone(),
+            shadow_edge_pool_pks: resolved.edge_corridor_pattern_pks.clone(),
+            shadow_time_pool_pks: time_result.as_ref().map(|r| r.ranked.iter().map(|p| p.pattern_pk).collect()).unwrap_or_default(),
             timings,
         });
     }
@@ -886,6 +965,29 @@ pub fn load_gtfs_index_for_trip(
         debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
         seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
         seed_path_edges: resolved.seed_path_edges.clone(),
+        shadow_edge_pool_pks: resolved.edge_corridor_pattern_pks.clone(),
+        shadow_time_pool_pks: time_result.as_ref().map(|r| r.ranked.iter().map(|p| p.pattern_pk).collect()).unwrap_or_default(),
         timings,
     })
+}
+
+#[cfg(test)]
+mod window_ref_tests {
+    use super::*;
+
+    #[test]
+    fn ranks_by_nth_fastest_and_ignores_unscoreable_sentinels() {
+        // Sorted scoreable: 100, 3000, 5000, 7000, 9000, 40000 (f64::MAX ignored).
+        let scores = vec![5000.0, 3000.0, f64::MAX, 9000.0, 40000.0, 100.0, 7000.0];
+        // WINDOW_REF_RANK is a compile-time setting; derive the expectation from it.
+        let expected = match crate::settings::WINDOW_REF_RANK {
+            0 => 40000.0,
+            n => [100.0, 3000.0, 5000.0, 7000.0, 9000.0, 40000.0][(n - 1).min(5)],
+        };
+        assert_eq!(window_ref_score(&scores), Some(expected));
+        assert_eq!(window_ref_score(&[f64::MAX, f64::MAX]), None);
+        assert_eq!(window_ref_score(&[]), None);
+        // fewer scoreable candidates than the rank: falls back to the slowest available
+        assert_eq!(window_ref_score(&[800.0]), Some(800.0));
+    }
 }
