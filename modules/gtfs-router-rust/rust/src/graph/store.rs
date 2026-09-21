@@ -35,7 +35,12 @@ use crate::graph::coarse::{CoarseEdge, EdgeKind};
 /// have read as "zero distance, always in range" — a real correctness bug,
 /// not just a missing feature, so a one-time forced rebuild is the right
 /// trade here.
-const RUST_GRAPH_ALGO_VERSION: i64 = 2;
+///
+/// v2 -> v3: transit edges are now per (from, to, LINE) instead of
+/// per (from, to), and the edge's `via_pattern` is the route's fastest
+/// pattern for that stop pair. The record layout is unchanged, but a v2
+/// blob would silently keep the old one-edge-per-pair graph, so force a rebuild.
+const RUST_GRAPH_ALGO_VERSION: i64 = 3;
 
 pub struct GraphSignature {
     pub stop_count: i64,

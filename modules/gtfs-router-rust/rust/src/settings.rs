@@ -222,53 +222,10 @@ pub const DURATION_WINDOW_MAX_SEC: f64 = 8.0 * 3600.0;
 /// range of corridors doesn't hold the same pattern.
 pub const USE_SQL_ACTIVE_TRIP_FILTER: bool = true;
 
-// ── Frequency-graph pre-filter (freq_raptor.rs) ──────────────────────────
-/// Below this many candidate patterns, skip the frequency-graph pass
-/// entirely and go straight to the real SQL stage — the pre-filter's own
-/// (small) overhead isn't worth paying when there's nothing worth
-/// narrowing. Needs real tuning against Melbourne-scale
-/// `count.candidate_pattern_pks` numbers once this is running — 40 is a
-/// starting guess, not a measured value.
-pub const FREQ_GRAPH_MIN_CANDIDATE_PATTERNS: usize = 40;
-
-/// Pruning-safety margin around the frequency graph's best estimated
-/// arrival: `margin = max(FLOOR, estimated_duration * RELATIVE_PCT)`. Both
-/// components matter — a pure relative margin is too tight on short hops
-/// and too loose on long ones (see freq_raptor.rs's module doc for the
-/// full reasoning on why a single best estimate can't be trusted alone).
-pub const FREQ_GRAPH_MARGIN_FLOOR_SEC: i64 = 8 * 60;
-pub const FREQ_GRAPH_MARGIN_RELATIVE_PCT: f64 = 0.25;
-
-/// On/off switch for the margin pruning above, isolated from the constants
-/// themselves so it can be A/B'd without touching their tuned values —
-/// `false` sets the threshold to `i64::MAX`, i.e. every in-play stop stays
-/// in play and this pass narrows nothing. For measuring how much this pass
-/// alone is worth, independent of `ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE`
-/// below (same shape, different stage).
-pub const ENABLE_FREQ_GRAPH_MARGIN_PRUNE: bool = false;
-
-/// Shared shape used by both duration-based margin filters in this crate
-/// (`FREQ_GRAPH_MARGIN_*` above and `SEED_MEET_SELECT_MARGIN_*` below) —
-/// `max(floor, estimate * relative_pct)`. Kept as one function so the two
-/// sites can't quietly drift apart on the formula itself while still using
-/// independently tuned floor/pct constants and independent duration
-/// estimates (a frequency-graph relaxation vs. a per-candidate BFS
-/// backtrack — genuinely different traversals, not mergeable themselves).
+/// `max(floor, estimate * relative_pct)` — shared by the window and
+/// seed-path margin filters.
 pub fn margin_threshold(estimate: f64, floor: f64, relative_pct: f64) -> f64 {
     (estimate * relative_pct).max(floor)
-}
-
-/// Nearest-rank percentile of a set of scores (0.0 = min, 1.0 = max),
-/// ignoring `f64::MAX` sentinels (unscored entries — see every margin
-/// filter's "fail open" note). `p` is clamped to `[0, 1]`. Returns
-/// `f64::MAX` if nothing was scorable.
-pub fn percentile(scores: &[f64], p: f64) -> f64 {
-    let mut scored: Vec<f64> = scores.iter().copied().filter(|&s| s < f64::MAX).collect();
-    if scored.is_empty() { return f64::MAX; }
-    scored.sort_by(|a, b| a.total_cmp(b));
-    let p = p.clamp(0.0, 1.0);
-    let idx = ((scored.len() - 1) as f64 * p).round() as usize;
-    scored[idx]
 }
 
 /// Wait-time estimate used when `PatternHeadwayCache::headway_for` returns
@@ -278,12 +235,7 @@ pub fn percentile(scores: &[f64], p: f64) -> f64 {
 /// not toward it, since discovering "actually this was fine" later (via
 /// the real SQL stage) is cheap, while wrongly pruning a genuinely-good
 /// route because its headway was unmeasured is a correctness bug.
-pub const FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC: i64 = 20 * 60;
-
-/// Round cap for the frequency-graph search — same transfer-budget
-/// reasoning as level_cap_for below, but this graph is cheap enough that
-/// there's no strong reason to cap it any tighter than the real search.
-pub const FREQ_GRAPH_MAX_ROUNDS: u32 = 6;
+pub const UNKNOWN_HEADWAY_WAIT_SEC: i64 = 20 * 60;
 
 // ── rank_meets real-time scoring (seed_bfs.rs) ───────────────────────────
 /// rank_meets's real-time score for the origin/destination "last mile" leg
@@ -299,41 +251,6 @@ pub const FREQ_GRAPH_MAX_ROUNDS: u32 = 6;
 /// buckets whenever they supply different `max_walk_distance_m` values,
 /// same as before. Single on-device caller (no cross-request contention),
 /// so the extra bucket spread this can add is not a concern here.
-
-/// Margin applied when `materialize_seed_paths` selects which meeting
-/// nodes in a `batch_size`-capped slice actually get backtracked into
-/// `core_stop_pks` — `margin = max(FLOOR, best_score_in_batch * PCT)`,
-/// same shape as `FREQ_GRAPH_MARGIN_*` and the same reasoning: a single
-/// best real-time estimate shouldn't be trusted alone (no schedule/
-/// missed-connection awareness at this stage either), so every meeting
-/// node within margin of the batch's best stays in play rather than only
-/// the literal single best one. `batch_size` itself is still the outer
-/// ceiling (and still what the existing retry ladder doubles) — this
-/// margin only trims WITHIN that ceiling, so a genuinely-close alternative
-/// a few nodes into the batch doesn't drag in a needlessly wide ancestor
-/// union just because count-based truncation alone can't tell "clearly
-/// worse" apart from "basically tied."
-pub const SEED_MEET_SELECT_MARGIN_FLOOR_SEC: f64 = 4.0 * 60.0;
-pub const SEED_MEET_SELECT_MARGIN_RELATIVE_PCT: f64 = 0.25;
-
-/// On/off switch for the margin filter above, isolated from the constants
-/// themselves so it can be A/B'd without touching their tuned values —
-/// `false` skips straight to keeping the whole depth group (the
-/// `SEED_MEET_SELECT_TOP_K` hard ceiling below still applies either way,
-/// since that's a separate backtracking-cost bound, not part of this test).
-pub const ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE: bool = false;
-
-/// Hard ceiling applied AFTER the margin filter above — bounds the
-/// pathological case margin alone can't: a wide, genuinely-flat plateau of
-/// many meeting nodes all within margin of the best (common on a dense
-/// grid of near-identical bus options, say). Margin decides WHICH
-/// candidates are close enough to trust; this just caps how many of them
-/// `core_stop_pks` ever has to carry, sorted by the same real-time score
-/// so a cap that actually bites drops the weakest candidates first, not an
-/// arbitrary interleave-order tail. Real-time-based, unlike
-/// `cross_track_filter`'s straight-line cap — see this constant's use in
-/// `materialize_seed_paths`.
-pub const SEED_MEET_SELECT_TOP_K: usize = usize::MAX;
 
 /// Final-candidate-set strategy: instead of feeding McRAPTOR
 /// `core_stop_pks` (freq_raptor's temporally-narrowed ancestor union),
@@ -418,61 +335,6 @@ pub const EDGE_CORRIDOR_POOL_PATTERNS: usize = usize::MAX;
 /// import-time pattern_headway table says don't run in the search window.
 /// false = old behaviour (plain top-N by rank).
 pub const FILTER_EDGE_POOL_BY_ACTIVITY: bool = true;
-
-/// Uses pattern_headway's time buckets (night/off-peak/peak) to drop edge
-/// patterns that have rows only in buckets outside the search window. A
-/// pattern with NO headway rows at all is kept (unknown != not running).
-/// Relies on the importer writing a row for every bucket a pattern has at
-/// least one trip in (repo.rs documents NULL headway for <2 trips, i.e. the
-/// row still exists) — switch off if a search ever misses a service you
-/// know runs.
-pub const ENABLE_HEADWAY_WINDOW_FILTER: bool = true;
-
-/// The bucket check looks this far BEFORE the window start too, because a
-/// trip is bucketed at import time (by its start), and may reach the
-/// corridor stops well after it started.
-pub const HEADWAY_WINDOW_LOOKBACK_SEC: i64 = 3 * 3600;
-
-// ─── Time-based corridor (network-wide frequency RAPTOR, forward + backward) ──
-//
-// Replaces BFS *hop levels* with estimated *seconds* when deciding which
-// patterns are worth loading: a forward pass from the origin and a backward
-// pass from the destination (both on average hop times + headway/2 waits,
-// per transfer count), then a pattern qualifies if boarding/riding/alighting
-// it lands within a margin of the best estimate FOR ITS LEG COUNT — so a
-// slower direct option and a faster one-transfer option both survive.
-
-/// Compute it every search (cheap, in-memory) and log how it compares with
-/// the BFS edge corridor. Routing is unchanged unless TIME_CORRIDOR_USE_AS_POOL.
-pub const TIME_CORRIDOR_ENABLED: bool = true;
-
-/// true = the time corridor's ranked patterns replace the BFS edge-corridor
-/// pool fed to the loader's active/headway filters and cap. BFS still runs
-/// (seed paths still size the window) — this only swaps the pool.
-pub const TIME_CORRIDOR_USE_AS_POOL: bool = false;
-
-/// Max transit legs the estimate considers (transfers = legs - 1).
-pub const TIME_CORRIDOR_MAX_LEGS: usize = 4;
-
-/// A pattern qualifies when its best via-time is within
-/// max(FLOOR, RELATIVE_PCT * best_duration_for_that_leg_count) of that
-/// leg count's best estimated arrival.
-pub const TIME_CORRIDOR_MARGIN_FLOOR_SEC: i64 = 10 * 60;
-pub const TIME_CORRIDOR_MARGIN_RELATIVE_PCT: f64 = 0.25;
-
-/// Estimate calibration. Logged shadow-mode runs showed the raw estimate
-/// landing at ~74-82% of the duration RAPTOR actually returned (median hop
-/// times exclude dwell/slack; average waits ignore the connection actually
-/// caught). RIDE_SCALE stretches every in-vehicle hop; TRANSFER_PENALTY_SEC
-/// is added per transfer (boarding/alighting at a stop reached by riding).
-/// First-guess values — tune against `count.timecorr_est_pct_of_actual`
-/// in the log, aiming for it to sit near 90-100.
-pub const TIME_CORRIDOR_RIDE_SCALE: f64 = 1.10;
-pub const TIME_CORRIDOR_TRANSFER_PENALTY_SEC: i64 = 180;
-
-/// Stops kept either side of the qualifying board..alight segment when
-/// deciding which stops of a pattern to fetch stop_times for.
-pub const TIME_CORRIDOR_SEGMENT_MARGIN_STOPS: usize = 2;
 
 /// After the loaded pattern set is final, fetch stop_times only for stops
 /// served by a loaded pattern that has an active trip today (previously the

@@ -50,12 +50,11 @@
 
 use crate::graph::coarse::{CoarseGraph, CoarseEdge, EdgeKind};
 use crate::settings::{
-    level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC,
+    level_cap_for, ASSUMED_TRANSIT_SPEED_MPS, DEPTH_BUCKET_RANKING_ENABLED, ENABLE_SEED_PATH_MARGIN, UNKNOWN_HEADWAY_WAIT_SEC,
     MAX_SEED_PATHS, MAX_PATHS_PER_PATTERN_SEQUENCE, MAX_ASSEMBLED_PER_PATTERN_SEQUENCE, DEDUP_SEQUENCES_BY_ROUTE, SAFETY_MARGIN_LEVELS, SEED_MEET_DEPTH_BUCKET_WEIGHT,
     MAX_SEED_CANDIDATE_PATHS, EXPAND_THROUGH_TOUCHED_NODES, USE_EDGE_CORRIDOR,
     MAX_ENUMERATED_MEETS, MAX_HALF_PATHS_PER_MEET,
-    ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE, margin_threshold, SEED_MEET_SELECT_MARGIN_FLOOR_SEC,
-    SEED_MEET_SELECT_MARGIN_RELATIVE_PCT, SEED_MEET_SELECT_TOP_K, TOP_N_SEED_MEETS,
+    TOP_N_SEED_MEETS,
 };
 use crate::fxhash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::Hasher;
@@ -326,15 +325,32 @@ fn walk_closure(
     // Iterate a snapshot of the keys we started with — `start_frontier`
     // itself is about to grow in the loop below.
     let seed_keys: Vec<i64> = start_frontier.iter().copied().collect();
+    let cover = !graph.stop_lines.is_empty();
+    let mut walk: Vec<&CoarseEdge> = Vec::new();
+    let mut covered: FxHashSet<(i64, i64)> = FxHashSet::default();
     for key in seed_keys {
         let Some(edges) = graph.adjacency.get(&key) else { continue };
-        for e in edges {
-            if e.kind != EdgeKind::Walk { continue; }
-            // The graph itself only enforces a generous build-time
-            // ceiling (WALK_EDGE_THRESHOLD_M) — this is the real,
-            // caller-supplied cutoff (max_walk_distance_m), applied
-            // per request rather than baked into the persisted graph.
-            if e.distance_m > max_walk_distance_m { continue; }
+        // The graph itself only enforces a generous build-time ceiling
+        // (WALK_EDGE_THRESHOLD_M) — the real cutoff is the caller's
+        // max_walk_distance_m, applied per request.
+        walk.clear();
+        walk.extend(edges.iter().filter(|e| e.kind == EdgeKind::Walk && e.distance_m <= max_walk_distance_m));
+        if cover {
+            // Greedy per-source cover: closest first, keep a stop only if it
+            // adds a (line, direction) no closer kept stop already serves.
+            // Direction = the pattern's terminus, so the opposite-direction
+            // platform of a line a closer stop already serves is still kept.
+            // The source's own lines are deliberately NOT pre-covered.
+            walk.sort_by(|a, b| a.distance_m.total_cmp(&b.distance_m));
+            covered.clear();
+            walk.retain(|e| {
+                let Some(lines) = graph.stop_lines.get(&e.to) else { return false };
+                let mut adds = false;
+                for &l in lines { if covered.insert(l) { adds = true; } }
+                adds
+            });
+        }
+        for e in walk.iter() {
             match level_of.get(&e.to) {
                 None => {
                     level_of.insert(e.to, level);
@@ -707,7 +723,7 @@ fn real_time_from_root(
         let wait_cost = match arrival_pattern {
             Some(pk) if p_arrival_pattern != Some(pk) => match headway.headway_for(pk, t_p as i64) {
                 Some(h) => h as f64 / 2.0,
-                None => FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC as f64,
+                None => UNKNOWN_HEADWAY_WAIT_SEC as f64,
             },
             _ => 0.0,
         };
@@ -774,7 +790,7 @@ fn score_seed_path(
         let wait_cost = match via_pattern {
             Some(pk) if riding_pattern != Some(pk) => match headway.headway_for(pk, total as i64) {
                 Some(h) => h as f64 / 2.0,
-                None => FREQ_GRAPH_UNKNOWN_HEADWAY_WAIT_SEC as f64,
+                None => UNKNOWN_HEADWAY_WAIT_SEC as f64,
             },
             _ => 0.0,
         };
@@ -1188,74 +1204,10 @@ pub fn materialize_seed_paths(
 
     let capped = &run.ordered_meets[..batch_size.min(run.ordered_meets.len())];
 
-    // MARGIN FILTER: `capped` is still a raw count-based slice (batch_size
-    // remains the outer ceiling, and what the existing retry ladder
-    // doubles — see resolver.rs). Within that ceiling, drop any meeting
-    // node whose real-time score isn't within margin of the BEST score —
-    // see SEED_MEET_SELECT_MARGIN_*'s doc in settings.rs.
-    //
-    // PER-DEPTH, not global: `capped` is already the product of
-    // `rank_meets`'s weighted round-robin merge, which deliberately keeps
-    // SOME deeper/transfer meeting nodes in the batch even when a
-    // shallower one scores much better — that's the whole point of depth
-    // bucketing (see rank_meets's doc: a strict global sort can bury a
-    // real multi-transfer option under a merely-straighter one, now
-    // merely-faster-looking one). A single global margin threshold applied
-    // AFTER that merge would immediately undo it — every deep candidate
-    // the merge preserved would likely fail a margin computed against the
-    // shallowest bucket's best score, since a fair transfer inherently
-    // costs more real time than a direct ride even when it's the right
-    // choice. Computing margin separately per depth bucket keeps each
-    // depth's own already-negotiated representation intact; only the hard
-    // SEED_MEET_SELECT_TOP_K ceiling below stays global, since that one is
-    // a pure backtracking-cost bound, not a fairness mechanism.
-    let num_margin_buckets = SAFETY_MARGIN_LEVELS as usize + 1;
-    let mut capped_by_depth: Vec<Vec<(i64, u32)>> = vec![Vec::new(); num_margin_buckets];
-    for &(node, combined) in capped {
-        capped_by_depth[meet_depth(combined, run.first_meet_total_level, num_margin_buckets)].push((node, combined));
-    }
-    let mut batch: Vec<(i64, u32)> = Vec::with_capacity(capped.len());
-    for depth_group in &capped_by_depth {
-        if depth_group.is_empty() { continue; }
-
-        let best_score = depth_group.iter()
-            .filter_map(|&(node, _)| run.meet_scores.get(&node).copied())
-            .filter(|&s| s < f64::MAX)
-            .fold(f64::MAX, f64::min);
-
-        // Toggle off, no scoreable node in this depth at all, or the
-        // path-level margin filter is doing the real selection instead
-        // (ENABLE_SEED_PATH_MARGIN — see its doc): keep the whole group
-        // rather than filtering against a threshold we can't meaningfully
-        // compute, or against a gate this mode is meant to replace (same
-        // fail-open reasoning as the per-node case below, applied at the
-        // group level).
-        if !ENABLE_SEED_MEET_SELECT_MARGIN_PRUNE || ENABLE_SEED_PATH_MARGIN || best_score >= f64::MAX {
-            batch.extend(depth_group.iter().copied());
-            continue;
-        }
-
-        let margin = margin_threshold(best_score, SEED_MEET_SELECT_MARGIN_FLOOR_SEC, SEED_MEET_SELECT_MARGIN_RELATIVE_PCT);
-        let threshold = best_score + margin;
-        // A node with no score on record (shouldn't happen — rank_meets
-        // scores every node it ever sorts — but treated as "unscoreable,
-        // keep it" rather than silently dropped, same fail-open reasoning
-        // used everywhere else an f64::MAX sentinel appears in this file).
-        batch.extend(depth_group.iter().filter(|&&(node, _)| run.meet_scores.get(&node).map(|&s| s <= threshold).unwrap_or(true)).copied());
-    }
-    // Hard ceiling on top of the margin filter — see SEED_MEET_SELECT_TOP_K's
-    // doc in settings.rs. Only actually sorts/truncates when the margin
-    // filter alone didn't already bring the batch under K. Skipped
-    // entirely in path-margin mode, same reasoning as the margin filter
-    // above — this ceiling exists to bound the OLD meet-level selection's
-    // backtracking cost, and path-margin mode wants every meet's paths
-    // backtracked so its own path-level margin has the full field to
-    // choose from.
-    if !ENABLE_SEED_PATH_MARGIN && batch.len() > SEED_MEET_SELECT_TOP_K {
-        batch.sort_by_cached_key(|&(node, _)| run.meet_scores.get(&node).copied().unwrap_or(f64::MAX).to_bits());
-        batch.truncate(SEED_MEET_SELECT_TOP_K);
-    }
-    let batch = batch.as_slice();
+    // `capped` is the raw count-based slice (batch_size is the outer
+    // ceiling the retry ladder doubles — see resolver.rs). Every meet in it
+    // is backtracked; path-level selection happens downstream.
+    let batch = capped;
 
     // PATH DEDUP (see the assembly loop below). A single edge straddling
     // the frontier is discovered as a "meeting point" from both endpoints,
@@ -1617,6 +1569,46 @@ mod tests {
     fn stop(pk: i64, lat: f64, lon: f64) -> StopRow {
         StopRow { stop_pk: pk, stop_id: pk.to_string(), stop_name: format!("s{pk}"), stop_lat: lat, stop_lon: lon, agency: 1 }
     }
+    fn walk_edge(to: i64, d: f64) -> CoarseEdge {
+        CoarseEdge { to, kind: EdgeKind::Walk, cost: 0.5, distance_m: d, via_pattern: None }
+    }
+
+    #[test]
+    fn walk_cover_keeps_only_stops_that_add_a_line() {
+        // Source 1 walks to 2 (10m, line 100), 3 (20m, line 100 again), 4 (30m, line 200),
+        // 5 (40m, lines 100+300 -> adds 300), 6 (500m, beyond max walk).
+        let mut adj: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        adj.insert(1, vec![walk_edge(4, 30.0), walk_edge(3, 20.0), walk_edge(6, 500.0), walk_edge(2, 10.0), walk_edge(5, 40.0), walk_edge(7, 50.0)]);
+        // (line, terminus): 2 and 3 are the same line+direction; 7 is the same line, opposite direction.
+        let mut lines: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+        lines.insert(2, vec![(100, 50)]); lines.insert(3, vec![(100, 50)]); lines.insert(4, vec![(200, 50)]);
+        lines.insert(5, vec![(100, 50), (300, 50)]); lines.insert(6, vec![(900, 50)]);
+        lines.insert(7, vec![(100, 60)]);
+        let graph = CoarseGraph::new(adj).with_stop_lines(lines);
+
+        let mut level_of: FxHashMap<i64, u32> = FxHashMap::default();
+        let mut parents_of: FxHashMap<i64, FxHashSet<ParentEdge>> = FxHashMap::default();
+        let mut start: FxHashSet<i64> = FxHashSet::default();
+        start.insert(1);
+        let out = walk_closure(&graph, start, &mut level_of, &mut parents_of, 0, 400.0);
+        let mut got: Vec<i64> = out.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2, 4, 5, 7]); // 3 dropped (same line+direction as closer 2), 7 kept (opposite direction), 6 too far
+    }
+
+    #[test]
+    fn walk_without_stop_lines_index_keeps_every_stop() {
+        let mut adj: HashMap<i64, Vec<CoarseEdge>> = HashMap::new();
+        adj.insert(1, vec![walk_edge(2, 10.0), walk_edge(3, 20.0)]);
+        let graph = CoarseGraph::new(adj);
+        let mut level_of: FxHashMap<i64, u32> = FxHashMap::default();
+        let mut parents_of: FxHashMap<i64, FxHashSet<ParentEdge>> = FxHashMap::default();
+        let mut start: FxHashSet<i64> = FxHashSet::default();
+        start.insert(1);
+        let out = walk_closure(&graph, start, &mut level_of, &mut parents_of, 0, 400.0);
+        assert_eq!(out.len(), 3);
+    }
+
     fn transit(to: i64, pattern: i64) -> CoarseEdge {
         CoarseEdge { to, kind: EdgeKind::Transit, cost: 1.0, distance_m: 0.0, via_pattern: Some(pattern) }
     }

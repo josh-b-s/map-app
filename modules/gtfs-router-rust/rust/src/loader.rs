@@ -49,11 +49,9 @@ pub type ActiveServicesCacheEntry = (String, String, Arc<HashSet<(i64, String)>>
 use rusqlite::Connection;
 use crate::geo::{haversine_meters, LatLon};
 use crate::graph::coarse::CoarseGraph;
-use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternHopsCache, PatternsCache, RoutesCache, StopsCache};
+use crate::repo::{PatternCumulativeCache, PatternHeadwayCache, PatternsCache, RoutesCache, StopsCache};
 use crate::corridor::resolver::{resolve_corridor, CorridorCache, SeedBfsCache};
-use crate::freq_raptor;
-use crate::time_corridor::{self, TimeCorridorIndex};
-use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, FREQ_GRAPH_MIN_CANDIDATE_PATTERNS, ENABLE_SEED_PATH_MARGIN};
+use crate::settings::{SEED_MEETS_RETRY_CEILING, TOP_N_SEED_MEETS, ENABLE_SEED_PATH_MARGIN};
 use crate::corridor::tagging::CorridorBoundary;
 use crate::corridor::seed_bfs::SearchDir;
 use crate::settings::{
@@ -78,23 +76,6 @@ fn window_ref_score(seed_path_scores: &[f64]) -> Option<f64> {
         (crate::settings::WINDOW_REF_RANK - 1).min(v.len() - 1)
     };
     Some(v[idx])
-}
-
-/// Same initial-window estimate step 6 uses (duration-based when the seed
-/// paths are scoreable, else distance-based), needed EARLIER to decide which
-/// edge-corridor patterns can run in the search window. Kept separate from
-/// step 6's inline copy so that code (and its diagnostics) stays untouched;
-/// if you change the window rules there, change them here too.
-fn estimate_window_sec(seed_path_scores: &[f64], straight_line_m: f64) -> f64 {
-    let distance_scaled_sec = (straight_line_m / 1000.0) * WINDOW_DISTANCE_SCALE_SEC_PER_KM + WINDOW_DISTANCE_BUFFER_SEC;
-    let distance_based = distance_scaled_sec.max(INITIAL_WINDOW_MIN_SEC).min(INITIAL_WINDOW_MAX_SEC);
-    if ENABLE_DURATION_BASED_WINDOW {
-        if let Some(ref_score) = window_ref_score(seed_path_scores) {
-            let margin = margin_threshold(ref_score, WINDOW_DURATION_MARGIN_FLOOR_SEC, WINDOW_DURATION_MARGIN_RELATIVE_PCT);
-            return (ref_score + margin).max(INITIAL_WINDOW_MIN_SEC).min(DURATION_WINDOW_MAX_SEC);
-        }
-    }
-    distance_based
 }
 
 #[derive(Debug, Clone)]
@@ -163,11 +144,6 @@ pub struct GtfsIndex {
     /// against real stop_times to confirm a candidate is genuinely
     /// boardable, in place of a full McRAPTOR scan.
     pub seed_path_edges: Vec<Vec<Option<i64>>>,
-    /// Pattern pools each corridor strategy proposed for this search (BFS edge
-    /// corridor / time corridor), kept so lib.rs can measure which pool
-    /// actually contained the patterns of the journey RAPTOR returned.
-    pub shadow_edge_pool_pks: Vec<i64>,
-    pub shadow_time_pool_pks: Vec<i64>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
     /// own console.log breakdown.
@@ -180,7 +156,7 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
         no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary,
         seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(),
-        shadow_edge_pool_pks: Vec::new(), shadow_time_pool_pks: Vec::new(), timings,
+        timings,
     }
 }
 
@@ -260,10 +236,8 @@ pub fn load_gtfs_index_for_trip(
     patterns: &PatternsCache,
     routes: &RoutesCache,
     graph: &CoarseGraph,
-    hops: &PatternHopsCache,
     headway: &PatternHeadwayCache,
     pattern_cumulative: &PatternCumulativeCache,
-    time_index: &TimeCorridorIndex,
     corridor_cache: &mut CorridorCache,
     bfs_cache: &mut SeedBfsCache,
     active_services_cache: &Mutex<Option<ActiveServicesCacheEntry>>,
@@ -344,30 +318,6 @@ pub fn load_gtfs_index_for_trip(
     };
     mark!(t, "active_services");
 
-    // ── Time corridor (network-wide, estimated seconds) ─────────────────
-    // Independent of the BFS corridor and of the retry loop below, so it is
-    // computed once. In shadow mode it only feeds comparison logging; with
-    // TIME_CORRIDOR_USE_AS_POOL it replaces the BFS edge-corridor pool.
-    let time_result: Option<time_corridor::TimeCorridorResult> = if crate::settings::TIME_CORRIDOR_ENABLED {
-        let tc = time_corridor::compute(
-            time_index, graph, stops, headway, origin, destination,
-            depart_sec_of_day, walking_speed_mps, max_walk_distance_m,
-        );
-        if let Some(r) = &tc {
-            timings.push(("time_corridor".to_string(), r.elapsed_ms));
-            for (phase, ms) in &r.phase_ms { timings.push((format!("time_corridor.{phase}"), *ms)); }
-            timings.push(("count.timecorr_patterns".to_string(), r.ranked.len() as i64));
-            for (i, arr) in r.best_arrival_by_legs.iter().enumerate() {
-                if let Some(a) = arr {
-                    timings.push((format!("window.timecorr_best_{}leg_sec", i + 1), (a - depart_sec_of_day).max(0)));
-                }
-            }
-        } else {
-            timings.push(("count.timecorr_unavailable".to_string(), 1));
-        }
-        tc
-    } else { None };
-
     // ── Corridor -> candidate patterns -> trips actually running today ──
     // Retried with a bigger seed-meet batch if a batch comes back with no
     // pattern that has an active trip at all. BFS itself only ever runs
@@ -417,72 +367,33 @@ pub fn load_gtfs_index_for_trip(
         timings.push(("count.corridor_stop_pks".to_string(), full_allowed_stop_pks.len() as i64));
         timings.push(("count.candidate_pattern_pks".to_string(), full_candidate_pattern_pks.len() as i64));
 
-        // ── Candidate-set narrowing: EITHER the seed-path margin filter
-        // OR freq_raptor's frequency-graph pre-filter, never both — see
-        // ENABLE_SEED_PATH_MARGIN's doc in settings.rs for why these are
-        // two competing strategies for the same job (narrow the
-        // materialized candidate set BEFORE trips_for_candidates /
-        // windowed_discovery_and_fetch run below) rather than stacked
-        // stages. Both produce the same `FreqNarrowResult` shape so every
-        // consumer below — the active-trip lookup, the cheap
-        // fallback-to-full, all the timings/logging — is shared code,
-        // unaware of which strategy actually produced it.
-        // Pool of "edge-style" patterns handed to the narrowing below: the BFS
-        // edge corridor by default, or the time corridor's ranked patterns
-        // when TIME_CORRIDOR_USE_AS_POOL is on and it produced a result.
-        let use_time_pool = crate::settings::TIME_CORRIDOR_USE_AS_POOL && time_result.is_some();
-        let (pool_pks, pool_stops_by_pattern, pool_stop_union): (Vec<i64>, &HashMap<i64, Vec<i64>>, Vec<i64>) =
-            match (&time_result, use_time_pool) {
-                (Some(tc), true) => (
-                    tc.ranked.iter().map(|p| p.pattern_pk).collect(),
-                    &tc.stops_by_pattern,
-                    tc.stops_by_pattern.values().flatten().copied().collect::<HashSet<i64>>().into_iter().collect(),
-                ),
-                _ => (
-                    resolved.edge_corridor_pattern_pks.clone(),
-                    &resolved.edge_corridor_stops_by_pattern,
-                    resolved.edge_corridor_stop_pks.iter().copied().collect(),
-                ),
-            };
-        if let Some(tc) = &time_result {
-            let edge_set: HashSet<i64> = resolved.edge_corridor_pattern_pks.iter().copied().collect();
-            let time_set: HashSet<i64> = tc.ranked.iter().map(|p| p.pattern_pk).collect();
-            let overlap = edge_set.intersection(&time_set).count() as i64;
-            timings.push(("count.timecorr_only".to_string(), time_set.len() as i64 - overlap));
-            timings.push(("count.edgecorr_only".to_string(), edge_set.len() as i64 - overlap));
-            timings.push(("count.timecorr_edgecorr_overlap".to_string(), overlap));
-        }
-        let freq_narrow: Option<freq_raptor::FreqNarrowResult> = if ENABLE_SEED_PATH_MARGIN {
-            // Union of patterns/stops across every margin-kept whole
-            // candidate trip (resolve_corridor/materialize_seed_paths
-            // already did the actual margin filtering — this just
-            // flattens what survived). See seed_path_pattern_pks' doc for
-            // why this field isn't debug-only despite the naming symmetry
-            // with debug_seed_paths.
+        // ── Candidate set: patterns from every margin-kept seed path plus the
+        // BFS edge corridor's patterns (structural, not tied to which whole
+        // paths survived scoring/caps — e.g. an optional short ride between
+        // two stops that are also within walking distance).
+        let pool_pks: &Vec<i64> = &resolved.edge_corridor_pattern_pks;
+        let pool_stops_by_pattern = &resolved.edge_corridor_stops_by_pattern;
+        let narrow: Option<(HashSet<i64>, HashSet<i64>, HashSet<i64>)> = {
             let mut pattern_pks: HashSet<i64> = HashSet::new();
             for pats in &resolved.seed_path_pattern_pks { pattern_pks.extend(pats.iter().copied()); }
-            // Plus the edge-based corridor's patterns (structural, not tied to
-            // which whole paths survived scoring/caps) — e.g. an optional short
-            // ride between two stops that are also within walking distance.
             let before_edge = pattern_pks.len();
             pattern_pks.extend(pool_pks.iter().copied());
             timings.push(("count.edge_corridor_patterns_added".to_string(), (pattern_pks.len() - before_edge) as i64));
-            // Deliberately NOT narrowed to the literal stops in the
-            // margin-kept `paths` — those are a handful of discrete
-            // backtracked stop SEQUENCES, not every stop the surviving
-            // patterns actually run through. Narrowing stop_pks to just
-            // those broke real routes whose correct boarding/alighting
-            // stop simply wasn't the one a particular backtracked path
-            // happened to record, even though the pattern itself was kept
-            // (that stop's stop_times rows get filtered out downstream by
-            // `stop_pk IN corridor_stop_pks` regardless of pattern_pks).
-            // freq_raptor's own narrowing barely touches stops either (see
-            // count.freq_narrowed_stop_pks vs corridor_stop_pks in past
-            // runs) — patterns are where the real narrowing should happen,
-            // stops should stay generous.
-            // Fetch only stops that lie on a loaded pattern (+ the edge
-            // corridor's endpoints): the rest never have a candidate trip,
-            // yet each still costs a time-range lookup in the stop_times fetch.
+            // Route -> pattern expansion: the graph is per line, so a selected
+            // line may be represented by one pattern (the fastest for that stop
+            // pair) while its express / short-turn / all-stops siblings are
+            // just as boardable. Add every candidate pattern of a selected line.
+            let selected_lines: HashSet<i64> = pattern_pks.iter().map(|&pk| patterns.line_key(pk)).collect();
+            let mut expanded: HashSet<i64> = HashSet::new();
+            for &pk in &full_candidate_pattern_pks {
+                if !pattern_pks.contains(&pk) && selected_lines.contains(&patterns.line_key(pk)) {
+                    expanded.insert(pk);
+                }
+            }
+            pattern_pks.extend(expanded.iter().copied());
+            timings.push(("count.route_expanded_patterns".to_string(), expanded.len() as i64));
+            // Stops stay generous (patterns are where the narrowing happens):
+            // only stops lying on a loaded pattern, plus the edge corridor's stops.
             let stop_pks: HashSet<i64> = if crate::settings::NARROW_FETCH_STOPS_TO_PATTERNS {
                 let mut s: HashSet<i64> = HashSet::new();
                 for r in &resolved.pattern_stop_rows {
@@ -490,62 +401,18 @@ pub fn load_gtfs_index_for_trip(
                         s.insert(r.stop_pk);
                     }
                 }
-                s.extend(pool_stop_union.iter().copied());
+                s.extend(resolved.edge_corridor_stop_pks.iter().copied());
                 timings.push(("count.fetch_stops_before_narrowing".to_string(), full_allowed_stop_pks.len() as i64));
                 s
             } else {
                 full_allowed_stop_pks.clone()
             };
-
-            let best_score = resolved.seed_path_scores.iter().copied().filter(|&s| s < f64::MAX).fold(f64::MAX, f64::min);
-            // depart_sec_of_day + best whole-trip estimate, same
-            // "estimated best arrival sec-of-day" semantics
-            // FreqNarrowResult's doc promises — kept meaningful here
-            // rather than a placeholder, since freq_raptor.applied's
-            // fallback-to-full logging below doesn't distinguish sources.
-            let estimated_best_arrival_sec = if best_score < f64::MAX {
-                depart_sec_of_day + best_score.round() as i64
-            } else {
-                depart_sec_of_day
-            };
-
             timings.push(("count.seed_path_narrowed_pattern_pks".to_string(), pattern_pks.len() as i64));
             timings.push(("count.seed_path_narrowed_stop_pks".to_string(), stop_pks.len() as i64));
-
-            if pattern_pks.is_empty() {
-                // No margin-kept path at all — same "couldn't estimate,
-                // fall back to unnarrowed" contract FreqNarrowResult's own
-                // doc requires of freq_raptor::narrow_candidates.
-                None
-            } else {
-                Some(freq_raptor::FreqNarrowResult { pattern_pks, stop_pks, estimated_best_arrival_sec })
-            }
-        } else if full_candidate_pattern_pks.len() >= FREQ_GRAPH_MIN_CANDIDATE_PATTERNS {
-            // ── Frequency-graph pre-filter (freq_raptor.rs) ───────────────
-            // Narrows the materialized candidate set using precomputed
-            // hop-times/headways instead of real stop_times rows — see
-            // freq_raptor.rs's module doc for the algorithm and the
-            // pruning-safety margin reasoning. Gated by a size threshold:
-            // below FREQ_GRAPH_MIN_CANDIDATE_PATTERNS there's nothing worth
-            // narrowing, so this stage's own (small) overhead isn't worth
-            // paying.
-            let t = Instant::now();
-            let r = freq_raptor::narrow_candidates(
-                &resolved.pattern_pks, &full_allowed_stop_pks, &resolved.pattern_stop_rows,
-                hops, headway, graph, stops, origin, destination, depart_sec_of_day, walking_speed_mps, max_walk_distance_m,
-            );
-            mark!(t, "freq_raptor_narrow");
-            timings.push(("freq_raptor.applied".to_string(), r.is_some() as i64));
-            if let Some(res) = &r {
-                timings.push(("count.freq_narrowed_pattern_pks".to_string(), res.pattern_pks.len() as i64));
-                timings.push(("count.freq_narrowed_stop_pks".to_string(), res.stop_pks.len() as i64));
-            }
-            r
-        } else {
-            None
+            if pattern_pks.is_empty() { None } else { Some((pattern_pks, stop_pks, expanded)) }
         };
 
-        // Pulled out so the freq-narrowed attempt and the unnarrowed
+        // Pulled out so the narrowed attempt and the unnarrowed
         // fallback attempt below share one code path instead of two
         // hand-maintained copies of the exact same query.
         let run_trips_for_candidates = |pattern_pks: &[i64]| -> rusqlite::Result<(HashSet<i64>, HashMap<i64, i64>, HashSet<i64>)> {
@@ -578,48 +445,38 @@ pub fn load_gtfs_index_for_trip(
 
         let t = Instant::now();
         let (active_trip_pks, trip_pk_to_pattern, pattern_keys_with_active_trip, allowed_stop_pks, candidate_pattern_pks) =
-            if let Some(narrow) = &freq_narrow {
-                let pool_patterns: Vec<i64> = narrow.pattern_pks.iter().copied().collect();
+            if let Some((narrow_patterns, narrow_stops, expanded_patterns)) = &narrow {
+                let pool_patterns: Vec<i64> = narrow_patterns.iter().copied().collect();
                 // ONE trips query over seed patterns + the whole edge pool; the
                 // active-trip maps it returns are then narrowed to the final
                 // selection below instead of being fetched a second time.
                 let (mut a, mut t2p, mut p) = run_trips_for_candidates(&pool_patterns)?;
                 let mut narrowed_patterns: Vec<i64> = pool_patterns;
-                let mut fetch_stops: HashSet<i64> = narrow.stop_pks.clone();
+                let mut fetch_stops: HashSet<i64> = narrow_stops.clone();
 
                 if ENABLE_SEED_PATH_MARGIN && crate::settings::FILTER_EDGE_POOL_BY_ACTIVITY && !p.is_empty() {
                     // ── Pick the edge patterns to load from the ranked pool ──
                     // Walk the pool in rank order and only let patterns that can
-                    // run take a slot: (1) no active trip today = never (exact),
-                    // (2) pattern_headway has service only in buckets outside the
-                    // search window = skip. Seed-path patterns are always kept
-                    // (when active) and count toward the cap like before.
-                    let window_sec = force_window_sec.map(|v| v as f64)
-                        .unwrap_or_else(|| estimate_window_sec(&resolved.seed_path_scores, haversine_meters(origin, destination)));
-                    let hw_lo = depart_sec_of_day - WINDOW_BOARD_BUFFER_SEC - crate::settings::HEADWAY_WINDOW_LOOKBACK_SEC;
-                    let hw_hi = depart_sec_of_day + window_sec.round() as i64;
-
+                    // run take a slot (no active trip today = never, exact).
+                    // Seed-path patterns are always kept (when active) and count toward the cap.
                     let mut seed_patterns: HashSet<i64> = HashSet::new();
                     for pats in &resolved.seed_path_pattern_pks { seed_patterns.extend(pats.iter().copied()); }
                     let mut keep: HashSet<i64> = seed_patterns.iter().copied().filter(|pk| p.contains(pk)).collect();
 
+                    // Route-expanded siblings of selected lines: kept whenever they
+                    // run today (they're the same line, so no extra rank/cap).
+                    for &pk in expanded_patterns { if p.contains(&pk) { keep.insert(pk); } }
+
                     let mut taken: usize = 0;
-                    let (mut dropped_inactive, mut dropped_headway, mut dropped_cap) = (0i64, 0i64, 0i64);
-                    for &pk in &pool_pks {
+                    let (mut dropped_inactive, mut dropped_cap) = (0i64, 0i64);
+                    for &pk in pool_pks {
                         if !p.contains(&pk) { dropped_inactive += 1; continue; }
                         if seed_patterns.contains(&pk) { taken += 1; continue; } // already in `keep`
-                        if crate::settings::ENABLE_HEADWAY_WINDOW_FILTER
-                            && headway.runs_in_window(pk, hw_lo, hw_hi) == Some(false)
-                        {
-                            dropped_headway += 1;
-                            continue;
-                        }
                         if taken >= crate::settings::MAX_EDGE_CORRIDOR_EXTRA_PATTERNS { dropped_cap += 1; continue; }
                         taken += 1;
                         keep.insert(pk);
                     }
                     timings.push(("count.edge_pool_dropped_inactive".to_string(), dropped_inactive));
-                    timings.push(("count.edge_pool_dropped_headway".to_string(), dropped_headway));
                     timings.push(("count.edge_pool_dropped_cap".to_string(), dropped_cap));
 
                     if !keep.is_empty() {
@@ -639,7 +496,7 @@ pub fn load_gtfs_index_for_trip(
                                     s.insert(r.stop_pk);
                                 }
                             }
-                            for pk in &pool_pks {
+                            for pk in pool_pks {
                                 if !keep.contains(pk) { continue; }
                                 if let Some(v) = pool_stops_by_pattern.get(pk) { s.extend(v.iter().copied()); }
                             }
@@ -653,8 +510,7 @@ pub fn load_gtfs_index_for_trip(
                 if !p.is_empty() {
                     (a, t2p, p, fetch_stops, narrowed_patterns)
                 } else {
-                    // CHEAP FALLBACK (see freq_raptor.rs's pruning-safety
-                    // doc): the narrowed set had NO active service today —
+                    // CHEAP FALLBACK: the narrowed set had NO active service today —
                     // retry against the FULL materialized candidate set
                     // before reaching for the expensive batch_size-doubling
                     // retry below. This costs one more trips_for_candidates
@@ -665,7 +521,7 @@ pub fn load_gtfs_index_for_trip(
                     // as distinct from BFS/batch_size genuinely not having
                     // found enough candidates (that failure mode still
                     // falls through to the existing retry below).
-                    timings.push(("freq_raptor.fallback_to_full".to_string(), 1));
+                    timings.push(("narrow.fallback_to_full".to_string(), 1));
                     let (a, t2p, p) = run_trips_for_candidates(&full_candidate_pattern_pks)?;
                     (a, t2p, p, full_allowed_stop_pks.clone(), full_candidate_pattern_pks.clone())
                 }
@@ -704,7 +560,7 @@ pub fn load_gtfs_index_for_trip(
     // Reuse resolver's already-fetched rows when available (normal
     // seed-path-derived path); only re-query on the bbox-fallback path.
     let t = Instant::now();
-    let mut pattern_stop_rows: Vec<crate::repo::PatternStopRow> = if !resolved.pattern_stop_rows.is_empty() {
+    let pattern_stop_rows: Vec<crate::repo::PatternStopRow> = if !resolved.pattern_stop_rows.is_empty() {
         resolved.pattern_stop_rows.iter()
             .filter(|r| pattern_keys_with_active_trip.contains(&r.pattern_pk))
             .cloned()
@@ -712,14 +568,6 @@ pub fn load_gtfs_index_for_trip(
     } else {
         crate::repo::get_pattern_stops_for_patterns(conn, &patterns_running_today)?
     };
-    // Patterns picked outside the BFS corridor (time-corridor pool) have no
-    // rows in resolver's set — fill them from the resident index, no SQL.
-    if !resolved.pattern_stop_rows.is_empty() {
-        let have: HashSet<i64> = pattern_stop_rows.iter().map(|r| r.pattern_pk).collect();
-        let missing: Vec<i64> = patterns_running_today.iter().copied().filter(|pk| !have.contains(pk)).collect();
-        if !missing.is_empty() { pattern_stop_rows.extend(time_index.rows_for_patterns(&missing)); }
-    }
-
     let mut pattern_stops: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     for r in &pattern_stop_rows {
         pattern_stops.entry(r.pattern_pk).or_default().push((r.stop_pk, r.stop_sequence));
@@ -942,8 +790,6 @@ pub fn load_gtfs_index_for_trip(
             debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
             seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
             seed_path_edges: resolved.seed_path_edges.clone(),
-            shadow_edge_pool_pks: resolved.edge_corridor_pattern_pks.clone(),
-            shadow_time_pool_pks: time_result.as_ref().map(|r| r.ranked.iter().map(|p| p.pattern_pk).collect()).unwrap_or_default(),
             timings,
         });
     }
@@ -965,8 +811,6 @@ pub fn load_gtfs_index_for_trip(
         debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
         seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
         seed_path_edges: resolved.seed_path_edges.clone(),
-        shadow_edge_pool_pks: resolved.edge_corridor_pattern_pks.clone(),
-        shadow_time_pool_pks: time_result.as_ref().map(|r| r.ranked.iter().map(|p| p.pattern_pk).collect()).unwrap_or_default(),
         timings,
     })
 }

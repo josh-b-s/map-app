@@ -155,10 +155,9 @@ impl SeedBfsCache {
 /// if every PATTERN (not just route) serving it is already covered by a
 /// closer seed already picked, so the seed budget goes toward genuinely
 /// different rides rather than being spent on several stops of the same
-/// physical pattern. Pattern-level rather than route-level deliberately —
-/// see `get_pattern_pks_for_stops`'s doc for why route-level dedup can
-/// wrongly discard a farther stop that's the only seed for a genuinely
-/// different pattern sharing that route number. Falls back to the nearest
+/// physical line. Deduped on (line, terminus) so opposite directions and
+/// short-turn variants stay distinct (pattern-level SQL fallback when the
+/// resident stop->lines index is unavailable). Falls back to the nearest
 /// MIN_SEED_STOPS (dedup still applied) if the radius alone doesn't reach
 /// that floor.
 ///
@@ -173,6 +172,7 @@ impl SeedBfsCache {
 /// brute-force version always gave, just paid only in that rare case.
 fn nearest_for_seed(
     conn: &Connection,
+    graph: &CoarseGraph,
     stops: &StopsCache,
     center: LatLon,
     max_walk_distance_m: f64,
@@ -208,20 +208,38 @@ fn nearest_for_seed(
     let raw_candidates: Vec<(&StopRow, f64)> = within_radius.into_iter().take(MAX_SEED_STOPS * 3).collect();
     let candidate_pks: Vec<i64> = raw_candidates.iter().map(|(s, _)| s.stop_pk).collect();
 
-    let routes_by_stop = get_patterns_by_stop(conn, &candidate_pks)?;
-
-    let mut covered_patterns: HashSet<i64> = HashSet::new();
     let mut selected: Vec<&StopRow> = Vec::new();
-    for (s, _) in &raw_candidates {
-        if selected.len() >= MAX_SEED_STOPS { break; }
-        match routes_by_stop.get(&s.stop_pk) {
-            None => { selected.push(s); continue; }
-            Some(pats) if pats.is_empty() => { selected.push(s); continue; }
-            Some(pats) => {
-                let adds_new = pats.iter().any(|p| !covered_patterns.contains(p));
-                if !adds_new { continue; }
-                for &p in pats { covered_patterns.insert(p); }
-                selected.push(s);
+    if !graph.stop_lines.is_empty() {
+        // (line, terminus) dedupe from the resident index — no SQL. Same key as
+        // the BFS walk cover: different routes, opposite directions and
+        // short-turn variants stay distinct; same-line/direction variants merge.
+        let mut covered: HashSet<(i64, i64)> = HashSet::new();
+        for (s, _) in &raw_candidates {
+            if selected.len() >= MAX_SEED_STOPS { break; }
+            match graph.stop_lines.get(&s.stop_pk) {
+                None => { selected.push(s); }
+                Some(keys) if keys.is_empty() => { selected.push(s); }
+                Some(keys) => {
+                    let mut adds_new = false;
+                    for &k in keys { if covered.insert(k) { adds_new = true; } }
+                    if adds_new { selected.push(s); }
+                }
+            }
+        }
+    } else {
+        let routes_by_stop = get_patterns_by_stop(conn, &candidate_pks)?;
+        let mut covered_patterns: HashSet<i64> = HashSet::new();
+        for (s, _) in &raw_candidates {
+            if selected.len() >= MAX_SEED_STOPS { break; }
+            match routes_by_stop.get(&s.stop_pk) {
+                None => { selected.push(s); continue; }
+                Some(pats) if pats.is_empty() => { selected.push(s); continue; }
+                Some(pats) => {
+                    let adds_new = pats.iter().any(|p| !covered_patterns.contains(p));
+                    if !adds_new { continue; }
+                    for &p in pats { covered_patterns.insert(p); }
+                    selected.push(s);
+                }
             }
         }
     }
@@ -356,8 +374,8 @@ pub fn resolve_corridor(
     // Sequential, not concurrent — mirrors the TS version's own note about
     // a single shared SQLite connection; here it's simply because rusqlite
     // Connection isn't Sync-shareable without its own locking anyway.
-    let origin_seed_pks = nearest_for_seed(conn, stops, origin, max_walk_distance_m)?;
-    let dest_seed_pks = nearest_for_seed(conn, stops, destination, max_walk_distance_m)?;
+    let origin_seed_pks = nearest_for_seed(conn, graph, stops, origin, max_walk_distance_m)?;
+    let dest_seed_pks = nearest_for_seed(conn, graph, stops, destination, max_walk_distance_m)?;
     sub_timings.push(("nearest_for_seed_x2".to_string(), t.elapsed().as_millis() as i64));
 
     // BFS itself — cached WITHOUT batch_size (see SeedBfsCache doc), so a
