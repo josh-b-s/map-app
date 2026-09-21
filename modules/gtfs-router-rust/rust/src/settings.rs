@@ -193,6 +193,11 @@ pub const ENABLE_DURATION_BASED_WINDOW: bool = true;
 /// (slowest candidate 10-13h against real journeys of 1.5-3.5h). In logged
 /// runs the returned journey was never slower than the fastest candidate's
 /// estimate, so a low rank plus the margin below still covers it.
+///
+/// Now 1 (fastest candidate). Logged runs: candidate estimates ran 12-26%
+/// ABOVE the journey RAPTOR actually returned, so fastest + the 25% margin
+/// still left ~40% headroom, whereas rank 5 left 50-85%. The widening
+/// stages / forced wide retry remain the safety net if this ever misses.
 pub const WINDOW_REF_RANK: usize = 5;
 pub const WINDOW_DURATION_MARGIN_FLOOR_SEC: f64 = 10.0 * 60.0;
 pub const WINDOW_DURATION_MARGIN_RELATIVE_PCT: f64 = 0.25;
@@ -343,6 +348,23 @@ pub const FILTER_EDGE_POOL_BY_ACTIVITY: bool = true;
 /// Only takes effect together with NARROW_FETCH_STOPS_TO_PATTERNS.
 pub const NARROW_FETCH_STOPS_TO_ACTIVE_PATTERNS: bool = true;
 
+/// Route expansion (loader.rs) adds the other candidate patterns of every
+/// selected line, but only those sharing at least this many stops with the
+/// line's already-selected patterns — an express / short-turn / all-stops
+/// sibling overlaps the selected variant on its corridor, whereas a variant
+/// serving a different branch of the same route does not. 0 = no filter
+/// (expand every candidate pattern of a selected line). A pattern with no
+/// stop rows on record is always kept (fail open).
+pub const EXPANSION_MIN_SHARED_STOPS: usize = 0;
+
+/// true = route expansion only considers lines used by the kept seed paths
+/// (the top-N whole candidate trips), not every line the wider BFS edge
+/// corridor happened to touch. Logged runs: expansion added 500-1,000
+/// patterns per search but only 1-4 ever appeared in a returned journey, and
+/// the edge corridor supplies most of those lines. false = old behaviour
+/// (expand every selected line, seed or edge).
+pub const EXPAND_SEED_LINES_ONLY: bool = false;
+
 /// When one BFS side reaches a stop the OTHER side has already reached (a
 /// "touched" stop), should it still expand transit hops from it?
 ///  - true  = yes. The touched stop is one meeting point, but a different
@@ -482,3 +504,11 @@ pub fn level_cap_for(max_transfers: u32) -> u32 {
     max_transfers.max(1) + 1
 }
 
+/// Diagnostic for the windowed stop_times fetch: after the real fetch, also
+/// count how many stop_times rows the SAME stop/window range holds BEFORE the
+/// active-trip filter (`count.stop_times_rows_scanned`), log how long that
+/// count takes (`diag.scan_count_ms`), and log SQLite's query plan for the
+/// fetch as `plan.*` labels. scanned >> returned means most of the fetch is
+/// spent walking trips of patterns we never loaded. Costs one extra range
+/// scan per search — set false when not investigating.
+pub const DIAG_FETCH_SCAN: bool = false;

@@ -144,6 +144,10 @@ pub struct GtfsIndex {
     /// against real stop_times to confirm a candidate is genuinely
     /// boardable, in place of a full McRAPTOR scan.
     pub seed_path_edges: Vec<Vec<Option<i64>>>,
+    /// Loaded patterns that came ONLY from route expansion (not a seed-path
+    /// pattern and not an edge-corridor pattern) — diagnostic, lets lib.rs
+    /// measure whether expansion actually contributed to returned journeys.
+    pub expanded_pattern_pks: Vec<i64>,
     /// (label, elapsed_ms) for each stage — diagnostic only, surfaced to
     /// JS via RouteResult.timings for A/B profiling against gtfsLoader.ts's
     /// own console.log breakdown.
@@ -155,7 +159,7 @@ fn empty_index(allowed_stop_pks: HashSet<i64>, debug_seed_paths: Vec<Vec<i64>>, 
         allowed_stop_pks, patterns_by_pk: HashMap::new(), pattern_stops: HashMap::new(),
         stop_times_by_stop: HashMap::new(), stop_times_by_stop_and_pattern: HashMap::new(), stop_times_by_stop_and_trip: HashMap::new(),
         no_service_found: true, debug_seed_paths, debug_seed_path_depths, debug_bfs_levels, debug_corridor_boundary,
-        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(),
+        seed_path_pattern_pks: Vec::new(), seed_path_scores: Vec::new(), seed_path_edges: Vec::new(), expanded_pattern_pks: Vec::new(),
         timings,
     }
 }
@@ -383,14 +387,45 @@ pub fn load_gtfs_index_for_trip(
             // line may be represented by one pattern (the fastest for that stop
             // pair) while its express / short-turn / all-stops siblings are
             // just as boardable. Add every candidate pattern of a selected line.
-            let selected_lines: HashSet<i64> = pattern_pks.iter().map(|&pk| patterns.line_key(pk)).collect();
+            let selected_lines: HashSet<i64> = if crate::settings::EXPAND_SEED_LINES_ONLY {
+                resolved.seed_path_pattern_pks.iter().flatten().map(|&pk| patterns.line_key(pk)).collect()
+            } else {
+                pattern_pks.iter().map(|&pk| patterns.line_key(pk)).collect()
+            };
+            timings.push(("count.route_expansion_lines".to_string(), selected_lines.len() as i64));
             let mut expanded: HashSet<i64> = HashSet::new();
-            for &pk in &full_candidate_pattern_pks {
-                if !pattern_pks.contains(&pk) && selected_lines.contains(&patterns.line_key(pk)) {
-                    expanded.insert(pk);
+            let mut expansion_dropped = 0i64;
+            let min_shared = crate::settings::EXPANSION_MIN_SHARED_STOPS;
+            // Stops already covered per selected line (by its selected patterns).
+            let mut line_stops: HashMap<i64, HashSet<i64>> = HashMap::new();
+            if min_shared > 0 {
+                for r in &resolved.pattern_stop_rows {
+                    if pattern_pks.contains(&r.pattern_pk) {
+                        line_stops.entry(patterns.line_key(r.pattern_pk)).or_default().insert(r.stop_pk);
+                    }
                 }
             }
+            // Shared-stop count per candidate sibling pattern, and which ones have rows at all.
+            let mut shared: HashMap<i64, usize> = HashMap::new();
+            let mut has_rows: HashSet<i64> = HashSet::new();
+            if min_shared > 0 {
+                for r in &resolved.pattern_stop_rows {
+                    if pattern_pks.contains(&r.pattern_pk) { continue; }
+                    let line = patterns.line_key(r.pattern_pk);
+                    let Some(covered) = line_stops.get(&line) else { continue };
+                    has_rows.insert(r.pattern_pk);
+                    if covered.contains(&r.stop_pk) { *shared.entry(r.pattern_pk).or_insert(0) += 1; }
+                }
+            }
+            for &pk in &full_candidate_pattern_pks {
+                if pattern_pks.contains(&pk) || !selected_lines.contains(&patterns.line_key(pk)) { continue; }
+                let keep = min_shared == 0
+                    || !has_rows.contains(&pk)
+                    || shared.get(&pk).copied().unwrap_or(0) >= min_shared;
+                if keep { expanded.insert(pk); } else { expansion_dropped += 1; }
+            }
             pattern_pks.extend(expanded.iter().copied());
+            timings.push(("count.route_expansion_dropped".to_string(), expansion_dropped));
             timings.push(("count.route_expanded_patterns".to_string(), expanded.len() as i64));
             // Stops stay generous (patterns are where the narrowing happens):
             // only stops lying on a loaded pattern, plus the edge corridor's stops.
@@ -545,6 +580,15 @@ pub fn load_gtfs_index_for_trip(
         timings.push(("seed_batch_retry.from_batch_size".to_string(), batch_size as i64));
         batch_size = (batch_size * 2).min(SEED_MEETS_RETRY_CEILING);
     };
+
+    // Loaded patterns that only route expansion brought in (diagnostic).
+    let expanded_loaded: Vec<i64> = {
+        let mut base: HashSet<i64> = HashSet::new();
+        for pats in &resolved.seed_path_pattern_pks { base.extend(pats.iter().copied()); }
+        base.extend(resolved.edge_corridor_pattern_pks.iter().copied());
+        candidate_pattern_pks.iter().copied().filter(|pk| !base.contains(pk) && pattern_keys_with_active_trip.contains(pk)).collect()
+    };
+    timings.push(("count.expanded_loaded_patterns".to_string(), expanded_loaded.len() as i64));
 
     if candidate_pattern_pks.is_empty() || pattern_keys_with_active_trip.is_empty() {
         mark!(t_total, "total");
@@ -774,6 +818,35 @@ pub fn load_gtfs_index_for_trip(
         if !windowed_trip_pks.is_empty() { break; }
     }
     mark!(t, "windowed_discovery_and_fetch");
+
+    if crate::settings::DIAG_FETCH_SCAN {
+        let last_window = window_stages[(stages_tried as usize).saturating_sub(1).min(window_stages.len() - 1)];
+        let lo = (depart_sec_of_day - WINDOW_BOARD_BUFFER_SEC).max(0);
+        let hi = depart_sec_of_day + last_window;
+        let t_diag = Instant::now();
+        let scanned: rusqlite::Result<i64> = conn.query_row(
+            "SELECT COUNT(*) FROM stop_times \
+             WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
+             AND departure_sec BETWEEN ?1 AND ?2",
+            [lo, hi], |r| r.get(0));
+        if let Ok(n) = scanned {
+            timings.push(("count.stop_times_rows_scanned".to_string(), n));
+            timings.push(("diag.scan_count_ms".to_string(), t_diag.elapsed().as_millis() as i64));
+        }
+        // Query plan of the real fetch, one `plan.<detail>` label per plan row.
+        if let Ok(mut stmt) = conn.prepare(
+            "EXPLAIN QUERY PLAN SELECT trip_pk, stop_pk, stop_sequence, arrival_sec, departure_sec, pickup_type, drop_off_type \
+             FROM stop_times \
+             WHERE stop_pk IN (SELECT id FROM corridor_stop_pks) \
+             AND departure_sec BETWEEN ?1 AND ?2 \
+             AND trip_pk IN (SELECT id FROM active_trip_pks_staged)") {
+            if let Ok(rows) = stmt.query_map([lo, hi], |r| r.get::<_, String>(3)) {
+                for (i, d) in rows.flatten().enumerate() {
+                    timings.push((format!("plan.{i}.{}", d.replace(' ', "_")), 0));
+                }
+            }
+        }
+    }
     timings.push(("windowed_trip_discovery.stages_tried".to_string(), stages_tried));
     timings.push(("count.windowed_trip_pks".to_string(), windowed_trip_pks.len() as i64));
     timings.push(("count.stop_times_rows_returned".to_string(), rows_returned_total));
@@ -790,6 +863,7 @@ pub fn load_gtfs_index_for_trip(
             debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
             seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
             seed_path_edges: resolved.seed_path_edges.clone(),
+            expanded_pattern_pks: expanded_loaded.clone(),
             timings,
         });
     }
@@ -811,6 +885,7 @@ pub fn load_gtfs_index_for_trip(
         debug_corridor_boundary: resolved.debug_corridor_boundary.clone(),
         seed_path_pattern_pks: resolved.seed_path_pattern_pks.clone(), seed_path_scores: resolved.seed_path_scores.clone(),
         seed_path_edges: resolved.seed_path_edges.clone(),
+        expanded_pattern_pks: expanded_loaded,
         timings,
     })
 }

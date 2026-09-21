@@ -739,6 +739,17 @@ impl GtfsRouterEngine {
                             if !index.patterns_by_pk.contains_key(pk) { miss_loaded += 1; }
                         }
                     }
+                    // Patterns of the returned journeys that ONLY route expansion loaded.
+                    let expanded: std::collections::HashSet<i64> = index.expanded_pattern_pks.iter().copied().collect();
+                    let mut needed_expansion = 0i64;
+                    let mut journeys_needing_expansion = 0i64;
+                    for j in &journeys {
+                        let n = j.used_pattern_pks.iter().filter(|pk| expanded.contains(pk) && !kept_patterns.contains(pk)).count() as i64;
+                        needed_expansion += n;
+                        if n > 0 { journeys_needing_expansion += 1; }
+                    }
+                    timings.push(TimingEntry { label: "count.journey_patterns_from_expansion".to_string(), ms: needed_expansion });
+                    timings.push(TimingEntry { label: "count.journeys_needing_expansion".to_string(), ms: journeys_needing_expansion });
                     timings.push(TimingEntry { label: "count.journey_patterns_used".to_string(), ms: used });
                     timings.push(TimingEntry { label: "count.journey_patterns_missing_from_loaded".to_string(), ms: miss_loaded });
                 }
