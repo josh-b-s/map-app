@@ -8,10 +8,12 @@ import { Provider } from 'react-redux';
 import { store } from '@/store/store';
 import '@/global.css';
 import { warmUpGtfsEngine } from '@/services/gtfs/warmup/gtfsWarmup';
+import { loadPreferences } from '@/store/preferences.slice';
 
 export default function Layout() {
     useEffect(() => {
         warmUpGtfsEngine(); // deliberately not awaited — shouldn't block first paint
+        store.dispatch(loadPreferences()); // applies the saved theme mode via nativewind as soon as it resolves
     }, []);
 
     return (

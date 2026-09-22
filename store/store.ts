@@ -3,6 +3,7 @@ import searchReducer from './search.slice';
 import locationReducer from './location.slice';
 import routeReducer from './route.slice';
 import debugReducer from './debug.slice';
+import preferencesReducer from './preferences.slice';
 
 export const store = configureStore({
     reducer: {
@@ -10,6 +11,7 @@ export const store = configureStore({
         location: locationReducer,
         route: routeReducer,
         debug: debugReducer,
+        preferences: preferencesReducer,
     },
 });
 
