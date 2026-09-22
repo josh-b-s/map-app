@@ -1,5 +1,5 @@
 import React, { forwardRef, useMemo, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import { BottomSheetModal, BottomSheetView, BottomSheetScrollView } from '@gorhom/bottom-sheet';
 import { SharedValue } from 'react-native-reanimated';
 import { useDispatch, useSelector } from 'react-redux';
@@ -7,6 +7,8 @@ import { RootState, AppDispatch } from '@/store/store';
 import { SHADOW, TOP_SAFE, useThemeStyle } from '@/constants/themes';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { selectJourney } from '@/store/route.slice';
 import {classifyRouteType} from "@/services/gtfs/config/routeTypeUtil";
 
@@ -16,11 +18,35 @@ type Props = {
 
 type SortKey = 'arrival' | 'walking' | 'transfers';
 
-const SORT_OPTIONS: { key: SortKey; label: string }[] = [
-    { key: 'arrival',   label: 'Fastest' },
-    { key: 'walking',   label: 'Least walking' },
-    { key: 'transfers', label: 'Fewest transfers' },
+const SORT_OPTIONS: { key: SortKey; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
+    { key: 'arrival',   label: 'Fastest',          icon: 'flash-outline' },
+    { key: 'walking',   label: 'Least walking',    icon: 'walk-outline' },
+    { key: 'transfers', label: 'Fewest transfers', icon: 'swap-horizontal-outline' },
 ];
+
+// Journey times come out of the router as raw GTFS "HH:MM:SS" strings
+// (sometimes with hours >= 24 for past-midnight trips, per spec) — that
+// precision/format is right for internal sorting and computation, but
+// showing seconds and 24h-past-midnight hours to a rider is just noise.
+// This is display-only formatting; the underlying string is untouched.
+function formatClock(hhmmss: string): string {
+    const [hStr, mStr] = hhmmss.split(':');
+    const h = parseInt(hStr, 10);
+    const m = parseInt(mStr, 10);
+    if (Number.isNaN(h) || Number.isNaN(m)) return hhmmss;
+    const dayOffset = Math.floor(h / 24);
+    const d = new Date();
+    d.setHours(h % 24, m, 0, 0);
+    const label = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return dayOffset > 0 ? `${label} (+${dayOffset}d)` : label;
+}
+
+function formatDuration(mins: number): string {
+    if (mins < 60) return `${mins} min`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
 
 const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
     ({ animatedPosition }, ref) => {
@@ -68,25 +94,39 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
             >
                 <BottomSheetView style={{ flex: 1, paddingTop: 16 }}>
                     {error ? (
-                        <View style={{ padding: 24 }}>
-                            <Text style={{ color: '#ef4444', fontSize: 16 }}>{error}</Text>
+                        <View style={{ padding: 24, alignItems: 'center', gap: 8 }}>
+                            <Ionicons name="alert-circle-outline" size={28} color="#ef4444" />
+                            <Text style={{ color: '#ef4444', fontSize: 15, textAlign: 'center' }}>{error}</Text>
                         </View>
                     ) : journeys.length === 0 ? (
-                        <View style={{ padding: 24 }}>
-                            <Text style={{ color: theme.color, opacity: 0.5 }}>Calculating route...</Text>
+                        <View style={{ padding: 24, alignItems: 'center', gap: 10 }}>
+                            <ActivityIndicator color={theme.color} />
+                            <Text style={{ color: theme.color, opacity: 0.5, fontSize: 14 }}>Calculating route…</Text>
                         </View>
                     ) : (
                         <>
                             {/* Sort control — only worth showing when there's more than one option */}
                             {journeys.length > 1 && (
-                                <View style={{ flexDirection: 'row', gap: 8, paddingHorizontal: 24, paddingBottom: 12 }}>
+                                <View
+                                    accessibilityRole="tablist"
+                                    style={{ flexDirection: 'row', gap: 8, paddingHorizontal: 24, paddingBottom: 12 }}
+                                >
                                     {SORT_OPTIONS.map(opt => {
                                         const active = sortKey === opt.key;
                                         return (
                                             <Pressable
                                                 key={opt.key}
-                                                onPress={() => setSortKey(opt.key)}
+                                                accessibilityRole="button"
+                                                accessibilityLabel={`Sort by ${opt.label}`}
+                                                accessibilityState={{ selected: active }}
+                                                onPress={() => {
+                                                    Haptics.selectionAsync();
+                                                    setSortKey(opt.key);
+                                                }}
                                                 style={{
+                                                    flexDirection: 'row',
+                                                    alignItems: 'center',
+                                                    gap: 5,
                                                     paddingHorizontal: 12,
                                                     paddingVertical: 6,
                                                     borderRadius: 999,
@@ -95,6 +135,7 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                                                     borderColor: active ? '#2563eb' : theme.color + '33',
                                                 }}
                                             >
+                                                <Ionicons name={opt.icon} size={14} color={active ? '#fff' : theme.color} />
                                                 <Text style={{ color: active ? '#fff' : theme.color, fontSize: 13, fontWeight: '600' }}>
                                                     {opt.label}
                                                 </Text>
@@ -110,7 +151,13 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                                     return (
                                         <Pressable
                                             key={originalIndex}
-                                            onPress={() => dispatch(selectJourney(originalIndex))}
+                                            accessibilityRole="button"
+                                            accessibilityLabel={`Journey departing ${formatClock(journey.departureTime)}, arriving ${formatClock(journey.arrivalTime)}, ${formatDuration(journey.totalDurationMin)}`}
+                                            accessibilityState={{ selected: isSelected }}
+                                            onPress={() => {
+                                                Haptics.selectionAsync();
+                                                dispatch(selectJourney(originalIndex));
+                                            }}
                                             style={{
                                                 borderRadius: 20,
                                                 borderWidth: 2,
@@ -123,10 +170,10 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                                             {/* Summary row: times + duration */}
                                             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' }}>
                                                 <Text style={{ color: theme.color, fontSize: 22, fontWeight: '700' }}>
-                                                    {journey.departureTime} → {journey.arrivalTime}
+                                                    {formatClock(journey.departureTime)} → {formatClock(journey.arrivalTime)}
                                                 </Text>
                                                 <Text style={{ color: theme.color, opacity: 0.6, fontSize: 14 }}>
-                                                    {journey.totalDurationMin} min
+                                                    {formatDuration(journey.totalDurationMin)}
                                                 </Text>
                                             </View>
 
@@ -158,22 +205,38 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                                             </View>
 
                                             {isSelected && (
-                                                <View style={{ gap: 4, marginTop: 8 }}>
-                                                    {journey.legs.map((leg, i) => (
-                                                        <View key={i}>
-                                                            <Text style={{ color: theme.color, opacity: 0.7, fontSize: 13 }}>
-                                                                Board at {leg.originStopName}{leg.departureTime ? ` (${leg.departureTime})` : ''}
-                                                            </Text>
-                                                            <Text style={{ color: theme.color, opacity: 0.7, fontSize: 13 }}>
-                                                                Alight at {leg.destStopName}{leg.arrivalTime ? ` (${leg.arrivalTime})` : ''}
-                                                            </Text>
-                                                            {i < journey.legs.length - 1 && (
-                                                                <Text style={{ color: '#f59e0b', fontSize: 13, marginTop: 2 }}>
-                                                                    ↓ Transfer
-                                                                </Text>
-                                                            )}
-                                                        </View>
-                                                    ))}
+                                                <View style={{ marginTop: 8 }}>
+                                                    {journey.legs.map((leg, i) => {
+                                                        const isLastLeg = i === journey.legs.length - 1;
+                                                        return (
+                                                            <React.Fragment key={i}>
+                                                                <TimelineRow
+                                                                    color={leg.routeColor ?? '#2563eb'}
+                                                                    textColor={theme.color}
+                                                                    lineColor={theme.color + '22'}
+                                                                    label={`Board at ${leg.originStopName}`}
+                                                                    time={leg.departureTime ? formatClock(leg.departureTime) : undefined}
+                                                                />
+                                                                <TimelineRow
+                                                                    color={leg.routeColor ?? '#2563eb'}
+                                                                    textColor={theme.color}
+                                                                    lineColor={theme.color + '22'}
+                                                                    label={`Alight at ${leg.destStopName}`}
+                                                                    time={leg.arrivalTime ? formatClock(leg.arrivalTime) : undefined}
+                                                                    isLast={isLastLeg}
+                                                                />
+                                                                {!isLastLeg && (
+                                                                    <TimelineRow
+                                                                        color="#f59e0b"
+                                                                        textColor="#f59e0b"
+                                                                        lineColor={theme.color + '22'}
+                                                                        label="Transfer"
+                                                                        bold
+                                                                    />
+                                                                )}
+                                                            </React.Fragment>
+                                                        );
+                                                    })}
                                                 </View>
                                             )}
                                         </Pressable>
@@ -189,3 +252,30 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
 );
 
 export default RouteBottomSheetModal;
+
+// One stop/transfer on the expanded journey's board/alight timeline — a
+// dot on a connecting vertical line down the left edge, so a multi-transfer
+// route reads as a path instead of a wall of stacked text.
+function TimelineRow({ color, textColor, lineColor, label, time, isLast, bold }: {
+    color: string;
+    textColor: string;
+    lineColor: string;
+    label: string;
+    time?: string;
+    isLast?: boolean;
+    bold?: boolean;
+}) {
+    return (
+        <View style={{ flexDirection: 'row' }}>
+            <View style={{ width: 14, alignItems: 'center' }}>
+                <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color, marginTop: 4 }} />
+                {!isLast && <View style={{ width: 2, flex: 1, backgroundColor: lineColor, marginTop: 2 }} />}
+            </View>
+            <View style={{ flex: 1, paddingLeft: 8, paddingBottom: isLast ? 0 : 10 }}>
+                <Text style={{ color: textColor, opacity: bold ? 1 : 0.75, fontSize: 13, fontWeight: bold ? '700' : '400' }}>
+                    {label}{time ? `  ·  ${time}` : ''}
+                </Text>
+            </View>
+        </View>
+    );
+}

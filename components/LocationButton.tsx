@@ -2,6 +2,7 @@ import React, { RefObject } from 'react';
 import { TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import Animated, { clamp, SharedValue, useDerivedValue } from 'react-native-reanimated';
+import * as Haptics from 'expo-haptics';
 import { useDispatch } from 'react-redux';
 import { AppDispatch } from '@/store/store';
 import { setUserLocation } from '@/store/location.slice';
@@ -33,7 +34,12 @@ export default function LocationButton({ mapRef, animatedPosition }: {
             <TouchableOpacity
                 className="absolute bottom-5 right-5 w-16 h-16 rounded-full items-center justify-center"
                 style={[{ backgroundColor: theme.backgroundColor }, SHADOW]}
-                onPress={goToUserLocation}
+                accessibilityRole="button"
+                accessibilityLabel="Center map on my location"
+                onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    goToUserLocation();
+                }}
             >
                 <Ionicons name="locate" size={28} color={theme.color} />
             </TouchableOpacity>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Modal, Pressable, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 
 type Props = {
@@ -25,13 +26,6 @@ function dayLabel(d: Date, todayStart: Date): string {
     if (diffDays === 0) return 'Today';
     if (diffDays === 1) return 'Tomorrow';
     return d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
-}
-
-function clampMinutes(m: number): number {
-    return ((m % 60) + 60) % 60;
-}
-function clampHours(h: number): number {
-    return ((h % 24) + 24) % 24;
 }
 
 /**
@@ -69,6 +63,7 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
     });
 
     function selectDay(d: Date) {
+        Haptics.selectionAsync();
         setDraft(prev => {
             const next = new Date(d);
             next.setHours(prev.getHours(), prev.getMinutes(), 0, 0);
@@ -76,19 +71,33 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
         });
     }
 
+    // Keeps the draft within the day strip's range (today .. today+6) so
+    // there's always a matching pill highlighted above.
+    function clampToRange(d: Date): Date {
+        const minMs = todayStart.getTime();
+        const maxMs = todayStart.getTime() + (DAY_LABELS_AHEAD + 1) * 86_400_000 - 60_000;
+        return new Date(Math.min(Math.max(d.getTime(), minMs), maxMs));
+    }
+
+    // Uses Date's natural hour/minute overflow (setHours(24) → next day
+    // 00:00, setHours(-1) → previous day 23:00) instead of wrapping the
+    // number in place — stepping past midnight should actually roll the
+    // date forward/back, not silently stay on the same day.
     function adjustHour(delta: number) {
+        Haptics.selectionAsync();
         setDraft(prev => {
             const next = new Date(prev);
-            next.setHours(clampHours(prev.getHours() + delta));
-            return next;
+            next.setHours(prev.getHours() + delta);
+            return clampToRange(next);
         });
     }
 
     function adjustMinute(delta: number) {
+        Haptics.selectionAsync();
         setDraft(prev => {
             const next = new Date(prev);
-            next.setMinutes(clampMinutes(prev.getMinutes() + delta));
-            return next;
+            next.setMinutes(prev.getMinutes() + delta);
+            return clampToRange(next);
         });
     }
 
@@ -121,6 +130,8 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
                                     <TouchableOpacity
                                         key={i}
                                         onPress={() => selectDay(d)}
+                                        accessibilityRole="button"
+                                        accessibilityState={{ selected: active }}
                                         style={{
                                             paddingHorizontal: 12,
                                             paddingVertical: 8,
@@ -139,6 +150,7 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
                         {/* Hour / minute steppers */}
                         <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 20 }}>
                             <Stepper
+                                unit="hour"
                                 label={String(draft.getHours()).padStart(2, '0')}
                                 onIncrement={() => adjustHour(1)}
                                 onDecrement={() => adjustHour(-1)}
@@ -146,6 +158,7 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
                             />
                             <Text style={{ color: theme.color, fontSize: 28, fontWeight: '700' }}>:</Text>
                             <Stepper
+                                unit="minute"
                                 label={String(draft.getMinutes()).padStart(2, '0')}
                                 onIncrement={() => adjustMinute(5)}
                                 onDecrement={() => adjustMinute(-5)}
@@ -157,12 +170,14 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
                         <View style={{ flexDirection: 'row', gap: 10, marginTop: 4 }}>
                             <TouchableOpacity
                                 style={{ flex: 1, paddingVertical: 12, borderRadius: 16, alignItems: 'center', backgroundColor: theme.color + '11' }}
+                                accessibilityRole="button"
                                 onPress={() => { onConfirm(null); onClose(); }}
                             >
                                 <Text style={{ color: theme.color, fontWeight: '600' }}>Leave now</Text>
                             </TouchableOpacity>
                             <TouchableOpacity
                                 style={{ flex: 1, paddingVertical: 12, borderRadius: 16, alignItems: 'center', backgroundColor: '#2563eb' }}
+                                accessibilityRole="button"
                                 onPress={() => { onConfirm(draft.getTime()); onClose(); }}
                             >
                                 <Text style={{ color: '#fff', fontWeight: '700' }}>Confirm</Text>
@@ -175,18 +190,28 @@ export default function DepartureTimeModal({ visible, value, onClose, onConfirm 
     );
 }
 
-function Stepper({ label, onIncrement, onDecrement, color }: {
-    label: string; onIncrement: () => void; onDecrement: () => void; color: string;
+function Stepper({ label, unit, onIncrement, onDecrement, color }: {
+    label: string; unit: string; onIncrement: () => void; onDecrement: () => void; color: string;
 }) {
     return (
         <View style={{ alignItems: 'center', gap: 6 }}>
-            <TouchableOpacity onPress={onIncrement} hitSlop={10}>
+            <TouchableOpacity
+                onPress={onIncrement}
+                hitSlop={10}
+                accessibilityRole="button"
+                accessibilityLabel={`Increase ${unit}`}
+            >
                 <Ionicons name="chevron-up" size={20} color={color} />
             </TouchableOpacity>
             <Text style={{ color, fontSize: 32, fontWeight: '700', minWidth: 56, textAlign: 'center' }}>
                 {label}
             </Text>
-            <TouchableOpacity onPress={onDecrement} hitSlop={10}>
+            <TouchableOpacity
+                onPress={onDecrement}
+                hitSlop={10}
+                accessibilityRole="button"
+                accessibilityLabel={`Decrease ${unit}`}
+            >
                 <Ionicons name="chevron-down" size={20} color={color} />
             </TouchableOpacity>
         </View>

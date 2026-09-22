@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {Alert, FlatList, Keyboard, Text, TextInput, TouchableOpacity, View} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
 import { clearResults, searchPlaces, selectPlace, setQuery, setDepartureTime, setWalkingSpeed } from '@/store/search.slice';
@@ -33,6 +34,7 @@ export default function Search() {
     const speedLabel = WALK_SPEED_CYCLE.find(o => o.mps === walkingSpeedMps)?.label ?? 'Normal';
 
     const cycleWalkingSpeed = useCallback(() => {
+        Haptics.selectionAsync();
         const idx = WALK_SPEED_CYCLE.findIndex(o => o.mps === walkingSpeedMps);
         const next = WALK_SPEED_CYCLE[(idx + 1) % WALK_SPEED_CYCLE.length];
         dispatch(setWalkingSpeed(next.mps));
@@ -80,6 +82,8 @@ export default function Search() {
                 />
                 {(query.length > 0 || loading) && (
                     <TouchableOpacity onPress={() => { dispatch(setQuery('')); dispatch(clearResults()); Keyboard.dismiss(); }}
+                                      accessibilityRole="button"
+                                      accessibilityLabel={loading ? 'Searching' : 'Clear search'}
                                       className="p-1.5 ml-1.5">
                         <Ionicons name={loading ? 'hourglass' : 'close'} size={20} color="#666" />
                     </TouchableOpacity>
@@ -93,6 +97,8 @@ export default function Search() {
                     <TouchableOpacity
                         className="flex-row items-center rounded-full px-3 py-2"
                         style={[{ backgroundColor: theme.backgroundColor }, SHADOW]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Set departure time"
                         onPress={() => setShowTimeModal(true)}
                     >
                         <Ionicons name="time-outline" size={16} color={theme.color} />
@@ -104,6 +110,8 @@ export default function Search() {
                         {departureTime !== null && (
                             <TouchableOpacity
                                 onPress={() => dispatch(setDepartureTime(null))}
+                                accessibilityRole="button"
+                                accessibilityLabel="Clear departure time"
                                 hitSlop={8}
                                 style={{ marginLeft: 6 }}
                             >
@@ -115,12 +123,18 @@ export default function Search() {
                     <TouchableOpacity
                         className="flex-row items-center rounded-full px-3 py-2"
                         style={[{ backgroundColor: theme.backgroundColor }, SHADOW]}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Walking speed: ${speedLabel}. Tap to cycle.`}
                         onPress={cycleWalkingSpeed}
                     >
                         <Ionicons name="walk-outline" size={16} color={theme.color} />
                         <Text style={{ color: theme.color, marginLeft: 6, fontSize: 13, fontWeight: '600' }}>
                             {speedLabel}
                         </Text>
+                        {/* Hints that this is a cycling control, not a static
+                            label — otherwise there's nothing to suggest it's
+                            tappable at all. */}
+                        <Ionicons name="sync-outline" size={11} color={theme.color} style={{ opacity: 0.45, marginLeft: 5 }} />
                     </TouchableOpacity>
                 </View>
             )}
@@ -141,7 +155,10 @@ export default function Search() {
                         renderItem={({ item, index }) => (
                             <TouchableOpacity
                                 onPress={() => onSelect(item)}
-                                className={`flex-row items-center px-3 py-3 ${index < results.length - 1 ? 'border-b border-gray-500' : ''}`}
+                                accessibilityRole="button"
+                                accessibilityLabel={`${item.name}, ${item.address}`}
+                                className="flex-row items-center px-3 py-3"
+                                style={index < results.length - 1 ? { borderBottomWidth: 1, borderBottomColor: theme.color + '22' } : undefined}
                             >
                                 <View className="flex-1">
                                     <Text className="text-lg font-semibold mb-0.5" style={{ color: theme.color }}>{item.name}</Text>

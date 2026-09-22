@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import MapView, { LatLng, Polyline, PROVIDER_GOOGLE} from 'react-native-maps';
-import {ActivityIndicator, Keyboard, StyleSheet, View} from 'react-native';
+import {ActivityIndicator, Keyboard, StyleSheet, Text, View} from 'react-native';
 import * as Location from 'expo-location';
 import {useSelector} from 'react-redux';
 import {RootState} from '@/store/store';
@@ -8,13 +8,14 @@ import {BottomSheetModal} from '@gorhom/bottom-sheet';
 import {useSharedValue} from 'react-native-reanimated';
 import {useColorScheme} from 'nativewind';
 import {useIsFocused} from '@react-navigation/native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
 import RouteBottomSheetModal from '@/components/RouteBottomSheetModal';
 import DebugMapOverlay from '@/components/DebugMapOverlay';
 import DebugControls from '@/components/DebugControls';
-import {MAP_STYLE_DARK} from '@/constants/themes';
+import {MAP_STYLE_DARK, SHADOW, TOP_SAFE, useThemeStyle} from '@/constants/themes';
 import {selectDisplayedJourney} from '@/store/route.slice';
 import {useGoToUserLocation} from '../../hooks/goToUserLocation';
 
@@ -26,6 +27,8 @@ export default function Index() {
     const modalRef = useRef<BottomSheetModal>(null);
     const bottomSheetPosition = useSharedValue(1000);
     const {colorScheme} = useColorScheme();
+    const theme = useThemeStyle();
+    const insets = useSafeAreaInsets();
 
     const userLocation = useSelector((s: RootState) => s.location.userLocation);
     const displayedJourney = useSelector(selectDisplayedJourney);
@@ -143,20 +146,39 @@ export default function Index() {
             </MapView>
 
             {routeLoading && (
+                // A small floating pill instead of a full-screen dim+spinner —
+                // the search bar's own hourglass icon already signals place
+                // lookups, so a second full-screen treatment for route
+                // computation felt heavier than the wait usually warrants.
                 <View
                     style={{
                         position: 'absolute',
-                        top: 0,
+                        top: TOP_SAFE(insets) + 128,
                         left: 0,
                         right: 0,
-                        bottom: 0,
                         alignItems: 'center',
-                        justifyContent: 'center',
-                        backgroundColor: 'rgba(0,0,0,0.15)',
                     }}
                     pointerEvents="none"
                 >
-                    <ActivityIndicator size="large" color="#2563eb" />
+                    <View
+                        style={[
+                            {
+                                flexDirection: 'row',
+                                alignItems: 'center',
+                                gap: 8,
+                                backgroundColor: theme.backgroundColor,
+                                paddingHorizontal: 14,
+                                paddingVertical: 8,
+                                borderRadius: 999,
+                            },
+                            SHADOW,
+                        ]}
+                    >
+                        <ActivityIndicator size="small" color="#2563eb" />
+                        <Text style={{ color: theme.color, fontSize: 13, fontWeight: '600' }}>
+                            Finding your route…
+                        </Text>
+                    </View>
                 </View>
             )}
 
