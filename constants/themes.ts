@@ -3,9 +3,14 @@ import { EdgeInsets } from 'react-native-safe-area-context';
 
 export function useThemeStyle() {
     const { colorScheme } = useColorScheme();
+    const dark = colorScheme === 'dark';
     return {
-        backgroundColor: colorScheme === 'dark' ? '#374151' : '#ffffff',
-        color: colorScheme === 'dark' ? '#ffffff' : '#000000',
+        backgroundColor: dark ? '#374151' : '#ffffff',
+        color: dark ? '#ffffff' : '#000000',
+        // A step darker than backgroundColor in both modes — for surfaces
+        // that need to visually separate from the sheet/card they sit on
+        // (inactive pills, chips) instead of blending flat into it.
+        surfaceColor: dark ? '#1f2937' : '#e5e7eb',
     };
 }
 

@@ -9,6 +9,7 @@ import MapView, { LatLng } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
 import { useWindowDimensions } from 'react-native';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import {useGoToUserLocation} from "@/hooks/goToUserLocation";
 
 export default function LocationButton({ mapRef, animatedPosition }: {
@@ -18,8 +19,12 @@ export default function LocationButton({ mapRef, animatedPosition }: {
     const dispatch = useDispatch<AppDispatch>();
     const theme = useThemeStyle();
     const { height } = useWindowDimensions();
+    const tabBarHeight = useBottomTabBarHeight();
 
-    const clampedTop = useDerivedValue(() => clamp(animatedPosition.value, height / 2, height));
+    // Same clamp() as the "don't go above half the screen" cap on the way
+    // up — just mirrored on the way down, so the button can't sink lower
+    // than just above the navbar.
+    const clampedTop = useDerivedValue(() => clamp(animatedPosition.value, height / 2, height - tabBarHeight));
 
     const goToUserLocation = useGoToUserLocation(mapRef);
 

@@ -7,6 +7,7 @@ import {RootState} from '@/store/store';
 import {BottomSheetModal} from '@gorhom/bottom-sheet';
 import {useSharedValue} from 'react-native-reanimated';
 import {useColorScheme} from 'nativewind';
+import {useIsFocused} from '@react-navigation/native';
 
 import Search from '@/components/Search';
 import LocationButton from '@/components/LocationButton';
@@ -38,6 +39,25 @@ export default function Index() {
     const debugEnabled = useSelector((s: RootState) => s.debug.enabled);
 
     const goToUserLocation = useGoToUserLocation(mapRef);
+
+    // The sheet is a root-level portal (mounted by BottomSheetModalProvider
+    // above the tab navigator), so switching tabs doesn't hide it on its
+    // own. Close it (not dismiss — dismiss unmounts it, and it wouldn't
+    // come back on its own) when this screen loses focus, and bring it
+    // back when returning here, but only if there's actually a place/route
+    // to show it for. Closing uses duration 0 — by the time this runs the
+    // Settings screen is already on screen, so an animated slide-down would
+    // visibly play over it instead of on the map.
+    const isFocused = useIsFocused();
+    useEffect(() => {
+        if (isFocused) {
+            if (selectedPlace) {
+                modalRef.current?.present();
+            }
+        } else {
+            modalRef.current?.close({ duration: 0 });
+        }
+    }, [isFocused, selectedPlace]);
 
     useEffect(() => {
         goToUserLocation();

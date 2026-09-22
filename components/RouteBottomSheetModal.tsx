@@ -6,6 +6,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { RootState, AppDispatch } from '@/store/store';
 import { SHADOW, TOP_SAFE, useThemeStyle } from '@/constants/themes';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { selectJourney } from '@/store/route.slice';
 import {classifyRouteType} from "@/services/gtfs/config/routeTypeUtil";
 
@@ -27,6 +28,7 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
         const dispatch = useDispatch<AppDispatch>();
         const { journeys = [], selectedJourneyIndex, error } = useSelector((s: RootState) => s.route);
         const [sortKey, setSortKey] = useState<SortKey>('arrival');
+        const tabBarHeight = useBottomTabBarHeight();
 
         // Sort for DISPLAY only — selection is always by original journeys[]
         // index so the map/state stays in sync regardless of sort order.
@@ -48,13 +50,18 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                 ref={ref}
                 animatedPosition={animatedPosition}
                 backgroundStyle={{
-                    backgroundColor: theme.backgroundColor,
+                    backgroundColor: theme.surfaceColor,
                     borderTopLeftRadius: 40,
                     borderTopRightRadius: 40,
                 }}
                 handleIndicatorStyle={{ backgroundColor: theme.color }}
                 style={[SHADOW, { borderTopLeftRadius: 40, borderTopRightRadius: 40 }]}
                 topInset={TOP_SAFE(useSafeAreaInsets())}
+                // Reserves the navbar's height at the bottom of the sheet's
+                // own container, so even at the 100% snap point the sheet
+                // stops short of it and the navbar stays on top/visible
+                // instead of getting covered.
+                bottomInset={tabBarHeight}
                 snapPoints={['10%', '40%', '100%']}
                 enableOverDrag={false}
                 enablePanDownToClose={false}
@@ -108,7 +115,7 @@ const RouteBottomSheetModal = forwardRef<BottomSheetModal, Props>(
                                                 borderRadius: 20,
                                                 borderWidth: 2,
                                                 borderColor: isSelected ? '#2563eb' : theme.color + '22',
-                                                backgroundColor: isSelected ? '#2563eb11' : 'transparent',
+                                                backgroundColor: isSelected ? '#2563eb11' : theme.backgroundColor,
                                                 padding: 16,
                                                 gap: 8,
                                             }}

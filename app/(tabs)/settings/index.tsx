@@ -31,7 +31,7 @@ export default function SettingsMenu() {
     const router = useRouter();
 
     return (
-        <ScrollView style={{ flex: 1, backgroundColor: theme.backgroundColor }} contentContainerStyle={{ padding: 16, gap: 12 }}>
+        <ScrollView style={{ flex: 1, backgroundColor: theme.surfaceColor }} contentContainerStyle={{ padding: 16, gap: 12 }}>
             {ITEMS.map((item) => (
                 <Pressable
                     key={item.route}
@@ -42,7 +42,7 @@ export default function SettingsMenu() {
                         gap: 14,
                         padding: 16,
                         borderRadius: 16,
-                        backgroundColor: theme.color + '0d',
+                        backgroundColor: theme.backgroundColor,
                     }}
                 >
                     <View
