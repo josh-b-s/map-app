@@ -3,13 +3,39 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'gtfs.db';
 const DB_DIR = `${FileSystem.documentDirectory}SQLite/`;
-// Exported so callers outside this file (gtfsRouterNative.ts's warm_up, which
-// opens its own independent rusqlite::Connection rather than sharing
-// op-sqlite's handle) can point the Rust engine at the exact same file.
+// Legacy default path — kept as the initial value of currentDbPath below so
+// anything that ran an import before multi-database support existed still
+// resolves to the same file it always did, until the user picks/imports a
+// database through the new registry (see gtfsDbRegistry.ts).
 export const DB_PATH = `${DB_DIR}${DB_NAME}`;
 
+// The file op-sqlite (and the Rust engine, via getCurrentDbPath() callers)
+// currently point at. Mutable rather than a constant so gtfsDbRegistry.ts's
+// setActiveDatabase() can repoint the whole app at a different imported
+// database without every call site needing to pass a path around.
+let currentDbPath: string = DB_PATH;
+
+export function getCurrentDbPath(): string {
+    return currentDbPath;
+}
+
+/**
+ * Switches which on-disk .db file getDb()/getOrCreateDbForImport() open.
+ * Drops the cached op-sqlite connection (if any) so the NEXT call reopens
+ * against the new path instead of silently continuing to serve queries
+ * against the old file. Does not touch the Rust router engine's own
+ * warmedUpPath cache — callers (gtfsDbRegistry.ts) are expected to also call
+ * invalidateNativeRouter() so the next route search re-warms against the
+ * new path too.
+ */
+export function setActiveDbPath(path: string): void {
+    if (path === currentDbPath) return;
+    currentDbPath = path;
+    _db = null;
+}
+
 export async function isDbReady(): Promise<boolean> {
-    const {exists} = await FileSystem.getInfoAsync(DB_PATH);
+    const {exists} = await FileSystem.getInfoAsync(currentDbPath);
     return exists;
 }
 
@@ -98,12 +124,12 @@ export async function getDb(): Promise<SQLiteDatabase> {
 
 /**
  * Dev/debug-only counterpart to getDb() — creates the SQLite/ folder and
- * an empty gtfs.db file if neither exists yet, then opens it, instead of
- * throwing. Exists specifically for DebugControls.tsx's import/benchmark
- * tools: those need to run on a fresh device BEFORE the normal
- * download-a-prebuilt-db flow has ever happened (that's the whole point of
- * on-device building), so they can't go through getDb()'s "must already be
- * downloaded" check the rest of the app relies on.
+ * an empty db file at currentDbPath if neither exists yet, then opens it,
+ * instead of throwing. Used by the import flow (gtfsDbImport.ts /
+ * gtfsInsertBenchmark.ts) which needs to run on a fresh device BEFORE the
+ * normal download-a-prebuilt-db flow has ever happened (that's the whole
+ * point of on-device building), so it can't go through getDb()'s "must
+ * already be downloaded" check the rest of the app relies on.
  *
  * Deliberately NOT used by any normal app code path — a real user's app
  * should still fail loudly via getDb() if its expected db is missing,
@@ -115,7 +141,8 @@ export async function getOrCreateDbForImport(): Promise<SQLiteDatabase> {
 
     const ready = await isDbReady();
     if (!ready) {
-        await FileSystem.makeDirectoryAsync(DB_DIR, {intermediates: true}).catch(() => {
+        const dir = currentDbPath.slice(0, currentDbPath.lastIndexOf('/') + 1);
+        await FileSystem.makeDirectoryAsync(dir, {intermediates: true}).catch(() => {
         });
         // Opening a non-existent file with op-sqlite creates it — no
         // explicit "create empty file" step needed beyond ensuring the
@@ -132,9 +159,12 @@ async function openAndCache(): Promise<SQLiteDatabase> {
     // a relative-path-prepended-to-filename semantic, but didn't fully
     // spell out open()'s resolution rules for a custom absolute directory
     // like the one this app already uses via expo-file-system. If this
-    // doesn't resolve to DB_PATH as expected, check op-sqlite's "Gotchas"
-    // page for the current location/path resolution behavior.
-    const raw = open({name: DB_NAME, location: DB_DIR});
+    // doesn't resolve to currentDbPath as expected, check op-sqlite's
+    // "Gotchas" page for the current location/path resolution behavior.
+    const lastSlash = currentDbPath.lastIndexOf('/');
+    const name = currentDbPath.slice(lastSlash + 1);
+    const location = currentDbPath.slice(0, lastSlash + 1);
+    const raw = open({name, location});
 
     const db = new SQLiteDatabase(raw);
 

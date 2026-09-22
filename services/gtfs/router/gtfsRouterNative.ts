@@ -21,7 +21,7 @@ import type {
 } from './raptorRouter';
 import { createDebugSinkCollector } from '../debug/debugSinkCollector';
 import { formatTimings } from './formatTimings';
-import { DB_PATH } from '@/services/db/sqliteDb';
+import { getCurrentDbPath } from '@/services/db/sqliteDb';
 
 const { GtfsRouterEngine } = gtfsRouterRust.gtfs_router;
 
@@ -163,9 +163,12 @@ function summarizeJourneys(journeys: Journey[]): string {
 
 /**
  * Same signature/contract as computeGtfsRoute() in raptorRouter.ts, backed by
- * the Rust RAPTOR engine instead. Uses DB_PATH internally (same file
- * op-sqlite opens) rather than taking a path param, so route.slice.ts's
- * call site doesn't need to know about it — same call shape as the TS path.
+ * the Rust RAPTOR engine instead. Resolves the currently-active database
+ * path via getCurrentDbPath() on every call (rather than a path param), so
+ * switching the selected database in settings/gtfs.tsx takes effect on the
+ * next search without route.slice.ts's call site needing to know about it —
+ * same call shape as the TS path. getEngine() already re-warms whenever the
+ * resolved path differs from what it last warmed up against.
  */
 export async function computeGtfsRouteNative(
     origin: LatLng,
@@ -178,7 +181,7 @@ export async function computeGtfsRouteNative(
     maxWalkDistanceM: number = 1.4 * 20 * 60,
     debugMode: boolean = false,
 ): Promise<GtfsRouteResult> {
-    const eng = await getEngine(DB_PATH);
+    const eng = await getEngine(getCurrentDbPath());
 
     const today = departureTime;
     const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000);

@@ -2,10 +2,11 @@
  * rustGtfsImporter.ts — thin bridge from the app to the native Rust
  * import_gtfs() (see modules/gtfs-importer/rust/src/lib.rs and import.rs).
  *
- * Replaces gtfsImporterLegacy.ts's importLatestZip() as the thing DebugControls.tsx
- * calls. gtfsImporterLegacy.ts itself is left untouched for now as a reference/
- * fallback until the Rust output has been verified against a real feed —
- * see the note in import.rs's process_agency() doc comment.
+ * importGtfsZipToPath() is the generic entry point: given an explicit zip
+ * file and target .db path, it runs the native import and reports progress.
+ * gtfsDbImport.ts (the settings screen's "Add zip" flow) calls this with a
+ * fresh per-import db path from gtfsDbRegistry.ts, rather than the old
+ * single-fixed-db-file/single-incoming-folder flow this file used to own.
  *
  * NOTE: ProgressCallback (from generated/gtfs_importer.ts) is a TypeScript
  * interface, not a class — it doesn't exist at runtime, so it can't be
@@ -13,70 +14,32 @@
  * instead; ubrn's FfiConverterObjectWithCallbacks wraps it for the FFI call.
  */
 
-import * as FileSystem from 'expo-file-system/legacy';
 import {importGtfs, type ProgressCallback} from '@mapapp/gtfs-importer';
-import {ensureImportFolders, INCOMING_DIR} from './gtfsImporterLegacy';
-import {getNativeEngine, invalidateNativeRouter} from '../router/gtfsRouterNative';
 
 export type ImportProgressEvent = { table: string; inserted: number; total: number };
 
-// Same file:// stripping gtfsImporterLegacy.ts already does before handing paths
-// to native code — expo-file-system always includes the file:// scheme,
-// but std::fs::read on the Rust side wants a bare filesystem path.
+// expo-file-system always includes the file:// scheme on uris/paths it
+// hands back, but std::fs::read on the Rust side wants a bare filesystem
+// path.
 function stripFileScheme(p: string): string {
     return p.startsWith('file://') ? p.slice('file://'.length) : p;
 }
 
-/** Finds the first .zip sitting in incoming/ — mirrors gtfsImporterLegacy.ts's
- *  findIncomingZip(), duplicated here rather than imported since that one
- *  isn't exported. */
-async function findIncomingZip(): Promise<string | null> {
-    const entries = await FileSystem.readDirectoryAsync(INCOMING_DIR);
-    const zipName = entries.find(e => e.toLowerCase().endsWith('.zip'));
-    return zipName ? `${INCOMING_DIR}${zipName}` : null;
-}
-
-// documentDirectory/SQLite/gtfs.db — same on-device db path gtfsDb.ts's
-// getOrCreateDbForImport() opens via op-sqlite. The Rust side opens this
-// file directly via rusqlite rather than going through op-sqlite at all,
-// so there's no SQLiteDatabase handle to pass in — just the path.
-function gtfsDbPath(): string {
-    return `${FileSystem.documentDirectory}SQLite/gtfs.db`;
-}
-
 /**
- * Runs the native Rust GTFS import against whatever .zip is sitting in
- * gtfs-import/incoming/, writing straight into documentDirectory/SQLite/gtfs.db.
- * onProgress fires per-table (and periodically mid-table for the two big
- * ones, stop_times/shapes — see import.rs's `% 200_000` progress calls).
+ * Runs the native Rust GTFS import from `zipPath` straight into `dbPath`
+ * (a fresh, not-yet-existing file — the importer creates it). onProgress
+ * fires per-table (and periodically mid-table for the two big ones,
+ * stop_times/shapes — see import.rs's `% 200_000` progress calls).
  */
-export async function runRustImport(
+export async function importGtfsZipToPath(
+    zipPath: string,
+    dbPath: string,
     onProgress?: (p: ImportProgressEvent) => void,
 ): Promise<void> {
     const t0 = Date.now();
     const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
-    console.log('[rustGtfsImporter] starting import…');
-
-    await ensureImportFolders();
-    console.log(`[rustGtfsImporter] import folders ready (${elapsed()})`);
-
-    const zipPath = await findIncomingZip();
-    if (!zipPath) {
-        console.warn(`[rustGtfsImporter] no .zip found in ${INCOMING_DIR}`);
-        throw new Error(`No .zip found in ${INCOMING_DIR} — drop one there first.`);
-    }
-    console.log(`[rustGtfsImporter] using zip: ${zipPath}`);
-
-    // ensure documentDirectory/SQLite/ exists — rusqlite's Connection::open
-    // will NOT create missing parent directories, only the db file itself.
-    await FileSystem.makeDirectoryAsync(`${FileSystem.documentDirectory}SQLite/`, {
-        intermediates: true,
-    }).catch((_e: unknown) => {
-    });
-
-    const dbPath = gtfsDbPath();
-    console.log(`[rustGtfsImporter] db path: ${dbPath}`);
+    console.log(`[rustGtfsImporter] starting import of ${zipPath} -> ${dbPath}`);
 
     // Track a per-table start time so we can log a duration when a table
     // finishes (i.e. when the next progress event names a different table,
@@ -128,15 +91,6 @@ export async function runRustImport(
             );
         }
         console.log(`[rustGtfsImporter] import complete in ${elapsed()}`);
-
-        // warmedUpPath still equals dbPath from app-startup warmup — since
-        // dbPath is the same constant string before and after a re-import,
-        // just calling getNativeEngine(dbPath) again would compare that
-        // string to itself and skip warmUp() entirely. invalidateNativeRouter()
-        // resets warmedUpPath to null first, so the check below actually
-        // fires and reloads from the freshly-imported data.
-        invalidateNativeRouter();
-        await getNativeEngine(dbPath);
     } catch (err) {
         console.error(`[rustGtfsImporter] import failed after ${elapsed()}:`, err);
         throw err;

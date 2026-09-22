@@ -5,11 +5,6 @@ import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
 import { advanceStep, BFS_STEP_INTERVAL_MS, DebugPhase, retreatStep, setBfsCandidateMode, setPlaying, toggleDebugEnabled, toggleHopColorMode } from '@/store/debug.slice';
 import { SHADOW, useThemeStyle } from '@/constants/themes';
-import * as FileSystem from 'expo-file-system/legacy';
-import {ensureImportFolders, INCOMING_DIR} from "@/services/gtfs/import/gtfsImporterLegacy";
-import {getOrCreateDbForImport} from "@/services/db/sqliteDb";
-import {runInsertBenchmark} from "@/services/gtfs/import/gtfsInsertBenchmark";
-import {runRustImport} from "@/services/gtfs/import/rustGtfsImporter";
 import {compareRouters} from "@/services/gtfs/router/routeCompare";
 
 // TEMPORARY hardcoded test pair for the "Compare routers" button below —
@@ -40,14 +35,6 @@ const PHASE_LABELS: Record<DebugPhase, string> = {
 // one — tune to taste once you see it running).
 const STEP_INTERVAL_MS = 300;
 
-// A rough guess is fine here — only used to label the benchmark's
-// extrapolated estimate. Update to match your actual feed's real
-// stop_times count (see preprocess-gtfs.ts's own console output) once you
-// have a current number.
-const APPROX_REAL_STOP_TIMES_ROWS = 11_860_000;
-
-type ImportBusyState = 'idle' | 'preparing' | 'benchmarking' | 'importing';
-
 /**
  * Debug-mode toggle + phased-replay transport controls (prev/play/next),
  * floated bottom-left (mirrors LocationButton's bottom-right placement).
@@ -67,113 +54,28 @@ export default function DebugControls() {
     const theme = useThemeStyle();
     const { enabled, hasData, phase, stepIndex, playing, bfsCandidateMode, hopColorMode, bfsRoundCount, bfsCandidateCount, raptorStepCount: raptorStepTotal } = useSelector((s: RootState) => s.debug);
 
-    // Local (non-Redux) state for the GTFS import sub-panel — this is a
-    // dev-only, one-shot tool, not app state anything else needs to react
-    // to, so it doesn't belong in the debug slice.
-    const [importBusy, setImportBusy] = useState<ImportBusyState>('idle');
-    const [importStatus, setImportStatus] = useState<string>('');
-
-    async function handleListIncoming() {
-        setImportBusy('preparing');
-        try {
-            await ensureImportFolders();
-            const entries = await FileSystem.readDirectoryAsync(INCOMING_DIR);
-            if (entries.length === 0) {
-                setImportStatus(`Dir exists but is empty:\n${INCOMING_DIR}`);
-            } else {
-                // Stat each entry too — this is what actually distinguishes
-                // "file's there but unreadable" (getInfoAsync throws or
-                // reports exists:false/size:0) from a genuine path miss,
-                // which a bare directory listing can't tell you on its own.
-                const details = await Promise.all(entries.map(async name => {
-                    try {
-                        const info = await FileSystem.getInfoAsync(`${INCOMING_DIR}${name}`);
-                        return `${name} (${info.exists ? `${(info as any).size ?? '?'} bytes` : 'STAT FAILED'})`;
-                    } catch (e) {
-                        return `${name} (STAT THREW: ${String(e)})`;
-                    }
-                }));
-                setImportStatus(`Found:\n${details.join('\n')}`);
-            }
-        } catch (err) {
-            setImportStatus(`List failed: ${String(err)}`);
-        } finally {
-            setImportBusy('idle');
-        }
-    }
-
-    async function handlePrepFolders() {
-        setImportBusy('preparing');
-        try {
-            await ensureImportFolders();
-            // Logging the real path is the point here — see this file's
-            // header note on why you can't just drag a file into it.
-            setImportStatus(`Ready. Copy the GTFS zip into:\n${INCOMING_DIR}`);
-            console.log('[DebugControls] GTFS incoming dir:', INCOMING_DIR);
-        } catch (err) {
-            setImportStatus(`Prep failed: ${String(err)}`);
-        } finally {
-            setImportBusy('idle');
-        }
-    }
-
-    async function handleRunBenchmark() {
-        setImportBusy('benchmarking');
-        setImportStatus('Running insert benchmark…');
-        try {
-            const db = await getOrCreateDbForImport();
-            const result = await runInsertBenchmark(
-                db,
-                APPROX_REAL_STOP_TIMES_ROWS,
-                undefined,
-                line => setImportStatus(line),
-            );
-            const secs = (result.estimatedMsForRealRowCount / 1000).toFixed(1);
-            setImportStatus(`Done. Estimated real import: ~${secs}s. Check console for per-stage detail.`);
-        } catch (err) {
-            setImportStatus(`Benchmark failed: ${String(err)}`);
-        } finally {
-            setImportBusy('idle');
-        }
-    }
+    // GTFS import (prep folders / list incoming / benchmark / run import)
+    // has moved to app/(tabs)/settings/gtfs.tsx as a proper screen — this
+    // panel now only keeps the router A/B compare tool, which doesn't fit
+    // that settings screen.
+    const [compareBusy, setCompareBusy] = useState(false);
+    const [compareStatus, setCompareStatus] = useState<string>('');
 
     async function handleCompareRouters() {
-        setImportBusy('benchmarking'); // reuses the same busy-state gating as the other buttons
-        setImportStatus('Comparing TS vs Rust routers…');
+        setCompareBusy(true);
+        setCompareStatus('Comparing TS vs Rust routers…');
         try {
             const {tsMs, rustMs, tsResult, rustResult} = await compareRouters(TEST_ORIGIN, TEST_DESTINATION);
             const speedup = (tsMs / rustMs).toFixed(2);
-            setImportStatus(
+            setCompareStatus(
                 `TS: ${tsMs.toFixed(0)}ms (${tsResult.journeys.length}j) | ` +
                 `Rust: ${rustMs.toFixed(0)}ms (${rustResult.journeys.length}j) | ` +
                 `${speedup}x. Full detail in console.`
             );
         } catch (err) {
-            setImportStatus(`Compare failed: ${String(err)}`);
+            setCompareStatus(`Compare failed: ${String(err)}`);
         } finally {
-            setImportBusy('idle');
-        }
-    }
-
-    async function handleRunImport() {
-        console.log('[DebugControls] import button pressed (native Rust import)');
-        setImportBusy('importing');
-        setImportStatus('Importing… this can take a while, watch the console.');
-        const t0 = Date.now();
-        try {
-            // Native side (import.rs) logs its own per-table/per-agency
-            // progress via the same callback — this handler only drives the
-            // small live status line in the debug panel, same UX as the old
-            // TS importLatestZip path, just fed from Rust's onProgress now.
-            await runRustImport(p => {
-                const secs = ((Date.now() - t0) / 1000).toFixed(1);
-                setImportStatus(`${p.table}: ${p.inserted}/${p.total} (${secs}s elapsed)`);
-            });
-            setImportStatus(`Import complete in ${((Date.now() - t0) / 1000).toFixed(1)}s.`);
-        } catch (err) {
-            setImportStatus(`Import failed: ${String(err)}`);
-        } finally {
-            setImportBusy('idle');
+            setCompareBusy(false);
         }
     }
 
@@ -288,51 +190,23 @@ export default function DebugControls() {
                     style={[{ backgroundColor: theme.backgroundColor }, SHADOW]}
                 >
                     <Text style={{ color: theme.color, opacity: 0.6, fontSize: 11, fontWeight: '600', marginBottom: 4 }}>
-                        GTFS import
+                        Router compare
                     </Text>
                     <View className="flex-row items-center" style={{ gap: 4 }}>
                         <TouchableOpacity
                             className="p-1.5"
-                            disabled={importBusy !== 'idle'}
-                            onPress={handlePrepFolders}
-                        >
-                            <Ionicons name="folder-outline" size={18} color={theme.color} />
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                            className="p-1.5"
-                            disabled={importBusy !== 'idle'}
-                            onPress={handleListIncoming}
-                        >
-                            <Ionicons name="search-outline" size={18} color={theme.color} />
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                            className="p-1.5"
-                            disabled={importBusy !== 'idle'}
-                            onPress={handleRunBenchmark}
-                        >
-                            <Ionicons name="speedometer-outline" size={18} color={theme.color} />
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                            className="p-1.5"
-                            disabled={importBusy !== 'idle'}
-                            onPress={handleRunImport}
-                        >
-                            <Ionicons name="download-outline" size={18} color={theme.color} />
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                            className="p-1.5"
-                            disabled={importBusy !== 'idle'}
+                            disabled={compareBusy}
                             onPress={handleCompareRouters}
                         >
                             <Ionicons name="git-compare-outline" size={18} color={theme.color} />
                         </TouchableOpacity>
-                        {importBusy !== 'idle' && (
-                            <Text style={{ color: theme.color, fontSize: 11 }}>{importBusy}…</Text>
+                        {compareBusy && (
+                            <Text style={{ color: theme.color, fontSize: 11 }}>comparing…</Text>
                         )}
                     </View>
-                    {!!importStatus && (
+                    {!!compareStatus && (
                         <Text style={{ color: theme.color, opacity: 0.7, fontSize: 10, marginTop: 4, maxWidth: 220 }}>
-                            {importStatus}
+                            {compareStatus}
                         </Text>
                     )}
                 </View>
