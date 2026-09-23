@@ -23,6 +23,11 @@ export type GtfsDatabaseEntry = {
     name: string;
     fileName: string;
     importedAt: number;
+    /** MD5 of the source .zip at import time (see gtfsDbImport.ts) — lets a
+     *  future import detect "this exact feed is already imported" before
+     *  paying the real import cost. Optional because entries created before
+     *  this field existed won't have one; those just never match. */
+    zipHash?: string;
 };
 
 type RegistryFile = {
@@ -65,6 +70,17 @@ export async function getActiveDatabaseId(): Promise<string | null> {
     return reg.activeId;
 }
 
+/**
+ * Finds an already-imported database whose source zip had this exact hash,
+ * if any. Used by gtfsDbImport.ts BEFORE running the (expensive) import, so
+ * re-adding a byte-identical feed can be caught early instead of silently
+ * doing the full import again into a second, redundant database file.
+ */
+export async function findDatabaseByHash(zipHash: string): Promise<GtfsDatabaseEntry | null> {
+    const reg = await readRegistry();
+    return reg.databases.find(d => d.zipHash === zipHash) ?? null;
+}
+
 /** Strips a trailing .zip (case-insensitive) so "melbourne-gtfs.zip" -> "melbourne-gtfs". */
 export function nameFromZipFileName(zipFileName: string): string {
     return zipFileName.replace(/\.zip$/i, '');
@@ -80,6 +96,21 @@ export class DuplicateNameError extends Error {
     constructor(name: string) {
         super(`"${name}" is already in use by another feed.`);
         this.name = 'DuplicateNameError';
+    }
+}
+
+/**
+ * Thrown by gtfsDbImport.ts when the picked zip's hash exactly matches an
+ * already-imported feed's — distinguished from other Errors so the
+ * settings screen can offer "use the existing one" instead of a generic
+ * failure message.
+ */
+export class DuplicateFeedError extends Error {
+    existing: GtfsDatabaseEntry;
+    constructor(existing: GtfsDatabaseEntry) {
+        super(`This exact feed is already imported as "${existing.name}".`);
+        this.name = 'DuplicateFeedError';
+        this.existing = existing;
     }
 }
 
@@ -163,7 +194,7 @@ export async function setActiveDatabase(id: string): Promise<void> {
  * collides with an existing entry, silently disambiguates it file-system
  * style ("Melbourne" -> "Melbourne (1)") rather than failing the import.
  */
-export async function registerDatabase(name: string, fileName: string): Promise<GtfsDatabaseEntry> {
+export async function registerDatabase(name: string, fileName: string, zipHash?: string): Promise<GtfsDatabaseEntry> {
     const reg = await readRegistry();
     const uniqueName = dedupeName(name, reg.databases.map(d => d.name));
     const entry: GtfsDatabaseEntry = {
@@ -171,6 +202,7 @@ export async function registerDatabase(name: string, fileName: string): Promise<
         name: uniqueName,
         fileName,
         importedAt: Date.now(),
+        zipHash,
     };
     reg.databases.push(entry);
     reg.activeId = entry.id;

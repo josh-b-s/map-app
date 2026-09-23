@@ -5,6 +5,7 @@ import { useThemeStyle } from '@/constants/themes';
 import { pickGtfsZip, importZipAsNewDatabase } from '@/services/gtfs/import/gtfsDbImport';
 import {
     deleteDatabase,
+    DuplicateFeedError,
     DuplicateNameError,
     getActiveDatabaseId,
     listDatabases,
@@ -62,7 +63,7 @@ export default function GtfsData() {
             const zip = await pickGtfsZip();
             if (!zip) return; // user cancelled the picker — not an error
 
-            setImportState({ busy: true, status: `Importing ${zip.name}…` });
+            setImportState({ busy: true, status: `Checking ${zip.name}…` });
             const t0 = Date.now();
             await importZipAsNewDatabase(zip, (p) => {
                 const secs = ((Date.now() - t0) / 1000).toFixed(1);
@@ -70,7 +71,28 @@ export default function GtfsData() {
             });
             await refresh();
         } catch (err) {
-            setError(`Import failed: ${String(err)}`);
+            if (err instanceof DuplicateFeedError) {
+                const existing = err.existing;
+                Alert.alert('Already imported', err.message, [
+                    { text: 'Cancel', style: 'cancel' },
+                    {
+                        text: 'Select it',
+                        onPress: async () => {
+                            setSwitchingId(existing.id);
+                            try {
+                                await setActiveDatabase(existing.id);
+                                setActiveId(existing.id);
+                            } catch (selectErr) {
+                                setError(`Couldn't switch database: ${String(selectErr)}`);
+                            } finally {
+                                setSwitchingId(null);
+                            }
+                        },
+                    },
+                ]);
+            } else {
+                setError(`Import failed: ${String(err)}`);
+            }
         } finally {
             setImportState({ busy: false });
         }
