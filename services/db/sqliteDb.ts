@@ -32,6 +32,17 @@ export function setActiveDbPath(path: string): void {
     _db = null;
 }
 
+/**
+ * Clears the active database entirely (back to the "nothing selected"
+ * state) — used when the currently-active database is deleted and there's
+ * no other one to fall back to. Distinct from setActiveDbPath() since that
+ * function's no-op-if-unchanged check can't express "go back to null".
+ */
+export function clearActiveDbPath(): void {
+    currentDbPath = null;
+    _db = null;
+}
+
 export async function isDbReady(): Promise<boolean> {
     if (!currentDbPath) return false;
     const {exists} = await FileSystem.getInfoAsync(currentDbPath);

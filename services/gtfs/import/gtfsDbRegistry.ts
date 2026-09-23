@@ -15,7 +15,7 @@
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
-import { setActiveDbPath } from '@/services/db/sqliteDb';
+import { setActiveDbPath, clearActiveDbPath } from '@/services/db/sqliteDb';
 import { invalidateNativeRouter } from '../router/gtfsRouterNative';
 
 export type GtfsDatabaseEntry = {
@@ -71,6 +71,43 @@ export function nameFromZipFileName(zipFileName: string): string {
 }
 
 /**
+ * Thrown by renameDatabase() when the requested name collides with another
+ * existing entry — distinguished from other Errors so callers (the
+ * settings screen) can show a specific "name already exists" message
+ * rather than a generic failure.
+ */
+export class DuplicateNameError extends Error {
+    constructor(name: string) {
+        super(`"${name}" is already in use by another feed.`);
+        this.name = 'DuplicateNameError';
+    }
+}
+
+function namesCollide(a: string, b: string): boolean {
+    return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/**
+ * Appends " (1)", " (2)", etc. — same convention every desktop file system
+ * uses for "a file with this name already exists here" — until `candidate`
+ * no longer collides (case-insensitively) with anything in `existingNames`.
+ * Used for imports, where silently disambiguating is friendlier than
+ * bothering the user mid-import; renameDatabase() below, in contrast,
+ * rejects a collision outright since a rename is a deliberate, one-off
+ * action the user should get a chance to reconsider.
+ */
+function dedupeName(candidate: string, existingNames: string[]): string {
+    if (!existingNames.some(n => namesCollide(n, candidate))) return candidate;
+    let n = 1;
+    let attempt = `${candidate} (${n})`;
+    while (existingNames.some(existing => namesCollide(existing, attempt))) {
+        n += 1;
+        attempt = `${candidate} (${n})`;
+    }
+    return attempt;
+}
+
+/**
  * Repoints the app at whichever database was active last session. Call
  * this once at startup (see app/_layout.tsx) BEFORE anything else touches
  * the db (warmup, a route search) — without it, sqliteDb.ts's currentDbPath
@@ -122,13 +159,16 @@ export async function setActiveDatabase(id: string): Promise<void> {
 
 /**
  * Registers a freshly-imported database file (already written to disk by
- * the caller — see gtfsDbImport.ts) and makes it the active one.
+ * the caller — see gtfsDbImport.ts) and makes it the active one. If `name`
+ * collides with an existing entry, silently disambiguates it file-system
+ * style ("Melbourne" -> "Melbourne (1)") rather than failing the import.
  */
 export async function registerDatabase(name: string, fileName: string): Promise<GtfsDatabaseEntry> {
     const reg = await readRegistry();
+    const uniqueName = dedupeName(name, reg.databases.map(d => d.name));
     const entry: GtfsDatabaseEntry = {
         id: `${Date.now()}`,
-        name,
+        name: uniqueName,
         fileName,
         importedAt: Date.now(),
     };
@@ -142,14 +182,55 @@ export async function registerDatabase(name: string, fileName: string): Promise<
     return entry;
 }
 
-/** Removes a database's registry entry and its on-disk file. Refuses to delete the active one. */
+/**
+ * Renames an existing entry. Unlike registerDatabase()'s import-time
+ * auto-disambiguation, this REJECTS a name that collides with another
+ * entry (throwing DuplicateNameError) instead of silently appending
+ * " (1)" — a rename is a deliberate action, so the user should get a
+ * chance to pick a different name rather than have one picked for them.
+ * Renaming to an entry's OWN current name (e.g. saving without changing
+ * anything) is not treated as a collision.
+ */
+export async function renameDatabase(id: string, newName: string): Promise<void> {
+    const trimmed = newName.trim();
+    if (!trimmed) throw new Error('Name cannot be empty.');
+
+    const reg = await readRegistry();
+    const entry = reg.databases.find(d => d.id === id);
+    if (!entry) throw new Error(`Unknown GTFS database id: ${id}`);
+
+    const collision = reg.databases.some(d => d.id !== id && namesCollide(d.name, trimmed));
+    if (collision) throw new DuplicateNameError(trimmed);
+
+    entry.name = trimmed;
+    await writeRegistry(reg);
+}
+
+/**
+ * Removes a database's registry entry and its on-disk file. If it was the
+ * active one, falls back to the most recently imported of whatever's left
+ * (or clears the selection entirely if this was the last database) rather
+ * than refusing the delete — the settings screen's confirmation dialog is
+ * where the user should be stopped and asked, not here.
+ */
 export async function deleteDatabase(id: string): Promise<void> {
     const reg = await readRegistry();
-    if (reg.activeId === id) {
-        throw new Error('Cannot delete the currently selected database — select another one first.');
-    }
     const entry = reg.databases.find(d => d.id === id);
     reg.databases = reg.databases.filter(d => d.id !== id);
+
+    if (reg.activeId === id) {
+        const fallback = [...reg.databases].sort((a, b) => b.importedAt - a.importedAt)[0] ?? null;
+        if (fallback) {
+            reg.activeId = fallback.id;
+            setActiveDbPath(dbPathFor(fallback));
+            invalidateNativeRouter();
+        } else {
+            reg.activeId = null;
+            clearActiveDbPath();
+            invalidateNativeRouter();
+        }
+    }
+
     await writeRegistry(reg);
 
     if (entry) {
