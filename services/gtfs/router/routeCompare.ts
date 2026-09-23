@@ -18,8 +18,8 @@ export async function compareRouters(
     const tsMs = performance.now() - tStart;
 
     // computeGtfsRouteNative no longer takes a dbPath param — it resolves
-    // DB_PATH internally (same file op-sqlite opens), same call shape as
-    // the TS path above.
+    // the active database internally via getCurrentDbPath(), same call
+    // shape as the TS path above.
     const rStart = performance.now();
     const rustResult = await computeGtfsRouteNative(origin, destination, departureTime);
     const rustMs = performance.now() - rStart;

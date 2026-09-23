@@ -76,7 +76,8 @@ export async function warmUpGtfsEngine(): Promise<void> {
         }
 
         // Rust engine's own warm_up(): opens ITS OWN rusqlite::Connection
-        // against the same on-disk file (DB_PATH) — this is not sharing
+        // against the same on-disk file (whatever getCurrentDbPath() resolves
+        // to) — this is not sharing
         // op-sqlite's handle above, it's a second, independent connection,
         // per op-sqlite's own "one connection per db" caution being about
         // op-sqlite specifically, not the file itself. warm_up() persists/

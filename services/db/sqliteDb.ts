@@ -1,21 +1,19 @@
 import {type DB as OPSQLiteDB, open, type Transaction as OPSQLiteTx} from '@op-engineering/op-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const DB_NAME = 'gtfs.db';
-const DB_DIR = `${FileSystem.documentDirectory}SQLite/`;
-// Legacy default path — kept as the initial value of currentDbPath below so
-// anything that ran an import before multi-database support existed still
-// resolves to the same file it always did, until the user picks/imports a
-// database through the new registry (see gtfsDbRegistry.ts).
-export const DB_PATH = `${DB_DIR}${DB_NAME}`;
-
 // The file op-sqlite (and the Rust engine, via getCurrentDbPath() callers)
-// currently point at. Mutable rather than a constant so gtfsDbRegistry.ts's
-// setActiveDatabase() can repoint the whole app at a different imported
-// database without every call site needing to pass a path around.
-let currentDbPath: string = DB_PATH;
+// currently point at. null means "no database selected yet" — there is
+// deliberately no legacy default file here any more: every real database
+// now comes from an explicit import via gtfsDbRegistry.ts, and the app
+// startup path (see app/_layout.tsx's restoreActiveDatabase() call) is
+// expected to call setActiveDbPath() before anything else touches the db.
+// Falling back to a fixed default path silently was the bug that caused a
+// stale/wrong file to be queried after a restart — better to fail loudly
+// via getDb()'s "no database selected" error than to succeed against the
+// wrong data.
+let currentDbPath: string | null = null;
 
-export function getCurrentDbPath(): string {
+export function getCurrentDbPath(): string | null {
     return currentDbPath;
 }
 
@@ -35,6 +33,7 @@ export function setActiveDbPath(path: string): void {
 }
 
 export async function isDbReady(): Promise<boolean> {
+    if (!currentDbPath) return false;
     const {exists} = await FileSystem.getInfoAsync(currentDbPath);
     return exists;
 }
@@ -114,6 +113,10 @@ let _db: SQLiteDatabase | null = null;
 export async function getDb(): Promise<SQLiteDatabase> {
     if (_db) return _db;
 
+    if (!currentDbPath) {
+        throw new Error('No GTFS database selected. Import or pick one in Settings → GTFS data.');
+    }
+
     const ready = await isDbReady();
     if (!ready) {
         throw new Error('GTFS database not found. Download it first.');
@@ -139,6 +142,10 @@ export async function getDb(): Promise<SQLiteDatabase> {
 export async function getOrCreateDbForImport(): Promise<SQLiteDatabase> {
     if (_db) return _db;
 
+    if (!currentDbPath) {
+        throw new Error('No database path set — call setActiveDbPath() first (see gtfsDbRegistry.ts).');
+    }
+
     const ready = await isDbReady();
     if (!ready) {
         const dir = currentDbPath.slice(0, currentDbPath.lastIndexOf('/') + 1);
@@ -153,6 +160,13 @@ export async function getOrCreateDbForImport(): Promise<SQLiteDatabase> {
 }
 
 async function openAndCache(): Promise<SQLiteDatabase> {
+    if (!currentDbPath) {
+        // Both callers above (getDb/getOrCreateDbForImport) already guard on
+        // this — reaching here with a null path would be a bug in one of
+        // them, not a normal runtime condition.
+        throw new Error('openAndCache() called with no active database path set.');
+    }
+
     // op-sqlite's `location` option: verify this against op-sqlite's docs
     // for your installed version before relying on it — the docs snippet
     // available at migration time showed `location` used for attach() with

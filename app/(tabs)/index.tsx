@@ -142,7 +142,7 @@ export default function Index() {
                     />
                 ) : null)}
 
-                {/*<DebugMapOverlay />*/}
+                <DebugMapOverlay />
             </MapView>
 
             {routeLoading && (
@@ -183,7 +183,7 @@ export default function Index() {
             )}
 
             <LocationButton mapRef={mapRef} animatedPosition={bottomSheetPosition} />
-            {/*<DebugControls />*/}
+            <DebugControls />
             <RouteBottomSheetModal ref={modalRef} animatedPosition={bottomSheetPosition} />
         </View>
     );

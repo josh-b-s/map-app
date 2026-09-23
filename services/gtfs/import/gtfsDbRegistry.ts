@@ -4,9 +4,10 @@
  *
  * Each import gets its own .db file, named by id so re-importing the same
  * region twice never collides: `{documentDirectory}SQLite/gtfs-{id}.db`.
- * Kept alongside the legacy single gtfs.db path (see sqliteDb.ts's DB_PATH)
- * rather than a separate folder, since that's the directory op-sqlite/rusqlite
- * already expect to find database files in.
+ * There is no legacy single-db fallback any more — sqliteDb.ts's
+ * currentDbPath starts as null, and stays null until restoreActiveDatabase()
+ * (app startup) or setActiveDatabase()/registerDatabase() (below) point it
+ * at a real imported file.
  *
  * Metadata (id/name/fileName/importedAt + which id is active) lives in one
  * small JSON file rather than a real table, since it's a handful of rows at
@@ -67,6 +68,40 @@ export async function getActiveDatabaseId(): Promise<string | null> {
 /** Strips a trailing .zip (case-insensitive) so "melbourne-gtfs.zip" -> "melbourne-gtfs". */
 export function nameFromZipFileName(zipFileName: string): string {
     return zipFileName.replace(/\.zip$/i, '');
+}
+
+/**
+ * Repoints the app at whichever database was active last session. Call
+ * this once at startup (see app/_layout.tsx) BEFORE anything else touches
+ * the db (warmup, a route search) — without it, sqliteDb.ts's currentDbPath
+ * just stays at its module-load default (the legacy gtfs.db path) even
+ * though the registry file and settings/gtfs.tsx's list both still say a
+ * different feed is selected, which is exactly the "shows as selected but
+ * routing errors" bug this fixes: the UI's idea of "active" was persisted,
+ * but the actual db connection's idea of "active" was not.
+ *
+ * If the previously-active entry's file is missing (e.g. storage was
+ * cleared, or the file was deleted outside the app), falls back to no
+ * active database instead of pointing at a nonexistent file, and clears
+ * activeId in the registry so the list doesn't keep showing a dead
+ * selection as checked.
+ */
+export async function restoreActiveDatabase(): Promise<void> {
+    const reg = await readRegistry();
+    if (!reg.activeId) return;
+
+    const entry = reg.databases.find(d => d.id === reg.activeId);
+    const path = entry ? dbPathFor(entry) : null;
+    const exists = path ? (await FileSystem.getInfoAsync(path)).exists : false;
+
+    if (entry && exists) {
+        setActiveDbPath(path!);
+        return;
+    }
+
+    console.warn(`[gtfsDbRegistry] active database "${reg.activeId}" is missing on disk — clearing selection`);
+    reg.activeId = null;
+    await writeRegistry(reg);
 }
 
 /**

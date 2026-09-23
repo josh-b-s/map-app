@@ -9,10 +9,18 @@ import { store } from '@/store/store';
 import '@/global.css';
 import { warmUpGtfsEngine } from '@/services/gtfs/warmup/gtfsWarmup';
 import { loadPreferences } from '@/store/preferences.slice';
+import { restoreActiveDatabase } from '@/services/gtfs/import/gtfsDbRegistry';
 
 export default function Layout() {
     useEffect(() => {
-        warmUpGtfsEngine(); // deliberately not awaited — shouldn't block first paint
+        // Must resolve BEFORE warmUpGtfsEngine() reads getCurrentDbPath() —
+        // otherwise warmup (and any search before this finishes) targets
+        // sqliteDb.ts's default legacy path instead of whatever feed the
+        // user actually had selected last session.
+        (async () => {
+            await restoreActiveDatabase();
+            warmUpGtfsEngine(); // deliberately not awaited from here on — shouldn't block first paint
+        })();
         store.dispatch(loadPreferences()); // applies the saved theme mode via nativewind as soon as it resolves
     }, []);
 

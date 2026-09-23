@@ -56,7 +56,7 @@ async function getEngine(dbPath: string): Promise<InstanceType<typeof GtfsRouter
  * real search's own getEngine(dbPath) call sees warmedUpPath already set
  * and skips calling warm_up() a second time.
  */
-export async function getNativeEngine(dbPath?: string) {
+export async function getNativeEngine(dbPath?: string | null) {
     if (dbPath) return getEngine(dbPath);
     if (!engine) engine = new GtfsRouterEngine();
     return engine;
@@ -181,7 +181,11 @@ export async function computeGtfsRouteNative(
     maxWalkDistanceM: number = 1.4 * 20 * 60,
     debugMode: boolean = false,
 ): Promise<GtfsRouteResult> {
-    const eng = await getEngine(getCurrentDbPath());
+    const dbPath = getCurrentDbPath();
+    if (!dbPath) {
+        throw new Error('No GTFS database selected. Import or pick one in Settings → GTFS data.');
+    }
+    const eng = await getEngine(dbPath);
 
     const today = departureTime;
     const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000);
